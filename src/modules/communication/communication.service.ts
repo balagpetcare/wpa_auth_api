@@ -1,0 +1,847 @@
+import {
+  CommunicationChannel,
+  CommunicationCredentialTestStatus,
+  CommunicationDeliveryStatus,
+  CommunicationHealthStatus,
+  CommunicationPurpose,
+  CommunicationProviderStatus,
+  OtpTemplateLanguage,
+  OtpTemplatePurpose,
+  Prisma,
+} from '@prisma/client';
+import type { Request } from 'express';
+import { prisma } from '../../lib/db.js';
+import { AppError } from '../../lib/errors.js';
+import { decryptCredentialPayload, encryptCredentialPayload, maskSecret } from '../../lib/credentialEncryption.js';
+import { writeAuditLog } from '../../lib/audit.js';
+import { createAdminNotification } from '../../lib/adminNotifications.js';
+import { config } from '../../config/index.js';
+import { resolveEmailAdapter, resolveSmsAdapter } from './communication.adapters.js';
+import type {
+  OtpCommunicationInput,
+  ProviderCredentialSecrets,
+  ProviderSendResult,
+  RoutingSelectionInput,
+} from './communication.types.js';
+
+type ProviderWithCredential = Prisma.CommunicationProviderGetPayload<{
+  include: { credentials: true };
+}>;
+
+const MAX_DELIVERY_ATTEMPTS = 3;
+
+function normalizePhoneToE164(phone: string) {
+  let cleaned = phone.replace(/[^\d+]/g, '');
+  
+  // Normalize BD local format (017... -> +88017...)
+  if (!cleaned.startsWith('+') && cleaned.startsWith('01') && cleaned.length === 11) {
+    cleaned = '+88' + cleaned;
+  } else if (!cleaned.startsWith('+')) {
+    cleaned = '+' + cleaned;
+  }
+
+  // Validate E.164 format
+  if (!/^\+[1-9]\d{7,14}$/.test(cleaned)) {
+    throw new AppError('Phone number must be in a valid E.164 format.', 'VALIDATION_ERROR', 400);
+  }
+  return cleaned;
+}
+
+function extractCountryCode(phone: string) {
+  const normalized = normalizePhoneToE164(phone);
+  const digits = normalized.slice(1);
+  const candidates = ['880', '1', '44', '91', '61', '971'];
+  return candidates.find((candidate) => digits.startsWith(candidate)) ?? digits.slice(0, 3);
+}
+
+function purposeToCommunicationPurpose(purpose: OtpTemplatePurpose): CommunicationPurpose {
+  switch (purpose) {
+    case 'PASSWORD_RESET':
+      return 'PASSWORD_RESET';
+    case 'LOGIN':
+    case 'REGISTER':
+      return 'AUTH';
+    default:
+      return 'OTP';
+  }
+}
+
+function mapProvider(provider: ProviderWithCredential) {
+  const activeCredential = provider.credentials.find((credential) => credential.isActive);
+  return {
+    ...provider,
+    activeCredential,
+  };
+}
+
+function getCredentialSecrets(provider: ProviderWithCredential) {
+  const credential = provider.credentials.find((item) => item.isActive);
+  if (!credential) throw new AppError('Provider has no active credentials.', 'BAD_REQUEST', 400);
+  return decryptCredentialPayload(credential.encryptedSecrets as any) as ProviderCredentialSecrets;
+}
+
+function getMaskedPreview(secrets: Record<string, string>) {
+  return Object.fromEntries(
+    Object.entries(secrets).map(([key, value]) => [key, /password/i.test(key) ? '********' : maskSecret(value)]),
+  );
+}
+
+async function writeProviderAuditLog(input: {
+  actorAdminId?: string | null;
+  providerId?: string | null;
+  action: string;
+  metadata?: Prisma.InputJsonValue;
+  req?: Request;
+}) {
+  await prisma.communicationProviderAuditLog.create({
+    data: {
+      actorAdminId: input.actorAdminId ?? null,
+      providerId: input.providerId ?? null,
+      action: input.action,
+      metadata: input.metadata,
+      ipAddress: input.req ? (input.req.ip ?? input.req.socket.remoteAddress) : undefined,
+      userAgent: input.req?.headers['user-agent'],
+    },
+  });
+}
+
+async function updateProviderHealth(providerId: string, result: ProviderSendResult) {
+  if (result.success) {
+    await prisma.communicationProvider.update({
+      where: { id: providerId },
+      data: {
+        successCount: { increment: 1 },
+        lastSuccessAt: new Date(),
+        healthStatus: 'HEALTHY',
+        lastFailureMessage: null,
+      },
+    });
+    return;
+  }
+
+  const provider = await prisma.communicationProvider.update({
+    where: { id: providerId },
+    data: {
+      failureCount: { increment: 1 },
+      lastFailureAt: new Date(),
+      lastFailureMessage: result.errorMessage,
+    },
+  });
+
+  const nextHealth: CommunicationHealthStatus = provider.failureCount + 1 >= 5 ? 'DOWN' : 'DEGRADED';
+  await prisma.communicationProvider.update({
+    where: { id: providerId },
+    data: { healthStatus: nextHealth },
+  });
+
+  if (nextHealth === 'DOWN') {
+    await createAdminNotification({
+      type: 'COMMUNICATION_PROVIDER_DOWN',
+      title: 'Communication provider down',
+      message: `${provider.name} is marked down after repeated failures.`,
+      severity: 'ERROR',
+      category: 'SYSTEM',
+      actionUrl: '/communication/provider-health',
+    });
+  }
+}
+
+async function logDeliveryAttempt(input: {
+  channel: CommunicationChannel;
+  purpose: OtpTemplatePurpose;
+  recipient: string;
+  countryCode?: string | null;
+  providerId?: string | null;
+  templateId?: string | null;
+  attemptNo: number;
+  result: ProviderSendResult;
+}) {
+  await prisma.communicationDeliveryLog.create({
+    data: {
+      channel: input.channel,
+      purpose: input.purpose,
+      recipient: input.recipient,
+      countryCode: input.countryCode ?? null,
+      providerId: input.providerId ?? null,
+      templateId: input.templateId ?? null,
+      status: input.result.success ? 'SENT' : input.attemptNo > 1 ? 'RETRIED' : 'FAILED',
+      attemptNo: input.attemptNo,
+      providerResponse: (input.result.rawResponse as Prisma.InputJsonValue | undefined) ?? undefined,
+      errorCode: input.result.errorCode,
+      errorMessage: input.result.errorMessage,
+      sentAt: input.result.success ? new Date() : null,
+      failedAt: input.result.success ? null : new Date(),
+    },
+  });
+}
+
+async function findCandidateProviders(input: RoutingSelectionInput) {
+  const rules = await prisma.communicationRoutingRule.findMany({
+    where: {
+      channel: input.channel,
+      purpose: input.purpose,
+      isActive: true,
+      OR: [
+        { countryCode: input.countryCode ?? null },
+        { countryCode: null },
+      ],
+    },
+    orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
+  });
+
+  const routedProviderIds = [
+    ...rules.map((rule) => rule.providerId).filter(Boolean),
+    ...rules.flatMap((rule) => {
+      const ids = rule.fallbackProviderIds as string[] | null;
+      return Array.isArray(ids) ? ids : [];
+    }),
+  ];
+
+  const where: Prisma.CommunicationProviderWhereInput = {
+    deletedAt: null,
+    type: input.channel,
+    status: { in: ['ACTIVE', 'TESTING'] },
+    healthStatus: { not: 'DOWN' },
+    supportedPurposes: { has: input.purpose },
+  };
+
+  if (input.channel === 'SMS') {
+    where.OR = [{ countryCode: input.countryCode ?? undefined }, { isGlobal: true }];
+  }
+
+  const providers = await prisma.communicationProvider.findMany({
+    where,
+    include: { credentials: true },
+    orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
+  });
+
+  const ranked = providers
+    .map(mapProvider)
+    .filter((provider) => provider.activeCredential)
+    .sort((a, b) => {
+      const aRouted = routedProviderIds.includes(a.id) ? 0 : 1;
+      const bRouted = routedProviderIds.includes(b.id) ? 0 : 1;
+      if (aRouted !== bRouted) return aRouted - bRouted;
+      if (input.channel === 'SMS') {
+        const aCountry = a.countryCode === input.countryCode ? 0 : a.isGlobal ? 1 : 2;
+        const bCountry = b.countryCode === input.countryCode ? 0 : b.isGlobal ? 1 : 2;
+        if (aCountry !== bCountry) return aCountry - bCountry;
+      }
+      return a.priority - b.priority;
+    });
+
+  return ranked;
+}
+
+function renderTemplate(body: string, variables: Record<string, string>) {
+  return Object.entries(variables).reduce(
+    (acc, [key, value]) => acc.replaceAll(`{{${key}}}`, value),
+    body,
+  );
+}
+
+async function resolveOtpTemplate(channel: CommunicationChannel, purpose: OtpTemplatePurpose, language: OtpTemplateLanguage) {
+  const exact = await prisma.otpTemplate.findFirst({
+    where: { channel, purpose, language, isActive: true },
+    orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+  });
+  if (exact) return exact;
+  return prisma.otpTemplate.findFirst({
+    where: { channel, purpose: 'GENERAL', language, isActive: true },
+    orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+  });
+}
+
+export async function dispatchEmail(input: {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+  purpose: OtpTemplatePurpose;
+  clientId?: string | null;
+  senderName?: string | null;
+  senderEmail?: string | null;
+}) {
+  const providers = await findCandidateProviders({
+    channel: 'EMAIL',
+    purpose: purposeToCommunicationPurpose(input.purpose),
+  });
+  if (!providers.length) {
+    throw new AppError('Email delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
+  }
+
+  const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
+  for (let index = 0; index < attemptsLimit; index += 1) {
+    const provider = providers[index];
+    const credentials = getCredentialSecrets(provider);
+    const adapter = resolveEmailAdapter(provider.code);
+    const result = await adapter.sendEmail({
+      to: input.to,
+      subject: input.subject,
+      text: input.text,
+      html: input.html,
+      provider,
+      credentials,
+      config: {
+        fromEmail: input.senderEmail ?? provider.activeCredential?.fromEmail ?? null,
+        fromName: input.senderName ?? provider.activeCredential?.fromName ?? null,
+        smtpHost: provider.activeCredential?.smtpHost ?? null,
+        smtpPort: provider.activeCredential?.smtpPort ?? null,
+        smtpSecure: provider.activeCredential?.smtpSecure ?? null,
+      },
+    });
+
+    await logDeliveryAttempt({
+      channel: 'EMAIL',
+      purpose: input.purpose,
+      recipient: input.to,
+      providerId: provider.id,
+      attemptNo: index + 1,
+      result,
+    });
+    await updateProviderHealth(provider.id, result);
+    if (result.success) return result;
+  }
+
+  await createAdminNotification({
+    type: 'EMAIL_DELIVERY_FAILED',
+    title: 'Email OTP delivery failed',
+    message: `All active email providers failed while sending to ${input.to}.`,
+    severity: 'ERROR',
+    category: 'SYSTEM',
+    actionUrl: '/communication/provider-health',
+  });
+  throw new AppError('Unable to send email at this time.', 'COMMUNICATION_UNAVAILABLE', 503);
+}
+
+export async function dispatchSms(input: {
+  to: string;
+  message: string;
+  purpose: OtpTemplatePurpose;
+}) {
+  const countryCode = extractCountryCode(input.to);
+  const providers = await findCandidateProviders({
+    channel: 'SMS',
+    purpose: purposeToCommunicationPurpose(input.purpose),
+    countryCode,
+  });
+  if (!providers.length) {
+    throw new AppError('SMS delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
+  }
+
+  const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
+  for (let index = 0; index < attemptsLimit; index += 1) {
+    const provider = providers[index];
+    const credentials = getCredentialSecrets(provider);
+    const adapter = resolveSmsAdapter(provider.code);
+    const result = await adapter.sendSms({
+      to: normalizePhoneToE164(input.to),
+      message: input.message,
+      countryCode,
+      provider,
+      credentials,
+    });
+
+    await logDeliveryAttempt({
+      channel: 'SMS',
+      purpose: input.purpose,
+      recipient: input.to,
+      countryCode,
+      providerId: provider.id,
+      attemptNo: index + 1,
+      result,
+    });
+    await updateProviderHealth(provider.id, result);
+    if (result.success) return result;
+  }
+
+  await createAdminNotification({
+    type: 'SMS_DELIVERY_FAILED',
+    title: 'SMS OTP delivery failed',
+    message: `All active SMS providers failed while sending to ${input.to}.`,
+    severity: 'ERROR',
+    category: 'SYSTEM',
+    actionUrl: '/communication/provider-health',
+  });
+  throw new AppError('Unable to send SMS at this time.', 'COMMUNICATION_UNAVAILABLE', 503);
+}
+
+export async function sendOtpEmail(input: OtpCommunicationInput & { email: string }) {
+  const language = input.language ?? 'EN';
+  const template = await resolveOtpTemplate('EMAIL', input.purpose, language);
+  if (!template) throw new AppError('Email OTP template is not configured.', 'COMMUNICATION_UNAVAILABLE', 503);
+  const variables = {
+    otp: input.otp,
+    minutes: String(input.minutes ?? config.OTP_EXPIRY_MINUTES),
+    appName: config.OTP_APP_NAME,
+    purpose: input.purpose,
+    supportEmail: config.OTP_SUPPORT_EMAIL,
+  };
+  const subject = template.subject || 'Your WPA verification code';
+  const body = renderTemplate(template.body, variables);
+  return dispatchEmail({
+    to: input.email,
+    subject,
+    text: body.replace(/<[^>]+>/g, ''),
+    html: body.replace(/\n/g, '<br />'),
+    purpose: input.purpose,
+  });
+}
+
+export async function sendOtpSms(input: OtpCommunicationInput & { phone: string }) {
+  const language = input.language ?? 'EN';
+  const template = await resolveOtpTemplate('SMS', input.purpose, language);
+  if (!template) throw new AppError('SMS OTP template is not configured.', 'COMMUNICATION_UNAVAILABLE', 503);
+  const message = renderTemplate(template.body, {
+    otp: input.otp,
+    minutes: String(input.minutes ?? config.OTP_EXPIRY_MINUTES),
+    appName: config.OTP_APP_NAME,
+    purpose: input.purpose,
+    supportEmail: config.OTP_SUPPORT_EMAIL,
+  });
+  return dispatchSms({ to: input.phone, message, purpose: input.purpose });
+}
+
+export async function sendOtpMultiChannel(input: OtpCommunicationInput) {
+  const tasks: Promise<unknown>[] = [];
+  if (input.email) tasks.push(sendOtpEmail({ ...input, email: input.email }));
+  if (input.phone) tasks.push(sendOtpSms({ ...input, phone: input.phone }));
+  return Promise.all(tasks);
+}
+
+export async function createOrUpdateProvider(input: {
+  actorId: string;
+  req: Request;
+  providerId?: string;
+  data: {
+    name: string;
+    code: string;
+    type: CommunicationChannel;
+    status?: CommunicationProviderStatus;
+    environment?: 'SANDBOX' | 'LIVE';
+    isGlobal?: boolean;
+    countryCode?: string | null;
+    priority?: number;
+    supportedPurposes: CommunicationPurpose[];
+    dailyLimit?: number | null;
+    monthlyLimit?: number | null;
+    rateLimitPerMinute?: number | null;
+  };
+}) {
+  if (input.data.countryCode && !/^\d{1,4}$/.test(input.data.countryCode)) {
+    throw new AppError('countryCode must be a dialing code value.', 'VALIDATION_ERROR', 400);
+  }
+
+  const payload = {
+    ...input.data,
+    code: input.data.code.toUpperCase(),
+    updatedById: input.actorId,
+  };
+
+  const provider = input.providerId
+    ? await prisma.communicationProvider.update({
+        where: { id: input.providerId },
+        data: payload,
+      })
+    : await prisma.communicationProvider.create({
+        data: { ...payload, createdById: input.actorId },
+      });
+
+  await writeProviderAuditLog({
+    actorAdminId: input.actorId,
+    providerId: provider.id,
+    action: input.providerId ? 'COMMUNICATION_PROVIDER_UPDATED' : 'COMMUNICATION_PROVIDER_CREATED',
+    metadata: { type: provider.type, code: provider.code },
+    req: input.req,
+  });
+  await writeAuditLog({
+    userId: input.actorId,
+    action: 'CLIENT_UPDATED',
+    resource: 'communication_provider',
+    resourceId: provider.id,
+    metadata: { type: provider.type, code: provider.code },
+    req: input.req,
+  });
+  return provider;
+}
+
+export async function softDeleteProvider(providerId: string, actorId: string, req: Request) {
+  const activeRule = await prisma.communicationRoutingRule.findFirst({
+    where: { providerId, isActive: true },
+  });
+  if (activeRule) {
+    throw new AppError('Provider is used by an active routing rule.', 'BAD_REQUEST', 400);
+  }
+  const provider = await prisma.communicationProvider.update({
+    where: { id: providerId },
+    data: { deletedAt: new Date(), status: 'DISABLED', updatedById: actorId },
+  });
+  await writeProviderAuditLog({
+    actorAdminId: actorId,
+    providerId,
+    action: 'COMMUNICATION_PROVIDER_DELETED',
+    req,
+  });
+  return provider;
+}
+
+export async function upsertProviderCredential(input: {
+  providerId: string;
+  actorId: string;
+  req: Request;
+  credentialId?: string;
+  data: {
+    secrets: Record<string, string>;
+    apiBaseUrl?: string | null;
+    senderId?: string | null;
+    fromName?: string | null;
+    fromEmail?: string | null;
+    smtpHost?: string | null;
+    smtpPort?: number | null;
+    smtpSecure?: boolean | null;
+    isActive?: boolean;
+  };
+}) {
+  if (!Object.keys(input.data.secrets ?? {}).length) {
+    throw new AppError('Credential secrets are required.', 'VALIDATION_ERROR', 400);
+  }
+
+  const encryptedSecrets = encryptCredentialPayload(input.data.secrets);
+  const maskedSecretsPreview = getMaskedPreview(input.data.secrets);
+  const usernamePreview = input.data.secrets['username'] ? maskSecret(input.data.secrets['username']) : null;
+
+  const shouldBeActive = input.data.isActive ?? true;
+  const record = await prisma.$transaction(async (tx) => {
+    if (shouldBeActive) {
+      await tx.communicationProviderCredential.updateMany({
+        where: { providerId: input.providerId, isActive: true },
+        data: { isActive: false },
+      });
+    }
+
+    return input.credentialId
+      ? tx.communicationProviderCredential.update({
+          where: { id: input.credentialId },
+          data: {
+            encryptedSecrets,
+            maskedSecretsPreview,
+            apiBaseUrl: input.data.apiBaseUrl,
+            senderId: input.data.senderId,
+            fromName: input.data.fromName,
+            fromEmail: input.data.fromEmail,
+            smtpHost: input.data.smtpHost,
+            smtpPort: input.data.smtpPort,
+            smtpSecure: input.data.smtpSecure,
+            usernamePreview,
+            isActive: shouldBeActive,
+          },
+        })
+      : tx.communicationProviderCredential.create({
+          data: {
+            providerId: input.providerId,
+            encryptedSecrets,
+            maskedSecretsPreview,
+            apiBaseUrl: input.data.apiBaseUrl,
+            senderId: input.data.senderId,
+            fromName: input.data.fromName,
+            fromEmail: input.data.fromEmail,
+            smtpHost: input.data.smtpHost,
+            smtpPort: input.data.smtpPort,
+            smtpSecure: input.data.smtpSecure,
+            usernamePreview,
+            isActive: shouldBeActive,
+          },
+        });
+  });
+
+  await writeProviderAuditLog({
+    actorAdminId: input.actorId,
+    providerId: input.providerId,
+    action: input.credentialId ? 'COMMUNICATION_PROVIDER_CREDENTIAL_UPDATED' : 'COMMUNICATION_PROVIDER_CREDENTIAL_CREATED',
+    req: input.req,
+  });
+  return {
+    ...record,
+    encryptedSecrets: undefined,
+  };
+}
+
+export async function listProviders(filters?: { type?: CommunicationChannel }) {
+  const providers = await prisma.communicationProvider.findMany({
+    where: {
+      deletedAt: null,
+      ...(filters?.type ? { type: filters.type } : {}),
+    },
+    include: {
+      credentials: {
+        where: { isActive: true },
+        orderBy: { updatedAt: 'desc' },
+        take: 1,
+      },
+    },
+    orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
+  });
+  return providers.map((provider) => ({
+    ...provider,
+    credentials: provider.credentials.map((credential) => ({
+      ...credential,
+      encryptedSecrets: undefined,
+    })),
+  }));
+}
+
+export async function getProviderById(providerId: string) {
+  const provider = await prisma.communicationProvider.findFirst({
+    where: { id: providerId, deletedAt: null },
+    include: { credentials: true },
+  });
+  if (!provider) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  return provider;
+}
+
+export async function setProviderStatus(providerId: string, status: CommunicationProviderStatus, actorId: string, req: Request) {
+  const provider = await prisma.communicationProvider.findUnique({
+    where: { id: providerId },
+    include: { credentials: { where: { isActive: true } } },
+  });
+  if (!provider) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  if (status === 'ACTIVE' && provider.credentials.length === 0) {
+    throw new AppError('Provider cannot be activated without an active credential.', 'BAD_REQUEST', 400);
+  }
+  const updated = await prisma.communicationProvider.update({
+    where: { id: providerId },
+    data: { status, updatedById: actorId },
+  });
+  await writeProviderAuditLog({
+    actorAdminId: actorId,
+    providerId,
+    action: status === 'ACTIVE' ? 'COMMUNICATION_PROVIDER_ACTIVATED' : 'COMMUNICATION_PROVIDER_DEACTIVATED',
+    req,
+  });
+  return updated;
+}
+
+export async function upsertRoutingRule(input: {
+  actorId: string;
+  req: Request;
+  ruleId?: string;
+  data: {
+    channel: CommunicationChannel;
+    countryCode?: string | null;
+    purpose: CommunicationPurpose;
+    language?: OtpTemplateLanguage | null;
+    providerId?: string | null;
+    fallbackProviderIds?: string[] | null;
+    priority?: number;
+    isActive?: boolean;
+  };
+}) {
+  const payload = {
+    ...input.data,
+    fallbackProviderIds: input.data.fallbackProviderIds ?? [],
+  };
+  const rule = input.ruleId
+    ? await prisma.communicationRoutingRule.update({ where: { id: input.ruleId }, data: payload })
+    : await prisma.communicationRoutingRule.create({ data: payload });
+  await writeProviderAuditLog({
+    actorAdminId: input.actorId,
+    providerId: rule.providerId,
+    action: input.ruleId ? 'COMMUNICATION_ROUTING_RULE_UPDATED' : 'COMMUNICATION_ROUTING_RULE_CREATED',
+    req: input.req,
+  });
+  return rule;
+}
+
+export async function upsertOtpTemplate(input: {
+  actorId: string;
+  req: Request;
+  templateId?: string;
+  data: {
+    channel: CommunicationChannel;
+    purpose: OtpTemplatePurpose;
+    language: OtpTemplateLanguage;
+    subject?: string | null;
+    body: string;
+    variables?: string[] | null;
+    isDefault?: boolean;
+    isActive?: boolean;
+  };
+}) {
+  const payload = {
+    channel: input.data.channel,
+    purpose: input.data.purpose,
+    language: input.data.language,
+    subject: input.data.subject ?? null,
+    body: input.data.body,
+    variables: input.data.variables ?? [],
+    isDefault: input.data.isDefault ?? false,
+    isActive: input.data.isActive ?? true,
+  };
+  const template = input.templateId
+    ? await prisma.otpTemplate.update({ where: { id: input.templateId }, data: payload })
+    : await prisma.otpTemplate.create({ data: payload });
+  await writeProviderAuditLog({
+    actorAdminId: input.actorId,
+    action: input.templateId ? 'OTP_TEMPLATE_UPDATED' : 'OTP_TEMPLATE_CREATED',
+    req: input.req,
+    metadata: { templateId: template.id },
+  });
+  return template;
+}
+
+export async function testProvider(providerId: string, actorId: string, req: Request, input: { to: string; subject?: string; message?: string }) {
+  const provider = await prisma.communicationProvider.findUnique({
+    where: { id: providerId },
+    include: { credentials: { where: { isActive: true } } },
+  });
+  if (!provider) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  const credential = provider.credentials[0];
+  if (!credential) throw new AppError('Provider has no active credentials.', 'BAD_REQUEST', 400);
+  const secrets = decryptCredentialPayload(credential.encryptedSecrets as any) as ProviderCredentialSecrets;
+
+  let result: ProviderSendResult;
+  if (provider.type === 'SMS') {
+    result = await resolveSmsAdapter(provider.code).sendSms({
+      to: input.to,
+      message: input.message || 'WPA Central Auth test message',
+      provider,
+      credentials: secrets,
+    });
+  } else {
+    result = await resolveEmailAdapter(provider.code).sendEmail({
+      to: input.to,
+      subject: input.subject || 'WPA Central Auth test email',
+      text: input.message || 'This is a WPA Central Auth provider test.',
+      html: `<p>${input.message || 'This is a WPA Central Auth provider test.'}</p>`,
+      provider,
+      credentials: secrets,
+      config: {
+        fromEmail: credential.fromEmail,
+        fromName: credential.fromName,
+        smtpHost: credential.smtpHost,
+        smtpPort: credential.smtpPort,
+        smtpSecure: credential.smtpSecure,
+      },
+    });
+  }
+
+  await prisma.communicationProviderCredential.update({
+    where: { id: credential.id },
+    data: {
+      lastTestStatus: result.success ? 'PASSED' : 'FAILED',
+      lastTestedAt: new Date(),
+      lastTestMessage: result.success ? 'Provider test passed.' : result.errorMessage,
+      lastTestDetails: (result.rawResponse as Prisma.InputJsonValue | undefined) ?? undefined,
+    },
+  });
+  await writeProviderAuditLog({
+    actorAdminId: actorId,
+    providerId,
+    action: provider.type === 'SMS' ? 'COMMUNICATION_PROVIDER_TEST_SMS' : 'COMMUNICATION_PROVIDER_TEST_EMAIL',
+    metadata: { recipient: input.to, success: result.success },
+    req,
+  });
+  await updateProviderHealth(providerId, result);
+  return result;
+}
+
+export async function getProviderHealth() {
+  return prisma.communicationProvider.findMany({
+    where: { deletedAt: null },
+    select: {
+      id: true,
+      name: true,
+      code: true,
+      type: true,
+      status: true,
+      healthStatus: true,
+      successCount: true,
+      failureCount: true,
+      lastSuccessAt: true,
+      lastFailureAt: true,
+      lastFailureMessage: true,
+      credentials: {
+        where: { isActive: true },
+        take: 1,
+        select: {
+          lastTestStatus: true,
+          lastTestedAt: true,
+          lastTestMessage: true,
+        },
+      },
+    },
+    orderBy: [{ type: 'asc' }, { priority: 'asc' }],
+  });
+}
+
+export async function getDeliveryLogs(filters: {
+  channel?: CommunicationChannel;
+  providerId?: string;
+  status?: CommunicationDeliveryStatus;
+  recipient?: string;
+  countryCode?: string;
+  limit: number;
+}) {
+  return prisma.communicationDeliveryLog.findMany({
+    where: {
+      ...(filters.channel ? { channel: filters.channel } : {}),
+      ...(filters.providerId ? { providerId: filters.providerId } : {}),
+      ...(filters.status ? { status: filters.status } : {}),
+      ...(filters.recipient ? { recipient: { contains: filters.recipient, mode: 'insensitive' } } : {}),
+      ...(filters.countryCode ? { countryCode: filters.countryCode } : {}),
+    },
+    include: {
+      provider: { select: { id: true, name: true, code: true } },
+      template: { select: { id: true, purpose: true, language: true } },
+    },
+    take: Math.min(filters.limit, 100),
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+export async function getProviderAuditLogs(limit: number) {
+  return prisma.communicationProviderAuditLog.findMany({
+    include: {
+      actorAdmin: { select: { id: true, email: true, username: true } },
+      provider: { select: { id: true, name: true, code: true } },
+    },
+    take: Math.min(limit, 100),
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+export async function listRoutingRules() {
+  return prisma.communicationRoutingRule.findMany({
+    include: { provider: { select: { id: true, name: true, code: true, type: true } } },
+    orderBy: [{ channel: 'asc' }, { priority: 'asc' }],
+  });
+}
+
+export async function listOtpTemplates() {
+  return prisma.otpTemplate.findMany({
+    orderBy: [{ channel: 'asc' }, { purpose: 'asc' }, { language: 'asc' }],
+  });
+}
+
+export async function deleteRoutingRule(ruleId: string) {
+  return prisma.communicationRoutingRule.delete({ where: { id: ruleId } });
+}
+
+export async function deleteOtpTemplate(templateId: string) {
+  return prisma.otpTemplate.delete({ where: { id: templateId } });
+}
+
+export async function formatProviderResponse(providerId: string) {
+  const provider = await prisma.communicationProvider.findUnique({
+    where: { id: providerId },
+    include: { credentials: { orderBy: { updatedAt: 'desc' } } },
+  });
+  if (!provider) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  return {
+    ...provider,
+    credentials: provider.credentials.map((credential) => ({
+      ...credential,
+      encryptedSecrets: undefined,
+    })),
+  };
+}

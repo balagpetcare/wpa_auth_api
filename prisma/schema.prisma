@@ -1,0 +1,937 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                             String                          @id @default(cuid())
+  email                          String?                         @unique
+  phone                          String?                         @unique
+  username                       String?                         @unique
+  passwordHash                   String?                         @map("password_hash")
+  displayName                    String?                         @map("display_name")
+  avatarUrl                      String?                         @map("avatar_url")
+  status                         UserStatus                      @default(PENDING_VERIFICATION)
+  emailVerifiedAt                DateTime?                       @map("email_verified_at")
+  phoneVerifiedAt                DateTime?                       @map("phone_verified_at")
+  createdAt                      DateTime                        @default(now()) @map("created_at")
+  updatedAt                      DateTime                        @updatedAt @map("updated_at")
+  bio                            String?
+  department                     String?
+  interfacePreferences           Json?                           @map("interface_preferences")
+  jobTitle                       String?                         @map("job_title")
+  lastLoginAt                    DateTime?                       @map("last_login_at")
+  lastPasswordChangedAt          DateTime?                       @map("last_password_changed_at")
+  notificationPreferences        Json?                           @map("notification_preferences")
+  organization                   String?
+  adminNotifications             AdminNotification[]
+  apiKeys                        ApiKey[]
+  auditLogs                      AuditLog[]
+  authorizationCodes             AuthorizationCode[]
+  communicationProviderAuditLogs CommunicationProviderAuditLog[]
+  createdCommunicationProviders  CommunicationProvider[]         @relation("CommunicationProviderCreatedBy")
+  updatedCommunicationProviders  CommunicationProvider[]         @relation("CommunicationProviderUpdatedBy")
+  emailBrandingSettingsUpdated   EmailBrandingSetting[]          @relation("EmailBrandingSettingUpdatedBy")
+  emailQueues                    EmailQueue[]
+  emailSendLogs                  EmailSendLog[]
+  emailTemplateAuditLogs         EmailTemplateAuditLog[]
+  emailTemplatesUpdated          EmailTemplate[]                 @relation("EmailTemplateUpdatedBy")
+  emailVerificationTokens        EmailVerificationToken[]
+  loginSessions                  LoginSession[]
+  oauthAccounts                  OAuthAccount[]
+  passwordResetTokens            PasswordResetToken[]
+  refreshTokens                  RefreshToken[]
+  securityEvents                 SecurityEvent[]
+  clientAccess                   UserClientAccess[]
+  roles                          UserRole[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([username])
+  @@index([status])
+  @@index([createdAt])
+  @@index([lastLoginAt])
+  @@index([createdAt, id])
+  @@index([lastLoginAt, id])
+  @@index([status, createdAt, id])
+  @@map("users")
+}
+
+model AuthClient {
+  id                 String               @id @default(cuid())
+  name               String
+  slug               String               @unique
+  type               AuthClientType
+  clientId           String               @unique @map("client_id")
+  clientSecretHash   String?              @map("client_secret_hash")
+  allowedOrigins     String[]             @map("allowed_origins")
+  redirectUris       String[]             @map("redirect_uris")
+  allowedScopes      String[]             @map("allowed_scopes")
+  status             AuthClientStatus     @default(ACTIVE)
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
+  apiKeys            ApiKey[]
+  auditLogs          AuditLog[]
+  authorizationCodes AuthorizationCode[]
+  emailBranding      ClientBranding?
+  emailTemplates     EmailTemplate[]
+  loginSessions      LoginSession[]
+  refreshTokens      RefreshToken[]
+  serviceTokens      ServiceAccessToken[]
+  userAccess         UserClientAccess[]
+
+  @@index([clientId])
+  @@index([slug])
+  @@index([status])
+  @@map("auth_clients")
+}
+
+model SocialProviderSetting {
+  id           String        @id @default(cuid())
+  provider     OAuthProvider @unique
+  displayName  String        @map("display_name")
+  icon         String?
+  enabled      Boolean       @default(false)
+  displayOrder Int           @default(0) @map("display_order")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  @@map("social_provider_settings")
+}
+
+model UserClientAccess {
+  userId       String                 @map("user_id")
+  clientId     String                 @map("client_id")
+  roleInClient String?                @map("role_in_client")
+  status       UserClientAccessStatus @default(ACTIVE)
+  createdAt    DateTime               @default(now()) @map("created_at")
+  client       AuthClient             @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, clientId])
+  @@index([userId])
+  @@index([clientId])
+  @@map("user_client_access")
+}
+
+model Role {
+  id          String                @id @default(cuid())
+  name        String                @unique
+  description String?
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime              @updatedAt @map("updated_at")
+  invitations AdminInvitationRole[]
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@index([name])
+  @@map("roles")
+}
+
+model Permission {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  description String?
+  resource    String
+  action      String
+  createdAt   DateTime         @default(now()) @map("created_at")
+  roles       RolePermission[]
+
+  @@index([name])
+  @@index([resource, action])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String     @map("role_id")
+  permissionId String     @map("permission_id")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([roleId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId    String   @map("user_id")
+  roleId    String   @map("role_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model RefreshToken {
+  id        String     @id @default(cuid())
+  userId    String     @map("user_id")
+  clientId  String     @map("client_id")
+  tokenHash String     @unique @map("token_hash")
+  scopes    String[]
+  expiresAt DateTime   @map("expires_at")
+  revokedAt DateTime?  @map("revoked_at")
+  userAgent String?    @map("user_agent")
+  ipAddress String?    @map("ip_address")
+  createdAt DateTime   @default(now()) @map("created_at")
+  client    AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([clientId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model LoginSession {
+  id           String     @id @default(cuid())
+  userId       String     @map("user_id")
+  clientId     String     @map("client_id")
+  sessionToken String     @unique @map("session_token")
+  userAgent    String?    @map("user_agent")
+  ipAddress    String?    @map("ip_address")
+  country      String?
+  expiresAt    DateTime   @map("expires_at")
+  revokedAt    DateTime?  @map("revoked_at")
+  lastActiveAt DateTime   @default(now()) @map("last_active_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  client       AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([clientId])
+  @@index([sessionToken])
+  @@index([expiresAt])
+  @@map("login_sessions")
+}
+
+model OAuthAccount {
+  id                String        @id @default(cuid())
+  userId            String        @map("user_id")
+  provider          OAuthProvider
+  providerAccountId String        @map("provider_account_id")
+  accessToken       String?       @map("access_token")
+  refreshToken      String?       @map("refresh_token")
+  tokenExpiresAt    DateTime?     @map("token_expires_at")
+  rawProfile        Json?         @map("raw_profile")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@index([provider])
+  @@index([provider, providerAccountId])
+  @@map("oauth_accounts")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  email     String
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+  @@map("email_verification_tokens")
+}
+
+model ApiKey {
+  id         String     @id @default(cuid())
+  userId     String     @map("user_id")
+  clientId   String     @map("client_id")
+  name       String
+  keyHash    String     @unique @map("key_hash")
+  keyPrefix  String     @map("key_prefix")
+  scopes     String[]
+  expiresAt  DateTime?  @map("expires_at")
+  lastUsedAt DateTime?  @map("last_used_at")
+  revokedAt  DateTime?  @map("revoked_at")
+  createdAt  DateTime   @default(now()) @map("created_at")
+  client     AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([clientId])
+  @@index([keyHash])
+  @@index([keyPrefix])
+  @@map("api_keys")
+}
+
+model AuthorizationCode {
+  id                  String     @id @default(cuid())
+  codeHash            String     @unique @map("code_hash")
+  userId              String     @map("user_id")
+  clientId            String     @map("client_id")
+  redirectUri         String     @map("redirect_uri")
+  scopes              String[]
+  state               String?
+  codeChallenge       String?    @map("code_challenge")
+  codeChallengeMethod String?    @map("code_challenge_method")
+  expiresAt           DateTime   @map("expires_at")
+  usedAt              DateTime?  @map("used_at")
+  createdAt           DateTime   @default(now()) @map("created_at")
+  client              AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user                User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([codeHash])
+  @@index([userId])
+  @@index([clientId])
+  @@index([expiresAt])
+  @@map("authorization_codes")
+}
+
+model ServiceAccessToken {
+  id        String     @id @default(cuid())
+  clientId  String     @map("client_id")
+  tokenHash String     @unique @map("token_hash")
+  scopes    String[]
+  expiresAt DateTime   @map("expires_at")
+  revokedAt DateTime?  @map("revoked_at")
+  createdAt DateTime   @default(now()) @map("created_at")
+  client    AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+  @@map("service_access_tokens")
+}
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  userId     String?     @map("user_id")
+  clientId   String?     @map("client_id")
+  action     AuditAction
+  resource   String?
+  resourceId String?     @map("resource_id")
+  ipAddress  String?     @map("ip_address")
+  userAgent  String?     @map("user_agent")
+  metadata   Json?
+  createdAt  DateTime    @default(now()) @map("created_at")
+  client     AuthClient? @relation(fields: [clientId], references: [id])
+  user       User?       @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([clientId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model SecurityEvent {
+  id        String                @id @default(cuid())
+  userId    String?               @map("user_id")
+  type      SecurityEventType
+  severity  SecurityEventSeverity
+  ipAddress String?               @map("ip_address")
+  userAgent String?               @map("user_agent")
+  metadata  Json?
+  resolved  Boolean               @default(false)
+  createdAt DateTime              @default(now()) @map("created_at")
+  user      User?                 @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([type])
+  @@index([severity])
+  @@index([resolved])
+  @@index([createdAt])
+  @@map("security_events")
+}
+
+model AdminNotification {
+  id          String                    @id @default(cuid())
+  userId      String?                   @map("user_id")
+  type        String
+  title       String
+  message     String
+  severity    AdminNotificationSeverity
+  category    AdminNotificationCategory
+  actionUrl   String?                   @map("action_url")
+  metadata    Json?
+  readAt      DateTime?                 @map("read_at")
+  dismissedAt DateTime?                 @map("dismissed_at")
+  createdAt   DateTime                  @default(now()) @map("created_at")
+  updatedAt   DateTime                  @updatedAt @map("updated_at")
+  user        User?                     @relation(fields: [userId], references: [id])
+
+  @@index([userId, readAt, createdAt])
+  @@index([createdAt])
+  @@index([severity])
+  @@index([category])
+  @@index([dismissedAt])
+  @@map("admin_notifications")
+}
+
+model AdminInvitation {
+  id              String                @id @default(cuid())
+  email           String
+  invitedByUserId String                @map("invited_by_user_id")
+  invitedUserId   String?               @map("invited_user_id")
+  tokenHash       String                @unique @map("token_hash")
+  status          InvitationStatus      @default(PENDING)
+  message         String?
+  expiresAt       DateTime              @map("expires_at")
+  acceptedAt      DateTime?             @map("accepted_at")
+  revokedAt       DateTime?             @map("revoked_at")
+  createdAt       DateTime              @default(now()) @map("created_at")
+  updatedAt       DateTime              @updatedAt @map("updated_at")
+  roles           AdminInvitationRole[]
+
+  @@index([email])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([invitedByUserId])
+  @@index([tokenHash])
+  @@map("admin_invitations")
+}
+
+model AdminInvitationRole {
+  invitationId String          @map("invitation_id")
+  roleId       String          @map("role_id")
+  invitation   AdminInvitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  role         Role            @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([invitationId, roleId])
+  @@index([invitationId])
+  @@index([roleId])
+  @@map("admin_invitation_roles")
+}
+
+model CommunicationProvider {
+  id                 String                            @id @default(cuid())
+  name               String
+  code               String                            @unique
+  type               CommunicationChannel
+  status             CommunicationProviderStatus       @default(INACTIVE)
+  environment        CommunicationProviderEnvironment  @default(SANDBOX)
+  isGlobal           Boolean                           @default(false) @map("is_global")
+  countryCode        String?                           @map("country_code")
+  priority           Int                               @default(100)
+  supportedPurposes  CommunicationPurpose[]            @map("supported_purposes")
+  dailyLimit         Int?                              @map("daily_limit")
+  monthlyLimit       Int?                              @map("monthly_limit")
+  rateLimitPerMinute Int?                              @map("rate_limit_per_minute")
+  failureCount       Int                               @default(0) @map("failure_count")
+  successCount       Int                               @default(0) @map("success_count")
+  lastSuccessAt      DateTime?                         @map("last_success_at")
+  lastFailureAt      DateTime?                         @map("last_failure_at")
+  lastFailureMessage String?                           @map("last_failure_message")
+  healthStatus       CommunicationHealthStatus         @default(UNKNOWN) @map("health_status")
+  createdById        String?                           @map("created_by_id")
+  updatedById        String?                           @map("updated_by_id")
+  createdAt          DateTime                          @default(now()) @map("created_at")
+  updatedAt          DateTime                          @updatedAt @map("updated_at")
+  deletedAt          DateTime?                         @map("deleted_at")
+  deliveryLogs       CommunicationDeliveryLog[]
+  auditLogs          CommunicationProviderAuditLog[]
+  credentials        CommunicationProviderCredential[]
+  createdBy          User?                             @relation("CommunicationProviderCreatedBy", fields: [createdById], references: [id])
+  updatedBy          User?                             @relation("CommunicationProviderUpdatedBy", fields: [updatedById], references: [id])
+  routingRules       CommunicationRoutingRule[]
+
+  @@index([type, status, priority])
+  @@index([countryCode, type, priority])
+  @@index([isGlobal, type, priority])
+  @@index([deletedAt])
+  @@map("communication_providers")
+}
+
+model CommunicationProviderCredential {
+  id                   String                            @id @default(cuid())
+  providerId           String                            @map("provider_id")
+  encryptedSecrets     Json                              @map("encrypted_secrets")
+  maskedSecretsPreview Json?                             @map("masked_secrets_preview")
+  apiBaseUrl           String?                           @map("api_base_url")
+  senderId             String?                           @map("sender_id")
+  fromName             String?                           @map("from_name")
+  fromEmail            String?                           @map("from_email")
+  smtpHost             String?                           @map("smtp_host")
+  smtpPort             Int?                              @map("smtp_port")
+  smtpSecure           Boolean?                          @map("smtp_secure")
+  usernamePreview      String?                           @map("username_preview")
+  lastTestStatus       CommunicationCredentialTestStatus @default(NOT_TESTED) @map("last_test_status")
+  lastTestedAt         DateTime?                         @map("last_tested_at")
+  lastTestMessage      String?                           @map("last_test_message")
+  lastTestDetails      Json?                             @map("last_test_details")
+  isActive             Boolean                           @default(true) @map("is_active")
+  createdAt            DateTime                          @default(now()) @map("created_at")
+  updatedAt            DateTime                          @updatedAt @map("updated_at")
+  provider             CommunicationProvider             @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([providerId, isActive])
+  @@map("communication_provider_credentials")
+}
+
+model CommunicationRoutingRule {
+  id                  String                 @id @default(cuid())
+  channel             CommunicationChannel
+  countryCode         String?                @map("country_code")
+  purpose             CommunicationPurpose
+  language            OtpTemplateLanguage?
+  providerId          String?                @map("provider_id")
+  fallbackProviderIds Json?                  @map("fallback_provider_ids")
+  priority            Int                    @default(100)
+  isActive            Boolean                @default(true) @map("is_active")
+  createdAt           DateTime               @default(now()) @map("created_at")
+  updatedAt           DateTime               @updatedAt @map("updated_at")
+  provider            CommunicationProvider? @relation(fields: [providerId], references: [id])
+
+  @@index([channel, countryCode, purpose, priority])
+  @@map("communication_routing_rules")
+}
+
+model OtpTemplate {
+  id           String                     @id @default(cuid())
+  channel      CommunicationChannel
+  purpose      OtpTemplatePurpose
+  language     OtpTemplateLanguage
+  subject      String?
+  body         String
+  variables    Json?
+  isDefault    Boolean                    @default(false) @map("is_default")
+  isActive     Boolean                    @default(true) @map("is_active")
+  createdAt    DateTime                   @default(now()) @map("created_at")
+  updatedAt    DateTime                   @updatedAt @map("updated_at")
+  deliveryLogs CommunicationDeliveryLog[]
+
+  @@unique([channel, purpose, language])
+  @@index([channel, purpose, language, isActive])
+  @@map("otp_templates")
+}
+
+model CommunicationDeliveryLog {
+  id               String                      @id @default(cuid())
+  channel          CommunicationChannel
+  purpose          OtpTemplatePurpose
+  recipient        String
+  countryCode      String?                     @map("country_code")
+  providerId       String?                     @map("provider_id")
+  templateId       String?                     @map("template_id")
+  otpId            String?                     @map("otp_id")
+  status           CommunicationDeliveryStatus
+  attemptNo        Int                         @default(1) @map("attempt_no")
+  providerResponse Json?                       @map("provider_response")
+  errorCode        String?                     @map("error_code")
+  errorMessage     String?                     @map("error_message")
+  sentAt           DateTime?                   @map("sent_at")
+  failedAt         DateTime?                   @map("failed_at")
+  createdAt        DateTime                    @default(now()) @map("created_at")
+  provider         CommunicationProvider?      @relation(fields: [providerId], references: [id])
+  template         OtpTemplate?                @relation(fields: [templateId], references: [id])
+
+  @@index([channel, purpose, createdAt])
+  @@index([recipient, createdAt])
+  @@index([providerId, createdAt])
+  @@map("communication_delivery_logs")
+}
+
+model CommunicationProviderAuditLog {
+  id           String                 @id @default(cuid())
+  actorAdminId String?                @map("actor_admin_id")
+  action       String
+  providerId   String?                @map("provider_id")
+  metadata     Json?
+  ipAddress    String?                @map("ip_address")
+  userAgent    String?                @map("user_agent")
+  createdAt    DateTime               @default(now()) @map("created_at")
+  actorAdmin   User?                  @relation(fields: [actorAdminId], references: [id])
+  provider     CommunicationProvider? @relation(fields: [providerId], references: [id])
+
+  @@index([actorAdminId, createdAt])
+  @@index([providerId, createdAt])
+  @@map("communication_provider_audit_logs")
+}
+
+model EmailBrandingSetting {
+  id                    String   @id @default(cuid())
+  logoUrl               String?  @map("logo_url")
+  logoAltText           String?  @map("logo_alt_text")
+  primaryColor          String?  @map("primary_color")
+  textColor             String?  @map("text_color")
+  headerBackgroundColor String?  @map("header_background_color")
+  footerBackgroundColor String?  @map("footer_background_color")
+  supportEmail          String?  @map("support_email")
+  supportPhone          String?  @map("support_phone")
+  websiteUrl            String?  @map("website_url")
+  privacyUrl            String?  @map("privacy_url")
+  termsUrl              String?  @map("terms_url")
+  helpUrl               String?  @map("help_url")
+  contactUrl            String?  @map("contact_url")
+  facebookUrl           String?  @map("facebook_url")
+  instagramUrl          String?  @map("instagram_url")
+  linkedinUrl           String?  @map("linkedin_url")
+  twitterUrl            String?  @map("twitter_url")
+  youtubeUrl            String?  @map("youtube_url")
+  tiktokUrl             String?  @map("tiktok_url")
+  footerText            String?  @map("footer_text")
+  address               String?  @map("address")
+  legalDisclaimer       String?  @map("legal_disclaimer")
+  isActive              Boolean  @default(true) @map("is_active")
+  updatedByAdminId      String?  @map("updated_by_admin_id")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+  brandName             String   @map("brand_name")
+  updatedByAdmin        User?    @relation("EmailBrandingSettingUpdatedBy", fields: [updatedByAdminId], references: [id])
+
+  @@map("email_branding_settings")
+}
+
+model EmailTemplate {
+  id               String                  @id @default(cuid())
+  key              String
+  name             String
+  subject          String
+  preheader        String?
+  htmlBody         String                  @map("html_body")
+  textBody         String?                 @map("text_body")
+  variables        Json?
+  isActive         Boolean                 @default(true) @map("is_active")
+  updatedByAdminId String?                 @map("updated_by_admin_id")
+  createdAt        DateTime                @default(now()) @map("created_at")
+  updatedAt        DateTime                @updatedAt @map("updated_at")
+  locale           String                  @default("en")
+  version          Int                     @default(1)
+  clientId         String?                 @map("client_id")
+  auditLogs        EmailTemplateAuditLog[]
+  versions         EmailTemplateVersion[]
+  client           AuthClient?             @relation(fields: [clientId], references: [id], onUpdate: NoAction)
+  updatedByAdmin   User?                   @relation("EmailTemplateUpdatedBy", fields: [updatedByAdminId], references: [id])
+
+  @@unique([key, locale, clientId])
+  @@index([key, locale, isActive])
+  @@index([clientId, isActive])
+  @@index([updatedByAdminId, updatedAt])
+  @@index([key, isActive])
+  @@map("email_templates")
+}
+
+model EmailTemplateVersion {
+  id         String        @id @default(cuid())
+  templateId String        @map("template_id")
+  version    Int
+  name       String
+  subject    String
+  preheader  String?
+  htmlBody   String        @map("html_body")
+  textBody   String?       @map("text_body")
+  variables  Json?
+  snapshot   Json?
+  createdAt  DateTime      @default(now()) @map("created_at")
+  template   EmailTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([templateId, version])
+  @@index([templateId, createdAt])
+  @@map("email_template_versions")
+}
+
+model ClientBranding {
+  id             String     @id @default(cuid())
+  clientId       String     @unique @map("client_id")
+  logoUrl        String?    @map("logo_url")
+  logoAltText    String?    @map("logo_alt_text")
+  brandColor     String?    @map("brand_color")
+  accentColor    String?    @map("accent_color")
+  senderName     String?    @map("sender_name")
+  senderEmail    String?    @map("sender_email")
+  supportEmail   String?    @map("support_email")
+  supportPhone   String?    @map("support_phone")
+  websiteUrl     String?    @map("website_url")
+  privacyUrl     String?    @map("privacy_url")
+  termsUrl       String?    @map("terms_url")
+  unsubscribeUrl String?    @map("unsubscribe_url")
+  footerText     String?    @map("footer_text")
+  isActive       Boolean    @default(true) @map("is_active")
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @default(now()) @updatedAt @map("updated_at")
+  client         AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([clientId])
+  @@index([isActive])
+  @@map("client_brandings")
+}
+
+model EmailQueue {
+  id             String        @id @default(cuid())
+  templateKey    String        @map("template_key")
+  locale         String        @default("en")
+  clientId       String?       @map("client_id")
+  recipientEmail String        @map("recipient_email")
+  recipientName  String?       @map("recipient_name")
+  subject        String
+  variables      Json?
+  status         String        @default("pending")
+  attempt        Int           @default(0)
+  maxRetries     Int           @default(3) @map("max_retries")
+  nextRetryAt    DateTime?     @map("next_retry_at")
+  lastError      String?       @map("last_error")
+  sendLogId      String?       @map("send_log_id")
+  userId         String?       @map("user_id")
+  metadata       Json?
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @default(now()) @updatedAt @map("updated_at")
+  sendLog        EmailSendLog? @relation(fields: [sendLogId], references: [id], onUpdate: NoAction)
+  user           User?         @relation(fields: [userId], references: [id], onUpdate: NoAction)
+
+  @@index([status, nextRetryAt])
+  @@index([templateKey, status])
+  @@index([recipientEmail, createdAt])
+  @@index([userId, status])
+  @@map("email_queues")
+}
+
+model EmailTemplateAuditLog {
+  id            String        @id @default(cuid())
+  templateId    String        @map("template_id")
+  action        String
+  changedFields Json?         @map("changed_fields")
+  actorAdminId  String?       @map("actor_admin_id")
+  ipAddress     String?       @map("ip_address")
+  userAgent     String?       @map("user_agent")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  fromVersion   Int?          @map("from_version")
+  toVersion     Int?          @map("to_version")
+  actorAdmin    User?         @relation(fields: [actorAdminId], references: [id])
+  template      EmailTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, createdAt])
+  @@index([actorAdminId, createdAt])
+  @@map("email_template_audit_logs")
+}
+
+model EmailSendLog {
+  id               String       @id @default(cuid())
+  templateKey      String       @map("template_key")
+  recipientEmail   String       @map("recipient_email")
+  subject          String
+  variables        Json?
+  status           String
+  userId           String?      @map("user_id")
+  errorMessage     String?      @map("error_message")
+  providerResponse Json?        @map("provider_response")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  locale           String       @default("en")
+  clientId         String?      @map("client_id")
+  recipientName    String?      @map("recipient_name")
+  deliveryStatus   String       @default("pending") @map("delivery_status")
+  attemptCount     Int          @default(1) @map("attempt_count")
+  sentAt           DateTime?    @map("sent_at")
+  failedAt         DateTime?    @map("failed_at")
+  queues           EmailQueue[]
+  user             User?        @relation(fields: [userId], references: [id])
+
+  @@index([templateKey, createdAt])
+  @@index([recipientEmail, createdAt])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("email_send_logs")
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+  PENDING_VERIFICATION
+}
+
+enum AuthClientType {
+  FIRST_PARTY_APP
+  THIRD_PARTY_APP
+  SERVICE
+}
+
+enum AuthClientStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum UserClientAccessStatus {
+  ACTIVE
+  REVOKED
+  SUSPENDED
+}
+
+enum OAuthProvider {
+  GOOGLE
+  FACEBOOK
+  APPLE
+  TWITTER
+  INSTAGRAM
+}
+
+enum AuditAction {
+  LOGIN
+  LOGOUT
+  REGISTER
+  PASSWORD_CHANGE
+  PASSWORD_RESET
+  EMAIL_VERIFIED
+  PHONE_VERIFIED
+  OAUTH_LINKED
+  OAUTH_UNLINKED
+  TOKEN_REFRESHED
+  TOKEN_REVOKED
+  API_KEY_CREATED
+  API_KEY_REVOKED
+  ROLE_ASSIGNED
+  ROLE_REMOVED
+  PERMISSION_GRANTED
+  PERMISSION_REVOKED
+  ACCOUNT_SUSPENDED
+  ACCOUNT_DELETED
+  CLIENT_CREATED
+  CLIENT_UPDATED
+  OAUTH_AUTHORIZE
+  OAUTH_TOKEN_ISSUED
+  OAUTH_TOKEN_REVOKED
+  OAUTH_INTROSPECT
+  PASSWORD_CHANGED
+  PROFILE_UPDATED
+  USER_STATUS_CHANGED
+  USER_PASSWORD_RESET_TRIGGERED
+  USER_ACCOUNT_DELETED
+  USER_SESSIONS_REVOKED
+  USER_UPDATED
+  PROFILE_AVATAR_UPDATED
+  PROFILE_AVATAR_REMOVED
+  ADMIN_INVITATION_CREATED
+  ADMIN_INVITATION_RESENT
+  ADMIN_INVITATION_REVOKED
+  ADMIN_INVITATION_ACCEPTED
+  ADMIN_ROLE_ASSIGNED
+  ADMIN_ROLE_REMOVED
+  ADMIN_ACCESS_GRANTED
+  ADMIN_ACCESS_REMOVED
+}
+
+enum SecurityEventType {
+  FAILED_LOGIN
+  BRUTE_FORCE_DETECTED
+  SUSPICIOUS_IP
+  ACCOUNT_LOCKED
+  TOKEN_REUSE_DETECTED
+  INVALID_API_KEY
+  UNAUTHORIZED_SCOPE
+  SUSPICIOUS_OAUTH
+}
+
+enum SecurityEventSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AdminNotificationSeverity {
+  INFO
+  SUCCESS
+  WARNING
+  ERROR
+  SECURITY
+}
+
+enum AdminNotificationCategory {
+  SYSTEM
+  SECURITY
+  USER_MANAGEMENT
+  AUTH
+  SETTINGS
+  BILLING
+  INTEGRATION
+}
+
+enum CommunicationChannel {
+  SMS
+  EMAIL
+}
+
+enum CommunicationProviderStatus {
+  ACTIVE
+  INACTIVE
+  TESTING
+  DISABLED
+}
+
+enum CommunicationProviderEnvironment {
+  SANDBOX
+  LIVE
+}
+
+enum CommunicationPurpose {
+  OTP
+  AUTH
+  PASSWORD_RESET
+  TRANSACTIONAL
+  ALERT
+}
+
+enum CommunicationHealthStatus {
+  UNKNOWN
+  HEALTHY
+  DEGRADED
+  DOWN
+}
+
+enum CommunicationCredentialTestStatus {
+  NOT_TESTED
+  PASSED
+  FAILED
+  BLOCKED
+}
+
+enum OtpTemplatePurpose {
+  LOGIN
+  REGISTER
+  PASSWORD_RESET
+  PAYMENT_VERIFY
+  ADMIN_INVITE
+  GENERAL
+}
+
+enum OtpTemplateLanguage {
+  EN
+  BN
+}
+
+enum CommunicationDeliveryStatus {
+  QUEUED
+  SENT
+  FAILED
+  RETRIED
+  BLOCKED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
