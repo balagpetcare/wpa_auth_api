@@ -455,8 +455,11 @@ router.get(
   async (req, res, next) => {
     try {
       const query = deliveryLogQuerySchema.parse(req.query);
-      const items = await communicationService.getDeliveryLogs(query);
-      res.json({ success: true, data: { items } });
+      const data = await communicationService.getDeliveryLogs({
+        ...query,
+        cursor: typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined,
+      });
+      res.json({ success: true, data });
     } catch (error) {
       next(error);
     }
@@ -469,8 +472,9 @@ router.get(
   async (req, res, next) => {
     try {
       const limit = Math.min(Number(req.query['limit'] ?? 50), 100);
-      const items = await communicationService.getProviderAuditLogs(limit);
-      res.json({ success: true, data: { items } });
+      const cursor = typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined;
+      const data = await communicationService.getProviderAuditLogs({ limit, cursor });
+      res.json({ success: true, data });
     } catch (error) {
       next(error);
     }

@@ -24,6 +24,7 @@ model User {
   interfacePreferences           Json?                           @map("interface_preferences")
   jobTitle                       String?                         @map("job_title")
   lastLoginAt                    DateTime?                       @map("last_login_at")
+  lastSeenAt                     DateTime?                       @map("last_seen_at")
   lastPasswordChangedAt          DateTime?                       @map("last_password_changed_at")
   notificationPreferences        Json?                           @map("notification_preferences")
   organization                   String?
@@ -222,6 +223,8 @@ model LoginSession {
   @@index([clientId])
   @@index([sessionToken])
   @@index([expiresAt])
+  @@index([userId, createdAt, id])
+  @@index([clientId, createdAt, id])
   @@map("login_sessions")
 }
 
@@ -357,6 +360,8 @@ model AuditLog {
   @@index([clientId])
   @@index([action])
   @@index([createdAt])
+  @@index([createdAt, id])
+  @@index([userId, createdAt, id])
   @@map("audit_logs")
 }
 
@@ -377,6 +382,9 @@ model SecurityEvent {
   @@index([severity])
   @@index([resolved])
   @@index([createdAt])
+  @@index([createdAt, id])
+  @@index([userId, createdAt, id])
+  @@index([type, createdAt, id])
   @@map("security_events")
 }
 
@@ -401,6 +409,7 @@ model AdminNotification {
   @@index([severity])
   @@index([category])
   @@index([dismissedAt])
+  @@index([userId, createdAt, id])
   @@map("admin_notifications")
 }
 
@@ -585,6 +594,10 @@ model CommunicationDeliveryLog {
   @@index([channel, purpose, createdAt])
   @@index([recipient, createdAt])
   @@index([providerId, createdAt])
+  @@index([createdAt, id])
+  @@index([channel, createdAt, id])
+  @@index([providerId, createdAt, id])
+  @@index([status, createdAt, id])
   @@map("communication_delivery_logs")
 }
 
@@ -600,8 +613,11 @@ model CommunicationProviderAuditLog {
   actorAdmin   User?                  @relation(fields: [actorAdminId], references: [id])
   provider     CommunicationProvider? @relation(fields: [providerId], references: [id])
 
-  @@index([actorAdminId, createdAt])
-  @@index([providerId, createdAt])
+  @@index([actorAdminId, createdAt], map: "communication_provider_audit_logs_actor_admin_id_created_at_idx")
+  @@index([providerId, createdAt], map: "communication_provider_audit_logs_provider_id_created_at_idx")
+  @@index([createdAt, id], map: "communication_provider_audit_logs_created_at_id_idx")
+  @@index([providerId, createdAt, id], map: "communication_provider_audit_logs_provider_id_created_at_id_idx")
+  @@index([actorAdminId, createdAt, id], map: "comm_provider_audit_actor_created_idx")
   @@map("communication_provider_audit_logs")
 }
 
@@ -793,6 +809,10 @@ model EmailSendLog {
   @@index([userId, createdAt])
   @@index([status, createdAt])
   @@index([clientId, createdAt])
+  @@index([createdAt, id])
+  @@index([templateKey, createdAt, id])
+  @@index([status, createdAt, id])
+  @@index([clientId, createdAt, id])
   @@map("email_send_logs")
 }
 

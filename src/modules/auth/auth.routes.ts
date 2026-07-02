@@ -55,6 +55,11 @@ const verifyEmailConfirmSchema = z.object({
   token: z.string().min(1),
 });
 
+const presenceHeartbeatSchema = z.object({
+  clientId: z.string().min(1).optional(),
+  appId: z.string().min(1).optional(),
+});
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 // POST /auth/register
@@ -143,6 +148,16 @@ router.post('/verify-email/confirm', enterpriseRateLimit({ route: 'auth-verify-e
   try {
     await authService.confirmEmailVerification(req.body.token, req);
     res.json({ success: true, message: 'Email verified successfully.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /auth/presence/heartbeat
+router.post('/presence/heartbeat', authGuard, enterpriseRateLimit({ route: 'auth-presence-heartbeat', windowMs: 30 * 1000, max: 2, identifierFrom: (req) => (req as AuthenticatedRequest).user?.sub }), validateBody(presenceHeartbeatSchema), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const result = await authService.heartbeatPresence(req.user!.id, req.body.appId ?? req.body.clientId ?? null);
+    res.json({ success: true, data: result });
   } catch (err) {
     next(err);
   }

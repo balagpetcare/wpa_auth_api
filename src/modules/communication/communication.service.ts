@@ -19,6 +19,9 @@ import { createAdminNotification } from '../../lib/adminNotifications.js';
 import { config } from '../../config/index.js';
 import { resolveEmailAdapter, resolveSmsAdapter } from './communication.adapters.js';
 import { getRedisClient } from '../../lib/redis.js';
+import { enqueueCommunicationJob } from '../../lib/communicationQueue.js';
+import { incrementMetric } from '../../lib/metrics.js';
+import { decodeCursor, encodeCursor } from '../../lib/pagination.js';
 import { ChannelDisabledError } from './communication.types.js';
 import type {
   OtpCommunicationInput,
@@ -176,6 +179,194 @@ async function logDeliveryAttempt(input: {
       failedAt: input.result.success ? null : new Date(),
     },
   });
+}
+
+export async function deliverQueuedEmail(input: {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+  purpose: OtpTemplatePurpose;
+  clientId?: string | null;
+  senderName?: string | null;
+  senderEmail?: string | null;
+  replyTo?: string | null;
+  environment?: 'SANDBOX' | 'LIVE' | null;
+}) {
+  const communicationPurpose = purposeToCommunicationPurpose(input.purpose);
+  let providers;
+  try {
+    providers = await findCandidateProviders({
+      channel: 'EMAIL',
+      purpose: communicationPurpose,
+      appId: input.clientId,
+      environment: input.environment,
+    });
+  } catch (err) {
+    if (err instanceof ChannelDisabledError) {
+      await logChannelDisabledBlock({
+        ruleId: err.ruleId,
+        channel: 'EMAIL',
+        purpose: input.purpose,
+        recipient: input.to,
+        appId: input.clientId,
+      });
+      throw new AppError('Email is disabled for this application.', 'CHANNEL_DISABLED', 403);
+    }
+    throw err;
+  }
+  if (!providers.length) {
+    throw new AppError('Email delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
+  }
+
+  const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
+  let rateLimitedCount = 0;
+  for (let index = 0; index < attemptsLimit; index += 1) {
+    const provider = providers[index];
+    const limitCheck = await checkProviderRateLimit(provider);
+    if (!limitCheck.allowed) {
+      rateLimitedCount += 1;
+      await logRateLimitBlock(provider, input.to, limitCheck.reason!);
+      continue;
+    }
+
+    const credentials = getCredentialSecrets(provider);
+    const adapter = resolveEmailAdapter(provider.code);
+    const result = await adapter.sendEmail({
+      to: input.to,
+      subject: input.subject,
+      text: input.text,
+      html: input.html,
+      provider,
+      credentials,
+      config: {
+        fromEmail: input.senderEmail ?? provider.activeCredential?.fromEmail ?? null,
+        fromName: input.senderName ?? provider.activeCredential?.fromName ?? null,
+        replyTo: input.replyTo ?? null,
+        smtpHost: provider.activeCredential?.smtpHost ?? null,
+        smtpPort: provider.activeCredential?.smtpPort ?? null,
+        smtpSecure: provider.activeCredential?.smtpSecure ?? null,
+      },
+    });
+
+    await logDeliveryAttempt({
+      channel: 'EMAIL',
+      purpose: input.purpose,
+      recipient: input.to,
+      providerId: provider.id,
+      attemptNo: index + 1,
+      result,
+    });
+    await updateProviderHealth(provider.id, result);
+    if (result.success) {
+      incrementMetric('email_send_total');
+      return result;
+    }
+  }
+
+  if (rateLimitedCount > 0 && rateLimitedCount === attemptsLimit) {
+    throw new AppError('Email delivery is temporarily rate-limited. Please try again shortly.', 'COMMUNICATION_RATE_LIMITED', 429);
+  }
+
+  await createAdminNotification({
+    type: 'EMAIL_DELIVERY_FAILED',
+    title: 'Email OTP delivery failed',
+    message: `All active email providers failed while sending to ${input.to}.`,
+    severity: 'ERROR',
+    category: 'SYSTEM',
+    actionUrl: '/communication/provider-health',
+  });
+  incrementMetric('email_failure_total');
+  throw new AppError('Unable to send email at this time.', 'COMMUNICATION_UNAVAILABLE', 503);
+}
+
+export async function deliverQueuedSms(input: {
+  to: string;
+  message: string;
+  purpose: OtpTemplatePurpose;
+  clientId?: string | null;
+  environment?: 'SANDBOX' | 'LIVE' | null;
+}) {
+  const countryCode = extractCountryCode(input.to);
+  const communicationPurpose = purposeToCommunicationPurpose(input.purpose);
+  let providers;
+  try {
+    providers = await findCandidateProviders({
+      channel: 'SMS',
+      purpose: communicationPurpose,
+      countryCode,
+      appId: input.clientId,
+      environment: input.environment,
+    });
+  } catch (err) {
+    if (err instanceof ChannelDisabledError) {
+      await logChannelDisabledBlock({
+        ruleId: err.ruleId,
+        channel: 'SMS',
+        purpose: input.purpose,
+        recipient: input.to,
+        appId: input.clientId,
+        countryCode,
+      });
+      throw new AppError('SMS is disabled for this application/country.', 'CHANNEL_DISABLED', 403);
+    }
+    throw err;
+  }
+  if (!providers.length) {
+    throw new AppError('SMS delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
+  }
+
+  const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
+  let rateLimitedCount = 0;
+  for (let index = 0; index < attemptsLimit; index += 1) {
+    const provider = providers[index];
+    const limitCheck = await checkProviderRateLimit(provider);
+    if (!limitCheck.allowed) {
+      rateLimitedCount += 1;
+      await logRateLimitBlock(provider, input.to, limitCheck.reason!);
+      continue;
+    }
+
+    const credentials = getCredentialSecrets(provider);
+    const adapter = resolveSmsAdapter(provider.code);
+    const result = await adapter.sendSms({
+      to: normalizePhoneToE164(input.to),
+      message: input.message,
+      countryCode,
+      provider,
+      credentials,
+    });
+
+    await logDeliveryAttempt({
+      channel: 'SMS',
+      purpose: input.purpose,
+      recipient: input.to,
+      countryCode,
+      providerId: provider.id,
+      attemptNo: index + 1,
+      result,
+    });
+    await updateProviderHealth(provider.id, result);
+    if (result.success) {
+      incrementMetric('sms_send_total');
+      return result;
+    }
+  }
+
+  if (rateLimitedCount > 0 && rateLimitedCount === attemptsLimit) {
+    throw new AppError('SMS delivery is temporarily rate-limited. Please try again shortly.', 'COMMUNICATION_RATE_LIMITED', 429);
+  }
+
+  await createAdminNotification({
+    type: 'SMS_DELIVERY_FAILED',
+    title: 'SMS OTP delivery failed',
+    message: `All active SMS providers failed while sending to ${input.to}.`,
+    severity: 'ERROR',
+    category: 'SYSTEM',
+    actionUrl: '/communication/provider-health',
+  });
+  incrementMetric('sms_failure_total');
+  throw new AppError('Unable to send SMS at this time.', 'COMMUNICATION_UNAVAILABLE', 503);
 }
 
 // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
@@ -424,88 +615,26 @@ export async function dispatchEmail(input: {
   // Omitted by existing callers, who keep their prior behavior unchanged.
   environment?: 'SANDBOX' | 'LIVE' | null;
 }) {
-  const communicationPurpose = purposeToCommunicationPurpose(input.purpose);
-  let providers;
-  try {
-    providers = await findCandidateProviders({
-      channel: 'EMAIL',
-      purpose: communicationPurpose,
-      appId: input.clientId,
-      environment: input.environment,
-    });
-  } catch (err) {
-    if (err instanceof ChannelDisabledError) {
-      await logChannelDisabledBlock({
-        ruleId: err.ruleId,
-        channel: 'EMAIL',
-        purpose: input.purpose,
-        recipient: input.to,
-        appId: input.clientId,
-      });
-      throw new AppError('Email is disabled for this application.', 'CHANNEL_DISABLED', 403);
-    }
-    throw err;
-  }
-  if (!providers.length) {
-    throw new AppError('Email delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
-  }
-
-  const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
-  let rateLimitedCount = 0;
-  for (let index = 0; index < attemptsLimit; index += 1) {
-    const provider = providers[index];
-
-    const limitCheck = await checkProviderRateLimit(provider);
-    if (!limitCheck.allowed) {
-      rateLimitedCount += 1;
-      await logRateLimitBlock(provider, input.to, limitCheck.reason!);
-      continue;
-    }
-
-    const credentials = getCredentialSecrets(provider);
-    const adapter = resolveEmailAdapter(provider.code);
-    const result = await adapter.sendEmail({
-      to: input.to,
+  const result = await enqueueCommunicationJob({
+    type: 'send_email',
+    payload: {
       subject: input.subject,
       text: input.text,
       html: input.html,
-      provider,
-      credentials,
-      config: {
-        fromEmail: input.senderEmail ?? provider.activeCredential?.fromEmail ?? null,
-        fromName: input.senderName ?? provider.activeCredential?.fromName ?? null,
-        replyTo: input.replyTo ?? null,
-        smtpHost: provider.activeCredential?.smtpHost ?? null,
-        smtpPort: provider.activeCredential?.smtpPort ?? null,
-        smtpSecure: provider.activeCredential?.smtpSecure ?? null,
-      },
-    });
-
-    await logDeliveryAttempt({
-      channel: 'EMAIL',
+      recipientEmail: input.to,
+      recipientName: input.senderName ?? undefined,
+      clientId: input.clientId ?? null,
+      locale: 'en',
       purpose: input.purpose,
-      recipient: input.to,
-      providerId: provider.id,
-      attemptNo: index + 1,
-      result,
-    });
-    await updateProviderHealth(provider.id, result);
-    if (result.success) return result;
-  }
-
-  if (rateLimitedCount > 0 && rateLimitedCount === attemptsLimit) {
-    throw new AppError('Email delivery is temporarily rate-limited. Please try again shortly.', 'COMMUNICATION_RATE_LIMITED', 429);
-  }
-
-  await createAdminNotification({
-    type: 'EMAIL_DELIVERY_FAILED',
-    title: 'Email OTP delivery failed',
-    message: `All active email providers failed while sending to ${input.to}.`,
-    severity: 'ERROR',
-    category: 'SYSTEM',
-    actionUrl: '/communication/provider-health',
+      userId: null,
+    },
   });
-  throw new AppError('Unable to send email at this time.', 'COMMUNICATION_UNAVAILABLE', 503);
+  incrementMetric('otp_send_total');
+  return {
+    success: true,
+    queued: true,
+    jobId: result.jobId,
+  };
 }
 
 export async function dispatchSms(input: {
@@ -517,83 +646,22 @@ export async function dispatchSms(input: {
   clientId?: string | null;
   environment?: 'SANDBOX' | 'LIVE' | null;
 }) {
-  const countryCode = extractCountryCode(input.to);
-  const communicationPurpose = purposeToCommunicationPurpose(input.purpose);
-  let providers;
-  try {
-    providers = await findCandidateProviders({
-      channel: 'SMS',
-      purpose: communicationPurpose,
-      countryCode,
-      appId: input.clientId,
-      environment: input.environment,
-    });
-  } catch (err) {
-    if (err instanceof ChannelDisabledError) {
-      await logChannelDisabledBlock({
-        ruleId: err.ruleId,
-        channel: 'SMS',
-        purpose: input.purpose,
-        recipient: input.to,
-        appId: input.clientId,
-        countryCode,
-      });
-      throw new AppError('SMS is disabled for this application/country.', 'CHANNEL_DISABLED', 403);
-    }
-    throw err;
-  }
-  if (!providers.length) {
-    throw new AppError('SMS delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
-  }
-
-  const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
-  let rateLimitedCount = 0;
-  for (let index = 0; index < attemptsLimit; index += 1) {
-    const provider = providers[index];
-
-    const limitCheck = await checkProviderRateLimit(provider);
-    if (!limitCheck.allowed) {
-      rateLimitedCount += 1;
-      await logRateLimitBlock(provider, input.to, limitCheck.reason!);
-      continue;
-    }
-
-    const credentials = getCredentialSecrets(provider);
-    const adapter = resolveSmsAdapter(provider.code);
-    const result = await adapter.sendSms({
-      to: normalizePhoneToE164(input.to),
+  const result = await enqueueCommunicationJob({
+    type: 'send_sms',
+    payload: {
+      to: input.to,
       message: input.message,
-      countryCode,
-      provider,
-      credentials,
-    });
-
-    await logDeliveryAttempt({
-      channel: 'SMS',
       purpose: input.purpose,
-      recipient: input.to,
-      countryCode,
-      providerId: provider.id,
-      attemptNo: index + 1,
-      result,
-    });
-    await updateProviderHealth(provider.id, result);
-    if (result.success) return result;
-  }
-
-  if (rateLimitedCount > 0 && rateLimitedCount === attemptsLimit) {
-    throw new AppError('SMS delivery is temporarily rate-limited. Please try again shortly.', 'COMMUNICATION_RATE_LIMITED', 429);
-  }
-
-  await createAdminNotification({
-    type: 'SMS_DELIVERY_FAILED',
-    title: 'SMS OTP delivery failed',
-    message: `All active SMS providers failed while sending to ${input.to}.`,
-    severity: 'ERROR',
-    category: 'SYSTEM',
-    actionUrl: '/communication/provider-health',
+      clientId: input.clientId ?? null,
+      userId: null,
+    },
   });
-  throw new AppError('Unable to send SMS at this time.', 'COMMUNICATION_UNAVAILABLE', 503);
+  incrementMetric('otp_send_total');
+  return {
+    success: true,
+    queued: true,
+    jobId: result.jobId,
+  };
 }
 
 export async function sendOtpEmail(input: OtpCommunicationInput & { email: string }) {
@@ -979,6 +1047,7 @@ export async function testProvider(providerId: string, actorId: string, req: Req
     req,
   });
   await updateProviderHealth(providerId, result);
+  incrementMetric('provider_health_check_total');
   return result;
 }
 
@@ -1017,34 +1086,70 @@ export async function getDeliveryLogs(filters: {
   status?: CommunicationDeliveryStatus;
   recipient?: string;
   countryCode?: string;
+  cursor?: string;
   limit: number;
 }) {
-  return prisma.communicationDeliveryLog.findMany({
-    where: {
+  const limit = Math.min(filters.limit, 100);
+  const where: Prisma.CommunicationDeliveryLogWhereInput = {
       ...(filters.channel ? { channel: filters.channel } : {}),
       ...(filters.providerId ? { providerId: filters.providerId } : {}),
       ...(filters.status ? { status: filters.status } : {}),
       ...(filters.recipient ? { recipient: { contains: filters.recipient, mode: 'insensitive' } } : {}),
       ...(filters.countryCode ? { countryCode: filters.countryCode } : {}),
-    },
+  };
+  if (filters.cursor) {
+    const decoded = decodeCursor(filters.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.CommunicationDeliveryLogWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
+  const logs = await prisma.communicationDeliveryLog.findMany({
+    where,
     include: {
       provider: { select: { id: true, name: true, code: true } },
       template: { select: { id: true, purpose: true, language: true } },
     },
-    take: Math.min(filters.limit, 100),
-    orderBy: { createdAt: 'desc' },
+    take: limit + 1,
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
   });
+  const hasNextPage = logs.length > limit;
+  const items = hasNextPage ? logs.slice(0, -1) : logs;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+  };
 }
 
-export async function getProviderAuditLogs(limit: number) {
-  return prisma.communicationProviderAuditLog.findMany({
+export async function getProviderAuditLogs(opts: { limit: number; cursor?: string }) {
+  const limit = Math.min(opts.limit, 100);
+  const where: Prisma.CommunicationProviderAuditLogWhereInput = {};
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.CommunicationProviderAuditLogWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
+  const logs = await prisma.communicationProviderAuditLog.findMany({
+    where,
     include: {
       actorAdmin: { select: { id: true, email: true, username: true } },
       provider: { select: { id: true, name: true, code: true } },
     },
-    take: Math.min(limit, 100),
-    orderBy: { createdAt: 'desc' },
+    take: limit + 1,
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
   });
+  const hasNextPage = logs.length > limit;
+  const items = hasNextPage ? logs.slice(0, -1) : logs;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+  };
 }
 
 export async function listRoutingRules() {

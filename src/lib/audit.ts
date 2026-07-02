@@ -18,7 +18,9 @@ export async function writeAuditLog(opts: {
       action: opts.action,
       resource: opts.resource,
       resourceId: opts.resourceId,
-      metadata: opts.metadata,
+      metadata: opts.req?.requestId
+        ? { ...(opts.metadata as Record<string, unknown> | undefined), requestId: opts.req.requestId }
+        : opts.metadata,
       ipAddress: opts.req ? (opts.req.ip ?? opts.req.socket.remoteAddress) : undefined,
       userAgent: opts.req?.headers['user-agent'],
     },
@@ -37,7 +39,9 @@ export async function writeSecurityEvent(opts: {
       userId: opts.userId,
       type: opts.type,
       severity: opts.severity,
-      metadata: opts.metadata,
+      metadata: opts.req?.requestId
+        ? { ...(opts.metadata as Record<string, unknown> | undefined), requestId: opts.req.requestId }
+        : opts.metadata,
       ipAddress: opts.req ? (opts.req.ip ?? opts.req.socket.remoteAddress) : undefined,
       userAgent: opts.req?.headers['user-agent'],
     }

@@ -8,7 +8,9 @@ import { getPublicAvatarUrl, removeAvatarByUrl } from '../../lib/avatarStorage.j
 import { sendEmail } from '../../lib/mailer.js';
 import { sendTemplatedEmailWithFallback } from '../../lib/sendTemplatedEmail.js';
 import { PaginationParams } from '../../lib/pagination.js';
+import { CursorPaginationInput, decodeCursor, encodeCursor, parseCursorLimit } from '../../lib/pagination.js';
 import { Request } from 'express';
+import { getPresenceSummary } from '../../lib/presence.js';
 
 // ─── Shared selects ──────────────────────────────────────────────────────────
 
@@ -25,6 +27,7 @@ const safeUserSelect = {
   createdAt: true,
   updatedAt: true,
   lastLoginAt: true,
+  lastSeenAt: true,
   lastPasswordChangedAt: true,
   roles: {
     select: {
@@ -246,6 +249,75 @@ export async function getUserById(id: string) {
   };
 }
 
+export async function getUserPresence(id: string) {
+  const user = await prisma.user.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      lastSeenAt: true,
+      lastLoginAt: true,
+      status: true,
+      loginSessions: {
+        orderBy: { lastActiveAt: 'desc' },
+        take: 25,
+        select: {
+          id: true,
+          clientId: true,
+          revokedAt: true,
+          expiresAt: true,
+          lastActiveAt: true,
+          createdAt: true,
+        },
+      },
+      clientAccess: {
+        select: {
+          clientId: true,
+          status: true,
+          client: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!user) throw new AppError('User not found.', 'NOT_FOUND', 404);
+
+  const redisPresence = await getPresenceSummary(id);
+  const activeSessions = user.loginSessions.filter((session) => !session.revokedAt && session.expiresAt > new Date());
+  const appMap = new Map(user.clientAccess.map((access) => [access.clientId, access.client]));
+  const appsOnline = redisPresence.appsOnline
+    .map((clientId) => appMap.get(clientId))
+    .filter((client): client is { id: string; name: string; slug: string } => Boolean(client))
+    .map((client) => ({
+      clientId: client.id,
+      name: client.name,
+      slug: client.slug,
+    }));
+
+  return {
+    onlineNow: redisPresence.onlineNow,
+    appsOnline,
+    lastSeenAt: user.lastSeenAt,
+    lastLoginAt: user.lastLoginAt,
+    activeSessions: {
+      total: user.loginSessions.length,
+      active: activeSessions.length,
+      activeSessions: activeSessions.map((session) => ({
+        id: session.id,
+        clientId: session.clientId,
+        createdAt: session.createdAt,
+        lastActiveAt: session.lastActiveAt,
+        expiresAt: session.expiresAt,
+      })),
+    },
+  };
+}
+
 export async function updateUserStatus(
   id: string,
   status: UserStatus,
@@ -360,27 +432,57 @@ export async function revokeUserSessions(id: string, actorId: string, req: Reque
   return { revokedCount: count.count };
 }
 
-export async function getUserSessions(id: string) {
-  return prisma.loginSession.findMany({
-    where: { userId: id },
+export async function getUserSessions(id: string, opts: { cursor?: string; limit?: number } = {}) {
+  const limit = parseCursorLimit(opts.limit ?? 50, 50);
+  const where: Prisma.LoginSessionWhereInput = { userId: id };
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.LoginSessionWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
+
+  const sessions = await prisma.loginSession.findMany({
+    where,
     select: { id: true, ipAddress: true, userAgent: true, country: true, expiresAt: true, revokedAt: true, lastActiveAt: true, createdAt: true, client: { select: { name: true, slug: true } } },
-    orderBy: { createdAt: 'desc' },
-    take: 50,
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: limit + 1,
   });
+  const hasNextPage = sessions.length > limit;
+  const items = hasNextPage ? sessions.slice(0, -1) : sessions;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+  };
 }
 
-export async function getUserAuditLogs(id: string, pagination: PaginationParams) {
-  const [logs, total] = await prisma.$transaction([
-    prisma.auditLog.findMany({
-      where: { userId: id },
-      select: { id: true, action: true, resource: true, resourceId: true, ipAddress: true, metadata: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-      skip: pagination.skip,
-      take: pagination.limit,
-    }),
-    prisma.auditLog.count({ where: { userId: id } }),
-  ]);
-  return { logs, total };
+export async function getUserAuditLogs(id: string, opts: { cursor?: string; limit?: number }) {
+  const limit = parseCursorLimit(opts.limit ?? 50, 50);
+  const where: Prisma.AuditLogWhereInput = { userId: id };
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.AuditLogWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
+  const logs = await prisma.auditLog.findMany({
+    where,
+    select: { id: true, action: true, resource: true, resourceId: true, ipAddress: true, metadata: true, createdAt: true },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: limit + 1,
+  });
+  const hasNextPage = logs.length > limit;
+  const items = hasNextPage ? logs.slice(0, -1) : logs;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+  };
 }
 
 // ─── Roles & Permissions ─────────────────────────────────────────────────────
@@ -846,54 +948,80 @@ export async function updateClientStatus(id: string, status: AuthClientStatus, a
 export async function listAuditLogs(opts: {
   userId?: string;
   action?: string;
-  pagination: PaginationParams;
+  pagination?: PaginationParams;
+  cursor?: string;
+  limit?: number;
 }) {
   const where: Prisma.AuditLogWhereInput = {};
   if (opts.userId) where.userId = opts.userId;
   if (opts.action) where.action = opts.action as any;
+  const limit = parseCursorLimit(opts.limit ?? opts.pagination?.limit ?? 50, 50);
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.AuditLogWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
 
-  const [logs, total] = await prisma.$transaction([
-    prisma.auditLog.findMany({
-      where,
-      select: {
-        id: true, action: true, resource: true, resourceId: true,
-        ipAddress: true, metadata: true, createdAt: true,
-        user: { select: { id: true, email: true, username: true } },
-        client: { select: { id: true, name: true, slug: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip: opts.pagination.skip,
-      take: opts.pagination.limit,
-    }),
-    prisma.auditLog.count({ where }),
-  ]);
-  return { logs, total };
+  const logs = await prisma.auditLog.findMany({
+    where,
+    select: {
+      id: true, action: true, resource: true, resourceId: true,
+      ipAddress: true, metadata: true, createdAt: true,
+      user: { select: { id: true, email: true, username: true } },
+      client: { select: { id: true, name: true, slug: true } },
+    },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: limit + 1,
+  });
+  const hasNextPage = logs.length > limit;
+  const items = hasNextPage ? logs.slice(0, -1) : logs;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+  };
 }
 
 export async function listSecurityEvents(opts: {
   userId?: string;
   resolved?: boolean;
-  pagination: PaginationParams;
+  pagination?: PaginationParams;
+  cursor?: string;
+  limit?: number;
 }) {
   const where: Prisma.SecurityEventWhereInput = {};
   if (opts.userId) where.userId = opts.userId;
   if (opts.resolved !== undefined) where.resolved = opts.resolved;
+  const limit = parseCursorLimit(opts.limit ?? opts.pagination?.limit ?? 50, 50);
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.SecurityEventWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
 
-  const [events, total] = await prisma.$transaction([
-    prisma.securityEvent.findMany({
-      where,
-      select: {
-        id: true, type: true, severity: true, ipAddress: true,
-        metadata: true, resolved: true, createdAt: true,
-        user: { select: { id: true, email: true, username: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip: opts.pagination.skip,
-      take: opts.pagination.limit,
-    }),
-    prisma.securityEvent.count({ where }),
-  ]);
-  return { events, total };
+  const events = await prisma.securityEvent.findMany({
+    where,
+    select: {
+      id: true, type: true, severity: true, ipAddress: true,
+      metadata: true, resolved: true, createdAt: true,
+      user: { select: { id: true, email: true, username: true } },
+    },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: limit + 1,
+  });
+  const hasNextPage = events.length > limit;
+  const items = hasNextPage ? events.slice(0, -1) : events;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+  };
 }
 
 export async function getDashboardStats() {
@@ -987,8 +1115,9 @@ export async function updateSocialProvider(
 
 // ─── Global Sessions ────────────────────────────────────────────────────────
 
-export async function listGlobalSessions(opts: { search?: string; status?: string; userId?: string; pagination: PaginationParams }) {
+export async function listGlobalSessions(opts: { search?: string; status?: string; userId?: string; pagination?: PaginationParams; cursor?: string; limit?: number }) {
   const where: Prisma.LoginSessionWhereInput = {};
+  const limit = parseCursorLimit(opts.limit ?? opts.pagination?.limit ?? 50, 50);
   
   if (opts.userId) {
     where.userId = opts.userId;
@@ -1012,6 +1141,14 @@ export async function listGlobalSessions(opts: { search?: string; status?: strin
     ];
   }
 
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    where.AND = [
+      ...(where.AND as Prisma.LoginSessionWhereInput[] ?? []),
+      { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+    ];
+  }
+
   const [sessions, total] = await prisma.$transaction([
     prisma.loginSession.findMany({
       where,
@@ -1027,9 +1164,8 @@ export async function listGlobalSessions(opts: { search?: string; status?: strin
         createdAt: true,
         user: { select: { email: true, username: true } },
       },
-      orderBy: { createdAt: 'desc' },
-      skip: opts.pagination.skip,
-      take: opts.pagination.limit,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     }),
     prisma.loginSession.count({ where }),
   ]);
@@ -1041,7 +1177,15 @@ export async function listGlobalSessions(opts: { search?: string; status?: strin
     return { ...s, status };
   });
 
-  return { sessions: mapped, total };
+  const hasNextPage = mapped.length > limit;
+  const items = hasNextPage ? mapped.slice(0, -1) : mapped;
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
+    hasNextPage,
+    limit,
+    total,
+  };
 }
 
 export async function revokeSession(id: string, actorId: string, req: Request) {
@@ -1468,7 +1612,7 @@ export async function listMyNotifications(opts: {
     select: adminNotificationSelect,
     take: limit + 1,
     skip: opts.cursor ? 1 : 0,
-    cursor: opts.cursor ? { id: opts.cursor } : undefined,
+    cursor: opts.cursor ? { id: decodeCursor(opts.cursor).id } : undefined,
     orderBy: [
       { createdAt: 'desc' },
       { id: 'desc' },
@@ -1481,7 +1625,7 @@ export async function listMyNotifications(opts: {
 
   const hasNextPage = items.length > limit;
   const sliced = hasNextPage ? items.slice(0, -1) : items;
-  const nextCursor = hasNextPage ? sliced[sliced.length - 1]?.id ?? null : null;
+  const nextCursor = hasNextPage ? encodeCursor({ createdAt: sliced[sliced.length - 1].createdAt, id: sliced[sliced.length - 1].id }) : null;
 
   return {
     items: sliced,
@@ -1635,14 +1779,15 @@ export async function listAdminUsers(opts: {
   };
 
   if (opts.cursor) {
-    queryArgs.cursor = { id: opts.cursor };
+    const decoded = decodeCursor(opts.cursor);
+    queryArgs.cursor = { id: decoded.id };
     queryArgs.skip = 1;
   }
 
   const results = await prisma.user.findMany(queryArgs);
   const hasNextPage = results.length > limit;
   const items = hasNextPage ? results.slice(0, -1) : results;
-  const nextCursor = hasNextPage ? items[items.length - 1].id : null;
+  const nextCursor = hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null;
 
   const superAdminRole = await prisma.role.findFirst({ where: { name: { in: ['super_admin', 'SUPER_ADMIN'] } } });
   let superAdminIds: string[] = [];

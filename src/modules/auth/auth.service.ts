@@ -19,6 +19,8 @@ import { sendTemplatedEmail, sendTemplatedEmailWithFallback } from '../../lib/se
 import { sendLoginAlertEmail, sendWelcomeEmail } from '../../lib/emailNotifications.js';
 import { Request } from 'express';
 import { logAbuseSignal, clearRisk } from '../../lib/antiAbuse.js';
+import { recordPresenceHeartbeat } from '../../lib/presence.js';
+import { incrementMetric } from '../../lib/metrics.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -192,12 +194,14 @@ export async function loginUser(
   });
 
   if (!user || !user.passwordHash) {
+    incrementMetric('login_failure_total');
     await logAbuseSignal({ route: 'auth-login', req, identifier: identifier, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
   }
 
   const valid = await bcrypt.compare(opts.password, user.passwordHash);
   if (!valid) {
+    incrementMetric('login_failure_total');
     await writeAuditLog({ userId: user.id, action: 'LOGIN', metadata: { success: false }, req });
     await logAbuseSignal({ route: 'auth-login', req, identifier: identifier, userId: user.id, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
@@ -254,6 +258,7 @@ export async function loginUser(
   });
 
   await writeAuditLog({ userId: user.id, clientId: client?.id, action: 'LOGIN', metadata: { success: true }, req });
+  incrementMetric('login_success_total');
   await clearRisk({ req, identifier });
 
   // Send login alert email
@@ -355,6 +360,7 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
           threat: 'REFRESH_TOKEN_REUSE_DETECTED',
           blockAfter: 3,
         });
+        incrementMetric('refresh_token_reuse_total');
 
         // Write SecurityEvent
         await writeSecurityEvent({
@@ -572,6 +578,7 @@ export async function forgotPassword(email: string, req: Request) {
     'Password Reset Request',
     `You requested a password reset. Click here to reset: ${resetLink}`
   );
+  incrementMetric('otp_send_total');
 
   // Never return raw token in production
   if (process.env.NODE_ENV === 'development') {
@@ -672,6 +679,7 @@ export async function requestEmailVerification(userId: string, email: string, re
     'Verify your email',
     `Please verify your email by clicking this link: ${verificationLink}`
   );
+  incrementMetric('otp_send_total');
 
   if (process.env.NODE_ENV === 'development') {
     return token;
@@ -704,6 +712,15 @@ export async function confirmEmailVerification(token: string, req: Request) {
       console.error('Failed to send welcome email', e);
     }
   }
+}
+
+export async function heartbeatPresence(userId: string, appId: string | null | undefined) {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
+  if (!user) throw new AppError('User not found.', 'NOT_FOUND', 404);
+  if (user.status === UserStatus.SUSPENDED || user.status === UserStatus.DELETED) {
+    throw new AppError('Account is not active.', 'ACCOUNT_INACTIVE', 403);
+  }
+  return recordPresenceHeartbeat({ userId, appId: appId ?? undefined });
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────

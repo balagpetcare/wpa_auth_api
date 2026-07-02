@@ -98,7 +98,7 @@ const sendLogsQuerySchema = z.object({
   status: z.enum(['PENDING', 'SENT', 'FAILED', 'BOUNCED']).optional(),
   recipientEmail: z.string().optional(),
   limit: z.coerce.number().min(1).max(100).optional().default(50),
-  offset: z.coerce.number().min(0).optional().default(0),
+  cursor: z.string().optional(),
 });
 
 // ─── Email Branding ──────────────────────────────────────────────────────────
@@ -620,11 +620,19 @@ router.get(
         };
       }
 
+      if (query.cursor) {
+        const { decodeCursor } = await import('../../lib/pagination.js');
+        const decoded = decodeCursor(query.cursor);
+        where.AND = [
+          ...(where.AND ?? []),
+          { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
+        ];
+      }
+
       const logs = await prisma.emailSendLog.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
-        take: query.limit,
-        skip: query.offset,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: query.limit + 1,
         select: {
           id: true,
           templateKey: true,
@@ -635,16 +643,19 @@ router.get(
           createdAt: true,
         },
       });
-
-      const total = await prisma.emailSendLog.count({ where });
+      const hasNextPage = logs.length > query.limit;
+      const items = hasNextPage ? logs.slice(0, -1) : logs;
+      const nextCursor = hasNextPage
+        ? Buffer.from(JSON.stringify({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }), 'utf8').toString('base64url')
+        : null;
 
       res.json({
         success: true,
         data: {
-          items: logs,
-          total,
+          items,
+          nextCursor,
+          hasNextPage,
           limit: query.limit,
-          offset: query.offset,
         },
       });
     } catch (error) {

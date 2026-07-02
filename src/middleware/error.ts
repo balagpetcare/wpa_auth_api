@@ -5,7 +5,12 @@ import multer from 'multer';
 
 export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction) {
   if (err instanceof AppError) {
-    res.status(err.status).json({ success: false, message: err.message, code: err.code });
+    res.status(err.status).json({
+      success: false,
+      message: err.message,
+      code: err.code,
+      requestId: req.requestId,
+    });
     return;
   }
 
@@ -17,6 +22,6 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
-  logger.error(err, 'Unhandled error');
-  res.status(500).json({ success: false, message: 'Internal Server Error', code: 'INTERNAL_ERROR' });
+  logger.error({ err, requestId: req.requestId, path: req.originalUrl, method: req.method }, 'Unhandled error');
+  res.status(500).json({ success: false, message: 'Internal Server Error', code: 'INTERNAL_ERROR', requestId: req.requestId });
 }

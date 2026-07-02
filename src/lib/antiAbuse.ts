@@ -4,7 +4,8 @@ import { getRedisClient } from './redis.js';
 import { AppError } from './errors.js';
 import { Prisma } from '@prisma/client';
 import { writeSecurityEvent } from './audit.js';
-import { createAdminNotification } from './adminNotifications.js';
+import { enqueueCommunicationJob } from './communicationQueue.js';
+import { incrementMetric } from './metrics.js';
 
 type ThreatKind =
   | 'RATE_LIMIT_BLOCKED'
@@ -67,14 +68,17 @@ async function emitThreatEvent(req: Request, threat: ThreatKind, metadata: Recor
 
   if (threat === 'ADMIN_LOGIN_ABUSE' || threat === 'BOT_TRAFFIC_SPIKE' || threat === 'SUSPICIOUS_ACTIVITY_BLOCKED') {
     try {
-    await createAdminNotification({
-        type: threat,
-        title: 'Suspicious activity detected',
-        message: 'Temporary abuse protection was triggered for one or more admin or public auth routes.',
-        severity: 'SECURITY',
-        category: 'SECURITY',
-        actionUrl: '/security-events',
-        metadata: metadata as Prisma.InputJsonValue,
+      await enqueueCommunicationJob({
+        type: 'send_admin_notification',
+        payload: {
+          type: threat,
+          title: 'Suspicious activity detected',
+          message: 'Temporary abuse protection was triggered for one or more admin or public auth routes.',
+          severity: 'SECURITY',
+          category: 'SECURITY',
+          actionUrl: '/security-events',
+          metadata: metadata as Record<string, unknown>,
+        },
       });
     } catch (err) {
       console.error('Failed to write abuse admin notification:', err);
@@ -92,6 +96,7 @@ async function applyBlock(req: Request, route: string, ip: string, identifier?: 
     multi.set(identifierBlockKey(identifier), route, 'PX', ttlMs);
   }
   await multi.exec();
+  incrementMetric('rate_limit_block_total');
   await emitThreatEvent(req, threat, {
     route,
     ip,

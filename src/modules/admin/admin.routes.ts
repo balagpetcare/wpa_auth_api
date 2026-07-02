@@ -11,6 +11,7 @@ import * as authService from '../auth/auth.service.js';
 import { avatarUpload } from '../../middleware/upload.js';
 import { AppError } from '../../lib/errors.js';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
+import { renderPrometheusMetrics } from '../../lib/metrics.js';
 
 const router = Router();
 
@@ -228,8 +229,10 @@ router.post('/users/:id/revoke-sessions', requirePermission('users:manage', 'adm
 // GET /admin/users/:id/sessions
 router.get('/users/:id/sessions', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
-    const sessions = await adminService.getUserSessions((req.params.id as string));
-    res.json({ success: true, sessions });
+    const cursor = typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.getUserSessions((req.params.id as string), { cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -238,9 +241,10 @@ router.get('/users/:id/sessions', requirePermission('users:read', 'admin:read'),
 // GET /admin/users/:id/audit-logs
 router.get('/users/:id/audit-logs', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
-    const pagination = parsePagination(req);
-    const { logs, total } = await adminService.getUserAuditLogs((req.params.id as string), pagination);
-    res.json({ success: true, ...paginatedResponse(logs, total, pagination) });
+    const cursor = typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.getUserAuditLogs(req.params.id as string, { cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -302,6 +306,16 @@ router.get('/end-users/:id', requirePermission('users:read', 'admin:read'), asyn
   }
 });
 
+// GET /admin/end-users/:id/presence
+router.get('/end-users/:id/presence', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
+  try {
+    const presence = await adminService.getUserPresence(req.params.id as string);
+    res.json({ success: true, presence });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // PATCH /admin/end-users/:id/status
 router.patch('/end-users/:id/status', requirePermission('users:manage', 'admin:manage'), validateBody(z.object({ status: z.nativeEnum(UserStatus) })), async (req: AuthenticatedRequest, res, next) => {
   try {
@@ -315,8 +329,10 @@ router.patch('/end-users/:id/status', requirePermission('users:manage', 'admin:m
 // GET /admin/end-users/:id/sessions
 router.get('/end-users/:id/sessions', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
-    const sessions = await adminService.getUserSessions((req.params.id as string));
-    res.json({ success: true, sessions });
+    const cursor = typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.getUserSessions((req.params.id as string), { cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -325,9 +341,10 @@ router.get('/end-users/:id/sessions', requirePermission('users:read', 'admin:rea
 // GET /admin/end-users/:id/audit-logs
 router.get('/end-users/:id/audit-logs', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
-    const pagination = parsePagination(req);
-    const { logs, total } = await adminService.getUserAuditLogs((req.params.id as string), pagination);
-    res.json({ success: true, ...paginatedResponse(logs, total, pagination) });
+    const cursor = typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.getUserAuditLogs((req.params.id as string), { cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -594,11 +611,12 @@ router.patch('/clients/:id/status', validateBody(z.object({ status: z.nativeEnum
 // GET /admin/audit-logs
 router.get('/audit-logs', async (req, res, next) => {
   try {
-    const pagination = parsePagination(req);
     const userId = req.query['userId'] as string | undefined;
     const action = req.query['action'] as string | undefined;
-    const { logs, total } = await adminService.listAuditLogs({ userId, action, pagination });
-    res.json({ success: true, ...paginatedResponse(logs, total, pagination) });
+    const cursor = req.query['cursor'] as string | undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.listAuditLogs({ userId, action, cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -607,12 +625,13 @@ router.get('/audit-logs', async (req, res, next) => {
 // GET /admin/security-events
 router.get('/security-events', async (req, res, next) => {
   try {
-    const pagination = parsePagination(req);
     const userId = req.query['userId'] as string | undefined;
     const resolvedParam = req.query['resolved'] as string | undefined;
     const resolved = resolvedParam === 'true' ? true : resolvedParam === 'false' ? false : undefined;
-    const { events, total } = await adminService.listSecurityEvents({ userId, resolved, pagination });
-    res.json({ success: true, ...paginatedResponse(events, total, pagination) });
+    const cursor = req.query['cursor'] as string | undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.listSecurityEvents({ userId, resolved, cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
@@ -626,6 +645,11 @@ router.get('/dashboard/stats', async (_req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// GET /admin/metrics
+router.get('/metrics', requirePermission('admin:read'), async (_req, res) => {
+  res.type('text/plain').send(renderPrometheusMetrics());
 });
 
 // ─── Social Providers ────────────────────────────────────────────────────────
@@ -657,12 +681,13 @@ router.patch('/social-providers/:provider', validateBody(z.object({
 // ─── Global Sessions ────────────────────────────────────────────────────────
 router.get('/sessions', async (req, res, next) => {
   try {
-    const pagination = parsePagination(req);
     const search = req.query['search'] as string | undefined;
     const status = req.query['status'] as string | undefined;
     const userId = req.query['userId'] as string | undefined;
-    const { sessions, total } = await adminService.listGlobalSessions({ search, status, userId, pagination });
-    res.json({ success: true, ...paginatedResponse(sessions, total, pagination) });
+    const cursor = req.query['cursor'] as string | undefined;
+    const limit = Number(req.query['limit'] ?? 50);
+    const data = await adminService.listGlobalSessions({ search, status, userId, cursor, limit });
+    res.json({ success: true, data });
   } catch (err) {
     next(err);
   }

@@ -5,9 +5,8 @@
 
 import { EmailTemplateKey, EmailVariables } from './emailRenderer.types.js';
 import { renderEmailTemplate } from './emailRenderer.js';
-import { dispatchEmail } from '../modules/communication/communication.service.js';
-import { prisma } from './db.js';
 import type { OtpTemplatePurpose } from '@prisma/client';
+import { dispatchEmail } from '../modules/communication/communication.service.js';
 
 interface SendTemplatedEmailInput {
   templateKey: EmailTemplateKey;
@@ -24,6 +23,7 @@ interface SendTemplatedEmailInput {
 
 interface SendTemplatedEmailResult {
   success: boolean;
+  queued?: boolean;
   error?: string;
   sendLogId?: string;
 }
@@ -72,7 +72,7 @@ export async function sendTemplatedEmail(
       input.locale
     );
 
-    // Send the email with client-specific sender info
+    // Enqueue the email send. The worker will do the actual provider dispatch.
     const sendResult = await dispatchEmail({
       to: recipientEmail,
       subject: rendered.subject,
@@ -85,43 +85,9 @@ export async function sendTemplatedEmail(
       replyTo: rendered.replyTo,
     });
 
-    // Log successful send with all context
-    const logData: any = {
-      templateKey: input.templateKey,
-      locale: input.locale || 'en',
-      clientId: input.clientId ?? null,
-      recipientEmail,
-      subject: rendered.subject,
-      variables: loggedVariables as any,
-      status: 'sent',
-      deliveryStatus: 'sent',
-      userId: input.userId ?? null,
-      senderName: rendered.senderName,
-      senderEmail: rendered.senderEmail,
-      sentAt: new Date(),
-    };
-    if (input.recipientName) {
-      logData.recipientName = input.recipientName;
-    }
-
-    // Safely log provider response without exposing sensitive data
-    if (sendResult.rawResponse) {
-      const response = sendResult.rawResponse as any;
-      logData.providerResponse = {
-        messageId: response.messageId,
-        status: response.status,
-        timestamp: response.timestamp,
-        // Don't log full response - just essential fields
-      };
-    }
-
-    const log = await prisma.emailSendLog.create({
-      data: logData,
-    });
-
     return {
       success: true,
-      sendLogId: log.id,
+      queued: Boolean((sendResult as any).queued ?? true),
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -142,41 +108,10 @@ export async function sendTemplatedEmail(
       // If we can't render for sender info, continue without it
     }
 
-    // Log failed send with context
-    try {
-      const logData: any = {
-        templateKey: input.templateKey,
-        locale: input.locale || 'en',
-        clientId: input.clientId ?? null,
-        recipientEmail,
-        subject: `[FAILED] ${input.templateKey}`,
-        variables: loggedVariables as any,
-        status: 'failed',
-        deliveryStatus: 'failed',
-        userId: input.userId ?? null,
-        errorMessage,
-        failedAt: new Date(),
-      };
-      if (senderName) logData.senderName = senderName;
-      if (senderEmail) logData.senderEmail = senderEmail;
-      if (input.recipientName) logData.recipientName = input.recipientName;
-
-      const log = await prisma.emailSendLog.create({
-        data: logData,
-      });
-
-      return {
-        success: false,
-        error: errorMessage,
-        sendLogId: log.id,
-      };
-    } catch (logError) {
-      console.error('Failed to log email send attempt:', logError);
-      return {
-        success: false,
-        error: errorMessage,
-      };
-    }
+    return {
+      success: false,
+      error: errorMessage,
+    };
   }
 }
 
@@ -212,48 +147,12 @@ export async function sendTemplatedEmailWithFallback(
         purpose,
       });
 
-      // Log the fallback send
-      const maskData = input.maskSensitiveData ?? true;
-      const loggedVariables = maskData ? maskSensitiveValues(input.variables) : input.variables;
-      const logData: any = {
-        templateKey: input.templateKey,
-        recipientEmail,
-        subject: `[FALLBACK] ${fallbackSubject}`,
-        variables: loggedVariables as any,
-        status: 'SUCCESS_FALLBACK',
-        userId: input.userId ?? null,
-        errorMessage: `Template render failed, used fallback: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      };
-
-      await prisma.emailSendLog.create({
-        data: logData,
-      });
-
       return {
         success: true,
+        queued: true,
       };
     } catch (fallbackError) {
       const errorMessage = fallbackError instanceof Error ? fallbackError.message : 'Unknown error';
-
-      try {
-        const maskData = input.maskSensitiveData ?? true;
-        const loggedVariables = maskData ? maskSensitiveValues(input.variables) : input.variables;
-        const logData: any = {
-          templateKey: input.templateKey,
-          recipientEmail,
-          subject: `[FAILED] ${fallbackSubject}`,
-          variables: loggedVariables as any,
-          status: 'FAILED',
-          userId: input.userId ?? null,
-          errorMessage: `Both template and fallback failed: ${errorMessage}`,
-        };
-
-        await prisma.emailSendLog.create({
-          data: logData,
-        });
-      } catch (logError) {
-        console.error('Failed to log fallback email failure:', logError);
-      }
 
       return {
         success: false,

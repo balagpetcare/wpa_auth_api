@@ -3,12 +3,13 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { config } from './config/index.js';
 import { logger } from './lib/logger.js';
-import { createRedisClient, closeRedisClient } from './lib/redis.js';
+import { createRedisClient, closeRedisClient, getRedisClient } from './lib/redis.js';
 import { prisma } from './lib/db.js';
 import apiRouter from './routes/index.js';
 import { errorHandler } from './middleware/error.js';
 import { ensureAvatarDirectory, getAvatarDirectory } from './lib/avatarStorage.js';
-import { startQueueProcessor, stopQueueProcessor } from './lib/emailQueueProcessor.js';
+import { requestIdMiddleware } from './middleware/requestId.js';
+import { incrementMetric, recordRequestLatency, updateHealthStatus } from './lib/metrics.js';
 
 // Initialise Redis before any middleware runs so rate limiting is ready.
 createRedisClient();
@@ -65,9 +66,25 @@ app.use('/uploads/avatars', express.static(getAvatarDirectory(), {
   maxAge: '1d',
 }));
 
-// Request logger middleware
+// Request correlation + request logger middleware
+app.use(requestIdMiddleware);
 app.use((req, res, next) => {
-  logger.info({ method: req.method, url: req.url }, 'Incoming request');
+  const startedAt = req.requestStartAt ?? Date.now();
+  incrementMetric('requests_total');
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAt;
+    recordRequestLatency(durationMs);
+    if (res.statusCode >= 400) incrementMetric('errors_total');
+    logger.info({
+      requestId: req.requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      durationMs,
+      userId: (req as any).user?.id,
+      clientId: (req as any).user?.clientId,
+    }, 'HTTP request completed');
+  });
   next();
 });
 
@@ -80,6 +97,27 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/health/live', (_req, res) => {
+  res.json({ status: 'UP', timestamp: new Date().toISOString() });
+});
+
+app.get('/health/ready', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    const redis = getRedisClient() ?? createRedisClient();
+    if (redis) {
+      await redis.ping();
+      updateHealthStatus({ redis: 'UP', postgres: 'UP' });
+    } else {
+      updateHealthStatus({ redis: 'UNKNOWN', postgres: 'UP' });
+    }
+    res.json({ status: 'READY', timestamp: new Date().toISOString() });
+  } catch (error) {
+    updateHealthStatus({ postgres: 'DOWN' });
+    res.status(503).json({ status: 'NOT_READY', timestamp: new Date().toISOString() });
+  }
+});
+
 // Aggregate API prefix (/api/v1)
 app.use(config.API_PREFIX, apiRouter);
 
@@ -88,18 +126,10 @@ app.use(errorHandler);
 
 const server = app.listen(config.PORT, config.HOST, () => {
   logger.info(`Server running on http://${config.HOST}:${config.PORT}`);
-  // Start email queue processor
-  startQueueProcessor().catch((error) => {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logger.error({ error: errorMsg }, 'Failed to start email queue processor');
-  });
 });
 
 async function gracefulShutdown(signal: string) {
   logger.info(`${signal} received, shutting down gracefully`);
-
-  // Stop queue processor first
-  await stopQueueProcessor();
 
   server.close(async () => {
     await closeRedisClient();
