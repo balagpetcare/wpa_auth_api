@@ -2,13 +2,25 @@ import { logger } from '../lib/logger.js';
 import { closeRedisClient, createRedisClient } from '../lib/redis.js';
 import { prisma } from '../lib/db.js';
 import { flushPresenceLastSeen } from '../lib/presence.js';
+import '../config/index.js';
 
 let running = true;
+
+async function touchHeartbeat() {
+  const redis = createRedisClient();
+  if (!redis) return;
+  try {
+    await redis.set('worker:presence:heartbeat', new Date().toISOString(), 'EX', 120);
+  } catch {
+    // Best-effort heartbeat only.
+  }
+}
 
 async function loop() {
   logger.info('Presence worker started');
   while (running) {
     try {
+      await touchHeartbeat();
       const result = await flushPresenceLastSeen(250);
       if (result.flushed > 0) {
         logger.info({ flushed: result.flushed }, 'Presence lastSeenAt batch flushed');

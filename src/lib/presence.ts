@@ -1,8 +1,7 @@
 import { getRedisClient } from './redis.js';
 import { prisma } from './db.js';
+import { config } from '../config/index.js';
 
-const PRESENCE_TTL_SECONDS = 90;
-const HEARTBEAT_COOLDOWN_SECONDS = 30;
 const DIRTY_SET_KEY = 'presence:dirty';
 
 function keyForApp(appId: string, userId: string) {
@@ -22,10 +21,10 @@ export async function recordPresenceHeartbeat(opts: { userId: string; appId?: st
   if (!redis) {
     return { recorded: false as const, reason: 'REDIS_UNAVAILABLE' as const };
   }
-  const ttlSeconds = opts.ttlSeconds ?? PRESENCE_TTL_SECONDS;
+  const ttlSeconds = opts.ttlSeconds ?? config.PRESENCE_TTL_SECONDS;
   const now = opts.now ?? Date.now();
   const cooldownKey = `presence:cooldown:${opts.appId ?? 'any'}:${opts.userId}`;
-  const cooldown = await redis.set(cooldownKey, String(now), 'EX', HEARTBEAT_COOLDOWN_SECONDS, 'NX');
+  const cooldown = await redis.set(cooldownKey, String(now), 'EX', config.PRESENCE_HEARTBEAT_MIN_INTERVAL_SECONDS, 'NX');
   if (cooldown !== 'OK') {
     return { recorded: false as const, reason: 'COOLDOWN' as const };
   }
@@ -59,8 +58,7 @@ export async function getPresenceSummary(userId: string) {
 export async function flushPresenceLastSeen(batchSize = 100) {
   const redis = getRedisClient();
   if (!redis) return { flushed: 0 };
-  const cutoff = Date.now();
-  const userIds = await redis.zrangebyscore(DIRTY_SET_KEY, 0, cutoff, 'LIMIT', 0, batchSize);
+  const userIds = await redis.zrange(DIRTY_SET_KEY, 0, batchSize - 1);
   if (!userIds.length) return { flushed: 0 };
   const touchedKeys = userIds.map((userId) => touchedKey(userId));
   const touchedValues = await redis.mget(...touchedKeys);
@@ -91,9 +89,9 @@ export async function flushPresenceLastSeen(batchSize = 100) {
 }
 
 export function getPresenceTtlSeconds() {
-  return PRESENCE_TTL_SECONDS;
+  return config.PRESENCE_TTL_SECONDS;
 }
 
 export function getPresenceCooldownSeconds() {
-  return HEARTBEAT_COOLDOWN_SECONDS;
+  return config.PRESENCE_HEARTBEAT_MIN_INTERVAL_SECONDS;
 }

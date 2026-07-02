@@ -987,14 +987,25 @@ export async function listAuditLogs(opts: {
 
 export async function listSecurityEvents(opts: {
   userId?: string;
+  type?: string;
+  severity?: string;
   resolved?: boolean;
+  createdFrom?: Date;
+  createdTo?: Date;
   pagination?: PaginationParams;
   cursor?: string;
   limit?: number;
 }) {
   const where: Prisma.SecurityEventWhereInput = {};
   if (opts.userId) where.userId = opts.userId;
+  if (opts.type) where.type = opts.type as any;
+  if (opts.severity) where.severity = opts.severity as any;
   if (opts.resolved !== undefined) where.resolved = opts.resolved;
+  if (opts.createdFrom || opts.createdTo) {
+    where.createdAt = {};
+    if (opts.createdFrom) where.createdAt.gte = opts.createdFrom;
+    if (opts.createdTo) where.createdAt.lte = opts.createdTo;
+  }
   const limit = parseCursorLimit(opts.limit ?? opts.pagination?.limit ?? 50, 50);
   if (opts.cursor) {
     const decoded = decodeCursor(opts.cursor);

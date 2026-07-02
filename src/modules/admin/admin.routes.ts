@@ -11,7 +11,7 @@ import * as authService from '../auth/auth.service.js';
 import { avatarUpload } from '../../middleware/upload.js';
 import { AppError } from '../../lib/errors.js';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
-import { renderPrometheusMetrics } from '../../lib/metrics.js';
+import { getOperationalSnapshot, renderPrometheusMetrics } from '../../lib/metrics.js';
 
 const router = Router();
 
@@ -626,11 +626,29 @@ router.get('/audit-logs', async (req, res, next) => {
 router.get('/security-events', async (req, res, next) => {
   try {
     const userId = req.query['userId'] as string | undefined;
+    const type = req.query['type'] as string | undefined;
+    const severity = req.query['severity'] as string | undefined;
     const resolvedParam = req.query['resolved'] as string | undefined;
     const resolved = resolvedParam === 'true' ? true : resolvedParam === 'false' ? false : undefined;
+    const createdFrom = req.query['createdFrom'] as string | undefined;
+    const createdTo = req.query['createdTo'] as string | undefined;
     const cursor = req.query['cursor'] as string | undefined;
     const limit = Number(req.query['limit'] ?? 50);
-    const data = await adminService.listSecurityEvents({ userId, resolved, cursor, limit });
+    const createdFromDate = createdFrom ? new Date(createdFrom) : undefined;
+    const createdToDate = createdTo ? new Date(createdTo) : undefined;
+    if ((createdFromDate && Number.isNaN(createdFromDate.getTime())) || (createdToDate && Number.isNaN(createdToDate.getTime()))) {
+      throw new AppError('Invalid date filter provided.', 'VALIDATION_ERROR', 400);
+    }
+    const data = await adminService.listSecurityEvents({
+      userId,
+      type,
+      severity,
+      resolved,
+      createdFrom: createdFromDate,
+      createdTo: createdToDate,
+      cursor,
+      limit,
+    });
     res.json({ success: true, data });
   } catch (err) {
     next(err);
@@ -650,6 +668,16 @@ router.get('/dashboard/stats', async (_req, res, next) => {
 // GET /admin/metrics
 router.get('/metrics', requirePermission('admin:read'), async (_req, res) => {
   res.type('text/plain').send(renderPrometheusMetrics());
+});
+
+// GET /admin/metrics/summary
+router.get('/metrics/summary', requirePermission('admin:read'), async (_req, res, next) => {
+  try {
+    const data = await getOperationalSnapshot();
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ─── Social Providers ────────────────────────────────────────────────────────

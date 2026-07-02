@@ -2,6 +2,8 @@ import { logger } from '../lib/logger.js';
 import { closeRedisClient, createRedisClient } from '../lib/redis.js';
 import { prisma } from '../lib/db.js';
 import { createAdminNotificationRecord } from '../lib/adminNotifications.js';
+import { incrementMetric } from '../lib/metrics.js';
+import '../config/index.js';
 import {
   reserveNextCommunicationJob,
   acknowledgeCommunicationJob,
@@ -14,6 +16,16 @@ import { deliverQueuedEmail, deliverQueuedSms } from '../modules/communication/c
 import type { Prisma } from '@prisma/client';
 
 let running = true;
+
+async function touchHeartbeat() {
+  const redis = createRedisClient();
+  if (!redis) return;
+  try {
+    await redis.set('worker:communication:heartbeat', new Date().toISOString(), 'EX', 120);
+  } catch {
+    // Best-effort heartbeat only.
+  }
+}
 
 async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunicationJob>> extends infer T ? T : never) {
   if (!job) return;
@@ -59,14 +71,17 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
     }
 
     await acknowledgeCommunicationJob(job);
+    incrementMetric('worker_processed_total');
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error({ error: errorMessage, jobType: job.type, jobId: job.id }, 'Communication job failed');
+    incrementMetric('worker_failure_total');
     if (job.attempts + 1 < job.maxAttempts) {
       const backoffMs = Math.min(60_000 * Math.pow(2, job.attempts), 24 * 60 * 60 * 1000);
       await scheduleCommunicationRetry(job, backoffMs, errorMessage);
     } else {
       await moveCommunicationJobToDlq(job, errorMessage);
+      incrementMetric('worker_dlq_total');
     }
   }
 }
@@ -74,6 +89,7 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
 async function loop() {
   logger.info('Communication worker started');
   while (running) {
+    await touchHeartbeat();
     await promoteDueCommunicationJobs();
     await recoverStalledCommunicationJobs();
     const job = await reserveNextCommunicationJob(5);

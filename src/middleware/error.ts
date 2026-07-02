@@ -18,7 +18,7 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     const message = err.code === 'LIMIT_FILE_SIZE'
       ? 'Avatar file size must not exceed 2MB.'
       : 'File upload failed.';
-    res.status(400).json({ success: false, message, code: 'UPLOAD_ERROR' });
+    res.status(400).json({ success: false, message, code: 'UPLOAD_ERROR', requestId: req.requestId });
     return;
   }
 

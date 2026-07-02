@@ -58,6 +58,8 @@ const envSchema = z.object({
   CAPTCHA_PROVIDER: z.enum(['none', 'turnstile', 'recaptcha']).default('none'),
   CAPTCHA_SECRET: z.string().optional(),
   CAPTCHA_REQUIRED_ON_HIGH_RISK: z.coerce.boolean().default(false),
+  PRESENCE_TTL_SECONDS: z.coerce.number().int().positive().default(90),
+  PRESENCE_HEARTBEAT_MIN_INTERVAL_SECONDS: z.coerce.number().int().positive().default(30),
   CREDENTIAL_ENCRYPTION_KEY: z.string().min(32),
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
   OTP_APP_NAME: z.string().default('WPA Central Auth'),

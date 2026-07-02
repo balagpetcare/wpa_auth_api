@@ -1,3 +1,7 @@
+import { prisma } from './db.js';
+import { getRedisClient } from './redis.js';
+import { getCommunicationQueueDepth } from './communicationQueue.js';
+
 type CounterKey =
   | 'requests_total'
   | 'errors_total'
@@ -5,6 +9,11 @@ type CounterKey =
   | 'login_failure_total'
   | 'refresh_token_reuse_total'
   | 'rate_limit_block_total'
+  | 'queue_enqueue_total'
+  | 'queue_failure_total'
+  | 'worker_processed_total'
+  | 'worker_failure_total'
+  | 'worker_dlq_total'
   | 'otp_send_total'
   | 'otp_failure_total'
   | 'email_send_total'
@@ -32,6 +41,11 @@ const counters: MetricsSnapshot['counters'] = {
   login_failure_total: 0,
   refresh_token_reuse_total: 0,
   rate_limit_block_total: 0,
+  queue_enqueue_total: 0,
+  queue_failure_total: 0,
+  worker_processed_total: 0,
+  worker_failure_total: 0,
+  worker_dlq_total: 0,
   otp_send_total: 0,
   otp_failure_total: 0,
   email_send_total: 0,
@@ -104,6 +118,21 @@ export function renderPrometheusMetrics(): string {
     '# HELP wpa_rate_limit_block_total Rate-limit blocks',
     '# TYPE wpa_rate_limit_block_total counter',
     `wpa_rate_limit_block_total ${snapshot.counters.rate_limit_block_total}`,
+    '# HELP wpa_queue_enqueue_total Communication jobs enqueued',
+    '# TYPE wpa_queue_enqueue_total counter',
+    `wpa_queue_enqueue_total ${snapshot.counters.queue_enqueue_total}`,
+    '# HELP wpa_queue_failure_total Communication enqueue failures',
+    '# TYPE wpa_queue_failure_total counter',
+    `wpa_queue_failure_total ${snapshot.counters.queue_failure_total}`,
+    '# HELP wpa_worker_processed_total Communication jobs processed',
+    '# TYPE wpa_worker_processed_total counter',
+    `wpa_worker_processed_total ${snapshot.counters.worker_processed_total}`,
+    '# HELP wpa_worker_failure_total Communication worker failures',
+    '# TYPE wpa_worker_failure_total counter',
+    `wpa_worker_failure_total ${snapshot.counters.worker_failure_total}`,
+    '# HELP wpa_worker_dlq_total Communication jobs sent to DLQ',
+    '# TYPE wpa_worker_dlq_total counter',
+    `wpa_worker_dlq_total ${snapshot.counters.worker_dlq_total}`,
     '# HELP wpa_request_latency_bucket Request latency buckets',
     '# TYPE wpa_request_latency_bucket counter',
     `wpa_request_latency_bucket{le="50"} ${snapshot.latency.lt_50ms}`,
@@ -113,4 +142,36 @@ export function renderPrometheusMetrics(): string {
     `wpa_request_latency_bucket{le="1000"} ${snapshot.latency.lt_1000ms}`,
     `wpa_request_latency_bucket{le="+Inf"} ${snapshot.latency.gte_1000ms}`,
   ].join('\n');
+}
+
+export async function getOperationalSnapshot() {
+  const redis = getRedisClient();
+  const [postgresUp, redisUp, queueDepth] = await Promise.all([
+    prisma.$queryRaw`SELECT 1`.then(() => true).catch(() => false),
+    redis ? redis.ping().then(() => true).catch(() => false) : Promise.resolve(false),
+    getCommunicationQueueDepth().catch(() => 0),
+  ]);
+
+  const workerHeartbeats = redis
+    ? await Promise.all([
+        redis.ttl('worker:communication:heartbeat').then((ttl) => ({ name: 'communication', ttl })).catch(() => ({ name: 'communication', ttl: -2 })),
+        redis.ttl('worker:presence:heartbeat').then((ttl) => ({ name: 'presence', ttl })).catch(() => ({ name: 'presence', ttl: -2 })),
+      ])
+    : [];
+
+  return {
+    health: {
+      database: postgresUp ? 'UP' : 'DOWN',
+      redis: redisUp ? 'UP' : 'DOWN',
+      queue: queueDepth >= 0 ? 'UP' : 'DOWN',
+    },
+    queue: {
+      depth: queueDepth,
+    },
+    workers: workerHeartbeats.map((worker) => ({
+      ...worker,
+      online: worker.ttl > 0,
+    })),
+    metrics: getMetricsSnapshot(),
+  };
 }

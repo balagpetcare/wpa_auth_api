@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { getRedisClient } from './redis.js';
 import { logger } from './logger.js';
+import { incrementMetric } from './metrics.js';
 
 export type CommunicationJobType = 'send_email' | 'send_sms' | 'send_admin_notification' | 'communication_retry' | 'provider_health_check';
 
@@ -106,6 +107,7 @@ export async function enqueueCommunicationJob(job: Omit<CommunicationQueueJob, '
   const redis = getRedisClient();
   if (!redis) {
     logger.warn({ jobType: job.type }, 'Redis unavailable; communication job not enqueued');
+    incrementMetric('queue_failure_total');
     return { queued: false, reason: 'REDIS_UNAVAILABLE' as const };
   }
 
@@ -120,10 +122,18 @@ export async function enqueueCommunicationJob(job: Omit<CommunicationQueueJob, '
 
   const ok = await redis.set(fullJob.dedupeKey, fullJob.id, 'PX', dedupeTtlMs, 'NX');
   if (ok !== 'OK') {
+    incrementMetric('queue_enqueue_total');
     return { queued: true, deduped: true as const, jobId: fullJob.id };
   }
 
-  await redis.lpush(QUEUE_KEY, JSON.stringify(fullJob));
+  try {
+    await redis.lpush(QUEUE_KEY, JSON.stringify(fullJob));
+  } catch (error) {
+    incrementMetric('queue_failure_total');
+    logger.error({ error: error instanceof Error ? error.message : String(error), jobType: job.type }, 'Failed to enqueue communication job');
+    throw error;
+  }
+  incrementMetric('queue_enqueue_total');
   return { queued: true, deduped: false as const, jobId: fullJob.id };
 }
 
@@ -176,7 +186,12 @@ export async function scheduleCommunicationRetry(job: CommunicationQueueJob, del
 export async function getCommunicationQueueDepth(): Promise<number> {
   const redis = getRedisClient();
   if (!redis) return 0;
-  return redis.llen(QUEUE_KEY);
+  const [queued, processing, delayed] = await Promise.all([
+    redis.llen(QUEUE_KEY),
+    redis.llen(PROCESSING_KEY),
+    redis.zcard(DELAYED_KEY),
+  ]);
+  return queued + processing + delayed;
 }
 
 export async function promoteDueCommunicationJobs(): Promise<number> {
