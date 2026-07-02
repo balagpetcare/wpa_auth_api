@@ -48,6 +48,28 @@ const emailBrandingUpdateSchema = z.object({
   footerText: z.string().max(500).optional().nullable(),
   address: z.string().max(500).optional().nullable(),
   legalDisclaimer: z.string().max(1000).optional().nullable(),
+  // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md)
+  replyTo: z.string().email().optional().nullable(),
+});
+
+// Phase 2.6A: per-app branding update schema — same field set as
+// ClientBranding, validated the same way as the global schema above.
+const clientBrandingUpdateSchema = z.object({
+  logoUrl: z.string().url().optional().nullable(),
+  logoAltText: z.string().max(255).optional().nullable(),
+  brandColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+  accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+  senderName: z.string().max(255).optional().nullable(),
+  senderEmail: z.string().email().optional().nullable(),
+  replyTo: z.string().email().optional().nullable(),
+  supportEmail: z.string().email().optional().nullable(),
+  supportPhone: z.string().max(20).optional().nullable(),
+  websiteUrl: z.string().url().optional().nullable(),
+  privacyUrl: z.string().url().optional().nullable(),
+  termsUrl: z.string().url().optional().nullable(),
+  unsubscribeUrl: z.string().url().optional().nullable(),
+  footerText: z.string().max(500).optional().nullable(),
+  isActive: z.boolean().optional(),
 });
 
 const emailTemplateUpdateSchema = z.object({
@@ -173,12 +195,28 @@ router.patch(
  * GET /admin/email-templates
  * List all email templates
  */
+// Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
+// added an optional ?clientId= filter and clientId/locale/version to the
+// projection — the underlying data (EmailTemplate.clientId) already
+// supported per-app overrides, but the list endpoint didn't expose enough
+// to distinguish a global default from an app-specific override, or to
+// filter down to just one app's rows for the new Template Overrides UI.
+// clientId=global returns only the system-default (clientId: null) rows.
+const emailTemplateListQuerySchema = z.object({
+  clientId: z.string().optional(),
+});
+
 router.get(
   '/email-templates',
   requirePermission('email_template.read'),
   async (req: AuthenticatedRequest, res, next) => {
     try {
+      const query = emailTemplateListQuerySchema.parse(req.query);
+      const where =
+        query.clientId === 'global' ? { clientId: null } : query.clientId ? { clientId: query.clientId } : {};
+
       const templates = await prisma.emailTemplate.findMany({
+        where,
         orderBy: { key: 'asc' },
         select: {
           id: true,
@@ -187,6 +225,9 @@ router.get(
           subject: true,
           preheader: true,
           isActive: true,
+          clientId: true,
+          locale: true,
+          version: true,
           updatedByAdminId: true,
           updatedAt: true,
           createdAt: true,
@@ -194,6 +235,70 @@ router.get(
       });
 
       res.json({ success: true, data: { items: templates, total: templates.length } });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Phase 2.6A: previously there was no way to create a new app-specific
+// template override — only PATCH on an existing row by id. This creates a
+// new EmailTemplate row scoped to a clientId (or clientId: null for a new
+// global-default key), reusing the existing key+locale+clientId unique
+// constraint already defined in the schema.
+const emailTemplateCreateSchema = z.object({
+  key: z.string().min(1).max(120),
+  clientId: z.string().nullable().optional(),
+  locale: z.string().min(2).max(10).optional().default('en'),
+  name: z.string().min(1).max(255),
+  subject: z.string().min(1).max(255),
+  preheader: z.string().max(255).optional().nullable(),
+  htmlBody: z.string().min(1),
+  textBody: z.string().optional().nullable(),
+  variables: z
+    .object({
+      required: z.array(z.string()).optional(),
+      optional: z.array(z.string()).optional(),
+    })
+    .optional()
+    .nullable(),
+});
+
+router.post(
+  '/email-templates',
+  requirePermission('email_template.update'),
+  emailBrandingRateLimit,
+  validateBody(emailTemplateCreateSchema),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      if (req.body.clientId) {
+        const client = await prisma.authClient.findUnique({ where: { id: req.body.clientId } });
+        if (!client) throw new AppError('Client not found.', 'NOT_FOUND', 404);
+      }
+
+      const existing = await prisma.emailTemplate.findUnique({
+        where: { key_locale_clientId: { key: req.body.key, locale: req.body.locale, clientId: req.body.clientId ?? null } },
+      });
+      if (existing) {
+        throw new AppError('A template with this key/locale already exists for this scope.', 'ALREADY_EXISTS', 409);
+      }
+
+      const created = await prisma.emailTemplate.create({
+        data: { ...req.body, updatedByAdminId: req.user!.id },
+      });
+
+      await prisma.emailTemplateAuditLog.create({
+        data: {
+          templateId: created.id,
+          action: 'CREATE',
+          changedFields: { key: created.key, clientId: created.clientId, locale: created.locale },
+          actorAdminId: req.user!.id,
+          ipAddress: req.ip,
+          userAgent: req.get('user-agent'),
+        },
+      });
+
+      res.status(201).json({ success: true, message: 'Template override created successfully.', data: created });
     } catch (error) {
       next(error);
     }
@@ -723,6 +828,11 @@ router.patch(
   '/clients/:clientId/branding',
   requirePermission('email_branding.update'),
   emailBrandingRateLimit,
+  // Phase 2.6A fix: this route previously accepted an unvalidated req.body
+  // spread directly into a Prisma upsert — now validated against the same
+  // field set as the global branding schema (adds replyTo, rejects unknown
+  // fields via zod's default strict-unknown-keys-stripped behavior).
+  validateBody(clientBrandingUpdateSchema),
   async (req: AuthenticatedRequest, res, next) => {
     try {
       const client = await prisma.authClient.findUnique({
@@ -740,6 +850,18 @@ router.patch(
           ...req.body,
         },
         update: req.body,
+      });
+
+      // Phase 2.6A: this route previously had no audit trail at all — add
+      // one, matching the pattern already used for global branding updates.
+      await writeAuditLog({
+        userId: req.user!.id,
+        clientId: req.params.clientId,
+        action: 'CLIENT_UPDATED',
+        resource: 'client_branding',
+        resourceId: branding.id,
+        metadata: { fields: Object.keys(req.body) },
+        req,
       });
 
       res.json({

@@ -15,6 +15,25 @@ const permissionsList = [
   { name: 'clients:write', description: 'Write clients', resource: 'clients', action: 'write' },
   { name: 'roles:read', description: 'Read roles', resource: 'roles', action: 'read' },
   { name: 'roles:write', description: 'Write roles', resource: 'roles', action: 'write' },
+  // Phase 2 role-permission management API (see docs/wpa-central-auth-api-complete-audit.md).
+  // Kept in the same `resource:action` naming convention as the existing roles:read/roles:write
+  // above (rather than the newer `resource.action` dot convention used by communication/email
+  // modules) for consistency with those two pre-existing role permissions.
+  { name: 'roles:delete', description: 'Delete roles', resource: 'roles', action: 'delete' },
+  { name: 'roles:manage', description: 'Create/update roles and manage role-permission assignments', resource: 'roles', action: 'manage' },
+  { name: 'permissions:read', description: 'Read the permission catalog', resource: 'permissions', action: 'read' },
+  // Phase 1 stabilization fix (docs/central-auth-api-admin-scalability-audit.md):
+  // admin.routes.ts already referenced 'users:manage', 'admin:manage', and
+  // 'admin:read' via requirePermission() on many routes (user CRUD, admin-team
+  // management, invitations), but none of the three were ever seeded as real
+  // Permission rows — meaning those checks could only ever be satisfied by
+  // super_admin's automatic bypass. Seeding them here makes the checks
+  // meaningful and grantable to custom roles without changing any existing
+  // role's effective access (they are intentionally NOT added to ADMIN's
+  // default permission set below, same as roles:manage).
+  { name: 'users:manage', description: 'Update, suspend, delete users and manage their sessions/roles', resource: 'users', action: 'manage' },
+  { name: 'admin:read', description: 'Read admin-team accounts and invitations', resource: 'admin', action: 'read' },
+  { name: 'admin:manage', description: 'Manage admin-team accounts, promotions, and invitations', resource: 'admin', action: 'manage' },
   { name: 'communication.providers.read', description: 'Read communication providers', resource: 'communication.providers', action: 'read' },
   { name: 'communication.providers.create', description: 'Create communication providers', resource: 'communication.providers', action: 'create' },
   { name: 'communication.providers.update', description: 'Update communication providers', resource: 'communication.providers', action: 'update' },
@@ -92,6 +111,27 @@ async function main() {
     console.log('Mapped all permissions to SUPER_ADMIN.');
   }
 
+  // 2c. Phase 2: safe default read-only permissions for ADMIN (see
+  // docs/wpa-central-auth-api-complete-audit.md, "Phase 2 Role-Permission API Update").
+  // Intentionally read-only — ADMIN can view roles/permissions in the Larkon UI but
+  // cannot create/update/delete roles or reassign permissions unless a super_admin
+  // explicitly grants `roles:manage`/`roles:write`/`roles:delete` via the new
+  // POST /admin/roles/:id/permissions API. SUPPORT and USER are intentionally left
+  // unchanged (no roles/permissions access) to avoid over-permissioning them.
+  const adminDefaultPermissionNames = ['roles:read', 'permissions:read'];
+  const adminRoleForDefaults = await prisma.role.findUnique({ where: { name: 'ADMIN' } });
+  if (adminRoleForDefaults) {
+    const defaultPerms = await prisma.permission.findMany({ where: { name: { in: adminDefaultPermissionNames } } });
+    for (const p of defaultPerms) {
+      await prisma.rolePermission.upsert({
+        where: { roleId_permissionId: { roleId: adminRoleForDefaults.id, permissionId: p.id } },
+        update: {},
+        create: { roleId: adminRoleForDefaults.id, permissionId: p.id },
+      });
+    }
+    console.log('Mapped safe default read-only permissions (roles:read, permissions:read) to ADMIN.');
+  }
+
   // 3. Clients
   for (const c of clientsList) {
     const existing = await prisma.authClient.findUnique({ where: { slug: c.slug } });
@@ -118,9 +158,28 @@ async function main() {
       console.log(`WARNING: Please save this secret now! It will never be shown again.`);
       console.log(`======================================================\n`);
     } else {
+      let updatedHash: string | undefined = undefined;
+
+      if (!existing.clientSecretHash && c.type === AuthClientType.SERVICE) {
+        // Dev fallback secret from environment or standard secure dev string
+        const devSecret = process.env.DEV_PAYMENT_GATEWAY_SECRET || 'wpa_payment_gateway_dev_secret_2026';
+        updatedHash = crypto.createHash('sha256').update(devSecret).digest('hex');
+
+        console.log(`\n======================================================`);
+        console.log(`[DEV PROVISIONING] Seeded missing client secret for: ${c.name}`);
+        console.log(`Client ID: ${existing.clientId}`);
+        console.log(`Dev Client Secret: ${devSecret}`);
+        console.log(`WARNING: This is a fallback dev-only secret. In production, rotate this secret!`);
+        console.log(`======================================================\n`);
+      }
+
       await prisma.authClient.update({
         where: { id: existing.id },
-        data: { name: c.name, type: c.type }
+        data: { 
+          name: c.name, 
+          type: c.type,
+          ...(updatedHash ? { clientSecretHash: updatedHash } : {})
+        }
       });
     }
   }
@@ -333,34 +392,41 @@ async function main() {
   console.log('OTP communication templates seeded.');
 
   // 5. Test non-super-admin user for local development
-  const testEmail = 'testuser@wpa.com';
-  const testUsername = 'testuser';
-  const testPassword = 'Password123!';
-  const userRole = await prisma.role.findUnique({ where: { name: 'USER' } });
-  
-  if (userRole) {
-    const existingTestUser = await prisma.user.findUnique({ where: { email: testEmail } });
-    if (!existingTestUser) {
-      console.log(`Creating test user: ${testEmail}`);
-      const testPasswordHash = await bcrypt.hash(testPassword, 10);
-      await prisma.user.create({
-        data: {
-          email: testEmail,
-          username: testUsername,
-          displayName: 'Test User',
-          passwordHash: testPasswordHash,
-          status: UserStatus.ACTIVE,
-          emailVerifiedAt: new Date(),
-          roles: {
-            create: {
-              roleId: userRole.id
+  // Phase 1 audit fix (docs/wpa-central-auth-api-complete-audit.md): this hardcoded
+  // test account must NEVER be created in production. Guarded explicitly below —
+  // do not remove this guard.
+  if (process.env.NODE_ENV === 'production') {
+    console.log('NODE_ENV=production — skipping hardcoded test user creation.');
+  } else {
+    const testEmail = 'testuser@wpa.com';
+    const testUsername = 'testuser';
+    const testPassword = 'Password123!';
+    const userRole = await prisma.role.findUnique({ where: { name: 'USER' } });
+
+    if (userRole) {
+      const existingTestUser = await prisma.user.findUnique({ where: { email: testEmail } });
+      if (!existingTestUser) {
+        console.log(`Creating test user: ${testEmail}`);
+        const testPasswordHash = await bcrypt.hash(testPassword, 10);
+        await prisma.user.create({
+          data: {
+            email: testEmail,
+            username: testUsername,
+            displayName: 'Test User',
+            passwordHash: testPasswordHash,
+            status: UserStatus.ACTIVE,
+            emailVerifiedAt: new Date(),
+            roles: {
+              create: {
+                roleId: userRole.id
+              }
             }
           }
-        }
-      });
-      console.log('Test user created successfully.');
-    } else {
-      console.log('Test user already exists.');
+        });
+        console.log('Test user created successfully.');
+      } else {
+        console.log('Test user already exists.');
+      }
     }
   }
 
@@ -1499,8 +1565,14 @@ Support: {{supportEmail}}
   const forceTemplateReseed = process.env.FORCE_RESEED === 'true';
 
   for (const template of emailTemplates) {
-    const existingTemplate = await prisma.emailTemplate.findUnique({
-      where: { key: template.key },
+    const locale = template.locale ?? 'en';
+    const clientId = template.clientId ?? null;
+    const existingTemplate = await prisma.emailTemplate.findFirst({
+      where: {
+        key: template.key,
+        locale,
+        clientId,
+      },
       select: { id: true, updatedByAdminId: true }
     });
 
@@ -1510,19 +1582,28 @@ Support: {{supportEmail}}
       continue;
     }
 
-    await prisma.emailTemplate.upsert({
-      where: { key: template.key },
-      update: forceTemplateReseed ? {
-        name: template.name,
-        subject: template.subject,
-        preheader: template.preheader,
-        htmlBody: template.htmlBody,
-        textBody: template.textBody,
-        variables: template.variables as any,
-        isActive: true
-      } : {},
-      create: {
+    if (existingTemplate) {
+      await prisma.emailTemplate.update({
+        where: { id: existingTemplate.id },
+        data: forceTemplateReseed ? {
+          name: template.name,
+          subject: template.subject,
+          preheader: template.preheader,
+          htmlBody: template.htmlBody,
+          textBody: template.textBody,
+          variables: template.variables as any,
+          isActive: true
+        } : {}
+      });
+      console.log(`  ✅ ${template.key}`);
+      continue;
+    }
+
+    await prisma.emailTemplate.create({
+      data: {
         key: template.key,
+        locale,
+        clientId,
         name: template.name,
         subject: template.subject,
         preheader: template.preheader,
@@ -1530,7 +1611,7 @@ Support: {{supportEmail}}
         textBody: template.textBody,
         variables: template.variables as any,
         isActive: true,
-        updatedByAdminId: seededAdmin?.id
+        updatedByAdminId: seededAdmin?.id,
       }
     });
     console.log(`  ✅ ${template.key}`);

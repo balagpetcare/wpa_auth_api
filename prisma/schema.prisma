@@ -82,6 +82,7 @@ model AuthClient {
   refreshTokens      RefreshToken[]
   serviceTokens      ServiceAccessToken[]
   userAccess         UserClientAccess[]
+  routingRules       CommunicationRoutingRule[]
 
   @@index([clientId])
   @@index([slug])
@@ -172,40 +173,50 @@ model UserRole {
 }
 
 model RefreshToken {
-  id        String     @id @default(cuid())
-  userId    String     @map("user_id")
-  clientId  String     @map("client_id")
-  tokenHash String     @unique @map("token_hash")
-  scopes    String[]
-  expiresAt DateTime   @map("expires_at")
-  revokedAt DateTime?  @map("revoked_at")
-  userAgent String?    @map("user_agent")
-  ipAddress String?    @map("ip_address")
-  createdAt DateTime   @default(now()) @map("created_at")
-  client    AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                String     @id @default(cuid())
+  userId            String     @map("user_id")
+  clientId          String     @map("client_id")
+  tokenHash         String     @unique @map("token_hash")
+  scopes            String[]
+  expiresAt         DateTime   @map("expires_at")
+  revokedAt         DateTime?  @map("revoked_at")
+  userAgent         String?    @map("user_agent")
+  ipAddress         String?    @map("ip_address")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  client            AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Additive fields for Phase 3.2
+  familyId          String?    @map("family_id")
+  replacedByTokenId String?    @map("replaced_by_token_id")
+  reusedAt          DateTime?  @map("reused_at")
+  revocationReason  String?    @map("revocation_reason")
 
   @@index([userId])
   @@index([clientId])
   @@index([tokenHash])
   @@index([expiresAt])
+  @@index([familyId])
   @@map("refresh_tokens")
 }
 
 model LoginSession {
-  id           String     @id @default(cuid())
-  userId       String     @map("user_id")
-  clientId     String     @map("client_id")
-  sessionToken String     @unique @map("session_token")
-  userAgent    String?    @map("user_agent")
-  ipAddress    String?    @map("ip_address")
-  country      String?
-  expiresAt    DateTime   @map("expires_at")
-  revokedAt    DateTime?  @map("revoked_at")
-  lastActiveAt DateTime   @default(now()) @map("last_active_at")
-  createdAt    DateTime   @default(now()) @map("created_at")
-  client       AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id               String     @id @default(cuid())
+  userId           String     @map("user_id")
+  clientId         String     @map("client_id")
+  sessionToken     String     @unique @map("session_token")
+  userAgent        String?    @map("user_agent")
+  ipAddress        String?    @map("ip_address")
+  country          String?
+  expiresAt        DateTime   @map("expires_at")
+  revokedAt        DateTime?  @map("revoked_at")
+  lastActiveAt     DateTime   @default(now()) @map("last_active_at")
+  createdAt        DateTime   @default(now()) @map("created_at")
+  client           AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user             User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Additive fields for Phase 3.2
+  revocationReason String?    @map("revocation_reason")
 
   @@index([userId])
   @@index([clientId])
@@ -297,6 +308,8 @@ model AuthorizationCode {
   state               String?
   codeChallenge       String?    @map("code_challenge")
   codeChallengeMethod String?    @map("code_challenge_method")
+  nonce               String?
+  authTime            DateTime?  @map("auth_time")
   expiresAt           DateTime   @map("expires_at")
   usedAt              DateTime?  @map("used_at")
   createdAt           DateTime   @default(now()) @map("created_at")
@@ -492,20 +505,41 @@ model CommunicationProviderCredential {
 }
 
 model CommunicationRoutingRule {
-  id                  String                 @id @default(cuid())
+  id   String @id @default(cuid())
+  // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
+  // nullable app scope — null means "system-wide default rule", non-null
+  // means "override for this specific connected app/client". Mirrors the
+  // existing EmailTemplate.clientId nullable-override pattern already used
+  // successfully elsewhere in this schema. Existing rows (all appId=null
+  // today) keep working unchanged as system defaults.
+  appId               String?                            @map("app_id")
   channel             CommunicationChannel
-  countryCode         String?                @map("country_code")
+  countryCode         String?                            @map("country_code")
   purpose             CommunicationPurpose
   language            OtpTemplateLanguage?
-  providerId          String?                @map("provider_id")
-  fallbackProviderIds Json?                  @map("fallback_provider_ids")
-  priority            Int                    @default(100)
-  isActive            Boolean                @default(true) @map("is_active")
-  createdAt           DateTime               @default(now()) @map("created_at")
-  updatedAt           DateTime               @updatedAt @map("updated_at")
-  provider            CommunicationProvider? @relation(fields: [providerId], references: [id])
+  providerId          String?                            @map("provider_id")
+  fallbackProviderIds Json?                              @map("fallback_provider_ids")
+  priority            Int                                @default(100)
+  // Hard kill-switch, distinct from isActive (row-level enable). When
+  // false, the channel is blocked outright for the matching app/country/
+  // purpose scope — no fallback providers are tried.
+  enabled             Boolean                            @default(true)
+  // When true (default), if every explicit provider/fallback candidate is
+  // unavailable, isGlobal=true providers may be tried as a last-resort
+  // international fallback tier. When false, only the explicit chain is
+  // tried.
+  fallbackEnabled     Boolean                            @default(true) @map("fallback_enabled")
+  // Restricts this rule to a specific provider environment; null matches
+  // either SANDBOX or LIVE.
+  environment         CommunicationProviderEnvironment?
+  isActive            Boolean                            @default(true) @map("is_active")
+  createdAt           DateTime                           @default(now()) @map("created_at")
+  updatedAt           DateTime                           @updatedAt @map("updated_at")
+  app                 AuthClient?                        @relation(fields: [appId], references: [id], onDelete: Cascade)
+  provider            CommunicationProvider?             @relation(fields: [providerId], references: [id])
 
   @@index([channel, countryCode, purpose, priority])
+  @@index([appId, channel, countryCode, purpose, priority])
   @@map("communication_routing_rules")
 }
 
@@ -600,6 +634,8 @@ model EmailBrandingSetting {
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @updatedAt @map("updated_at")
   brandName             String   @map("brand_name")
+  // Phase 2.6A: reply-to address for outgoing system-default branded email.
+  replyTo               String?  @map("reply_to")
   updatedByAdmin        User?    @relation("EmailBrandingSettingUpdatedBy", fields: [updatedByAdminId], references: [id])
 
   @@map("email_branding_settings")
@@ -662,6 +698,8 @@ model ClientBranding {
   accentColor    String?    @map("accent_color")
   senderName     String?    @map("sender_name")
   senderEmail    String?    @map("sender_email")
+  // Phase 2.6A: per-app reply-to address, overrides EmailBrandingSetting.replyTo.
+  replyTo        String?    @map("reply_to")
   supportEmail   String?    @map("support_email")
   supportPhone   String?    @map("support_phone")
   websiteUrl     String?    @map("website_url")
@@ -745,6 +783,8 @@ model EmailSendLog {
   attemptCount     Int          @default(1) @map("attempt_count")
   sentAt           DateTime?    @map("sent_at")
   failedAt         DateTime?    @map("failed_at")
+  senderName       String?      @map("sender_name")
+  senderEmail      String?      @map("sender_email")
   queues           EmailQueue[]
   user             User?        @relation(fields: [userId], references: [id])
 
@@ -752,6 +792,7 @@ model EmailSendLog {
   @@index([recipientEmail, createdAt])
   @@index([userId, createdAt])
   @@index([status, createdAt])
+  @@index([clientId, createdAt])
   @@map("email_send_logs")
 }
 
@@ -830,6 +871,10 @@ enum AuditAction {
   ADMIN_ROLE_REMOVED
   ADMIN_ACCESS_GRANTED
   ADMIN_ACCESS_REMOVED
+  // Phase 2 role-permission management API (see docs/wpa-central-auth-api-complete-audit.md)
+  ROLE_CREATED
+  ROLE_UPDATED
+  ROLE_DELETED
 }
 
 enum SecurityEventType {

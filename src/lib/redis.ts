@@ -21,6 +21,11 @@ export function createRedisClient(): Redis | null {
     maxRetriesPerRequest: 0,
     enableReadyCheck: false,
     lazyConnect: false,
+    // Without a command timeout, queued commands can hang indefinitely during a Redis
+    // outage/reconnect (observed live: requests to enterpriseRateLimit-protected routes
+    // hung 30s+ and never resolved even after Redis came back up). This bounds every
+    // command so callers relying on try/catch fail-open behavior actually get an error.
+    commandTimeout: 1500,
   }) as Redis;
 
   client.on('error', (err: Error) => {

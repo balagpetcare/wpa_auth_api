@@ -82,6 +82,7 @@ export async function sendTemplatedEmail(
       clientId: input.clientId,
       senderName: rendered.senderName,
       senderEmail: rendered.senderEmail,
+      replyTo: rendered.replyTo,
     });
 
     // Log successful send with all context

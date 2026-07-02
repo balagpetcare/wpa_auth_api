@@ -4,10 +4,19 @@ import usersRoutes from '../modules/users/users.routes.js';
 import adminRoutes, { adminAuthRouter } from '../modules/admin/admin.routes.js';
 import communicationRoutes from '../modules/communication/communication.routes.js';
 import emailRoutes from '../modules/email/email.routes.js';
-import clientsRoutes from '../modules/clients/clients.routes.js';
-import rolesRoutes from '../modules/roles/roles.routes.js';
-import auditRoutes from '../modules/audit/audit.routes.js';
 import oauthRoutes from '../modules/oauth/oauth.routes.js';
+// NOTE (Phase 1 audit fix, see docs/wpa-central-auth-api-complete-audit.md):
+// src/modules/clients/clients.routes.ts, src/modules/roles/roles.routes.ts, and
+// src/modules/audit/audit.routes.ts are LEGACY/DUPLICATE modules. They were
+// previously mounted at /clients, /roles, /audit with only `authGuard` (no
+// requireAdmin/requirePermission), allowing ANY authenticated user to create
+// OAuth clients, rotate client secrets, create roles, and read the full audit
+// log. Fully admin-guarded equivalents already exist under /admin/clients,
+// /admin/roles, and /admin/audit-logs (see modules/admin/admin.routes.ts).
+// These legacy routers are intentionally left UNMOUNTED below. The files are
+// kept (not deleted) in case they are needed for reference, but they must
+// NOT be re-mounted without adding `authGuard, requireAdmin` (and ideally
+// `requirePermission`) at the router level first.
 
 const router = Router();
 
@@ -26,8 +35,9 @@ router.use('/admin', emailRoutes);
 router.use('/admin', adminRoutes);
 
 router.use('/oauth', oauthRoutes);
-router.use('/clients', clientsRoutes);
-router.use('/roles', rolesRoutes);
-router.use('/audit', auditRoutes);
+// Legacy unprotected duplicates — DO NOT re-enable without admin guards. See note above.
+// router.use('/clients', clientsRoutes);
+// router.use('/roles', rolesRoutes);
+// router.use('/audit', auditRoutes);
 
 export default router;

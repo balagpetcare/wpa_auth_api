@@ -384,34 +384,335 @@ export async function getUserAuditLogs(id: string, pagination: PaginationParams)
 }
 
 // ─── Roles & Permissions ─────────────────────────────────────────────────────
+// Phase 2 role-permission management API (see
+// docs/wpa-central-auth-api-complete-audit.md, "Phase 2 Role-Permission API Update").
+
+const rolePermissionSelect = {
+  id: true,
+  name: true,
+  description: true,
+  createdAt: true,
+  updatedAt: true,
+  permissions: {
+    select: {
+      permission: { select: { id: true, name: true, description: true, resource: true, action: true } },
+    },
+  },
+  _count: { select: { users: true } },
+} satisfies Prisma.RoleSelect;
+
+function isSuperAdminRoleName(name: string): boolean {
+  return name.toLowerCase() === 'super_admin';
+}
+
+// Flattens the `{ permissions: [{ permission: {...} }] }` Prisma shape into a
+// plain `permissions: [{...}]` array and renames `_count.users` to `userCount`
+// for a cleaner API response. Never exposes anything beyond id/name/description/
+// resource/action — no sensitive fields exist on Role/Permission, but this keeps
+// the response shape explicit and stable for the Larkon frontend.
+function formatRoleWithPermissions(role: {
+  id: string;
+  name: string;
+  description: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  permissions: { permission: { id: string; name: string; description: string | null; resource: string; action: string } }[];
+  _count: { users: number };
+}) {
+  return {
+    id: role.id,
+    name: role.name,
+    description: role.description,
+    createdAt: role.createdAt,
+    updatedAt: role.updatedAt,
+    userCount: role._count.users,
+    permissions: role.permissions.map((rp) => rp.permission),
+  };
+}
 
 export async function listRoles() {
-  return prisma.role.findMany({
-    select: {
-      id: true, name: true, description: true, createdAt: true,
-      _count: { select: { users: true, permissions: true } },
-    },
+  const roles = await prisma.role.findMany({
+    select: rolePermissionSelect,
     orderBy: { name: 'asc' },
   });
+  return roles.map(formatRoleWithPermissions);
 }
 
-export async function createRole(data: { name: string; description?: string }) {
+export async function getRoleById(id: string) {
+  const role = await prisma.role.findUnique({ where: { id }, select: rolePermissionSelect });
+  if (!role) throw new AppError('Role not found.', 'NOT_FOUND', 404);
+  return formatRoleWithPermissions(role);
+}
+
+// Resolves a mixed list of permission ids and/or permission names ("keys") into
+// a de-duplicated list of valid Permission rows, throwing if any are unknown.
+async function resolvePermissions(opts: { permissionIds?: string[]; permissionKeys?: string[] }) {
+  const ids = Array.from(new Set(opts.permissionIds ?? []));
+  const keys = Array.from(new Set(opts.permissionKeys ?? []));
+  if (ids.length === 0 && keys.length === 0) return [];
+
+  const permissions = await prisma.permission.findMany({
+    where: { OR: [ids.length ? { id: { in: ids } } : undefined, keys.length ? { name: { in: keys } } : undefined].filter(Boolean) as Prisma.PermissionWhereInput[] },
+  });
+
+  const foundIds = new Set(permissions.map((p) => p.id));
+  const foundKeys = new Set(permissions.map((p) => p.name));
+  const missingIds = ids.filter((id) => !foundIds.has(id));
+  const missingKeys = keys.filter((key) => !foundKeys.has(key));
+  if (missingIds.length || missingKeys.length) {
+    throw new AppError(
+      `Unknown permission(s): ${[...missingIds, ...missingKeys].join(', ')}`,
+      'VALIDATION_ERROR',
+      400,
+    );
+  }
+  return permissions;
+}
+
+export async function createRole(data: {
+  name: string;
+  description?: string;
+  permissionIds?: string[];
+  permissionKeys?: string[];
+}) {
   const existing = await prisma.role.findUnique({ where: { name: data.name } });
   if (existing) throw new AppError('A role with that name already exists.', 'ALREADY_EXISTS', 409);
-  return prisma.role.create({ data, select: { id: true, name: true, description: true, createdAt: true } });
+
+  const permissions = await resolvePermissions({ permissionIds: data.permissionIds, permissionKeys: data.permissionKeys });
+
+  const role = await prisma.role.create({
+    data: {
+      name: data.name,
+      description: data.description,
+      permissions: permissions.length
+        ? { create: permissions.map((p) => ({ permissionId: p.id })) }
+        : undefined,
+    },
+    select: rolePermissionSelect,
+  });
+  return formatRoleWithPermissions(role);
 }
 
-export async function updateRole(id: string, data: { name?: string; description?: string }) {
+export async function createRoleAudited(
+  data: { name: string; description?: string; permissionIds?: string[]; permissionKeys?: string[] },
+  actorId: string,
+  req: Request,
+) {
+  const role = await createRole(data);
+  await writeAuditLog({
+    userId: actorId,
+    action: 'ROLE_CREATED',
+    resource: 'role',
+    resourceId: role.id,
+    metadata: { name: role.name, permissionCount: role.permissions.length },
+    req,
+  });
+  return role;
+}
+
+// Guard used by both PATCH /roles/:id (name/description/permissions) and the
+// dedicated permission-mutation endpoints below. Non-super-admin actors may not
+// change SUPER_ADMIN's permission set at all (name/description edits to the
+// SUPER_ADMIN role itself are still allowed for any admin with roles.manage,
+// since renaming/describing the role doesn't affect access — only touching its
+// permission *assignments* is restricted).
+function assertCanModifySuperAdminPermissions(roleName: string, actorRoles: string[]) {
+  if (!isSuperAdminRoleName(roleName)) return;
+  const isActorSuperAdmin = actorRoles.map((r) => r.toLowerCase()).includes('super_admin');
+  if (!isActorSuperAdmin) {
+    throw new AppError('Only a super_admin may modify SUPER_ADMIN role permissions.', 'FORBIDDEN', 403);
+  }
+}
+
+export async function updateRole(
+  id: string,
+  data: { name?: string; description?: string; permissionIds?: string[]; permissionKeys?: string[] },
+  actorId: string,
+  actorRoles: string[],
+  req: Request,
+) {
   const role = await prisma.role.findUnique({ where: { id } });
   if (!role) throw new AppError('Role not found.', 'NOT_FOUND', 404);
-  return prisma.role.update({ where: { id }, data, select: { id: true, name: true, description: true, updatedAt: true } });
+
+  const wantsPermissionChange = data.permissionIds !== undefined || data.permissionKeys !== undefined;
+  if (wantsPermissionChange) {
+    assertCanModifySuperAdminPermissions(role.name, actorRoles);
+    if (isSuperAdminRoleName(role.name) && (data.permissionIds?.length === 0 && data.permissionKeys?.length === 0)) {
+      throw new AppError('Cannot remove all permissions from the SUPER_ADMIN role.', 'FORBIDDEN', 403);
+    }
+  }
+
+  if (data.name && data.name !== role.name) {
+    const nameTaken = await prisma.role.findUnique({ where: { name: data.name } });
+    if (nameTaken) throw new AppError('A role with that name already exists.', 'ALREADY_EXISTS', 409);
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    if (wantsPermissionChange) {
+      const permissions = await resolvePermissions({ permissionIds: data.permissionIds, permissionKeys: data.permissionKeys });
+      await tx.rolePermission.deleteMany({ where: { roleId: id } });
+      if (permissions.length) {
+        await tx.rolePermission.createMany({
+          data: permissions.map((p) => ({ roleId: id, permissionId: p.id })),
+          skipDuplicates: true,
+        });
+      }
+    }
+    await tx.role.update({ where: { id }, data: { name: data.name, description: data.description } });
+    return tx.role.findUniqueOrThrow({ where: { id }, select: rolePermissionSelect });
+  });
+
+  await writeAuditLog({
+    userId: actorId,
+    action: 'ROLE_UPDATED',
+    resource: 'role',
+    resourceId: id,
+    metadata: { name: updated.name, permissionsReplaced: wantsPermissionChange },
+    req,
+  });
+
+  return formatRoleWithPermissions(updated);
+}
+
+export async function deleteRole(id: string, actorId: string, req: Request) {
+  const role = await prisma.role.findUnique({ where: { id }, select: { id: true, name: true, _count: { select: { users: true } } } });
+  if (!role) throw new AppError('Role not found.', 'NOT_FOUND', 404);
+
+  if (isSuperAdminRoleName(role.name)) {
+    throw new AppError('The SUPER_ADMIN role cannot be deleted.', 'FORBIDDEN', 403);
+  }
+  if (role._count.users > 0) {
+    throw new AppError('Cannot delete a role that is still assigned to users. Reassign or remove those users first.', 'ROLE_IN_USE', 409);
+  }
+
+  await prisma.$transaction([
+    prisma.rolePermission.deleteMany({ where: { roleId: id } }),
+    prisma.role.delete({ where: { id } }),
+  ]);
+
+  await writeAuditLog({ userId: actorId, action: 'ROLE_DELETED', resource: 'role', resourceId: id, metadata: { name: role.name }, req });
+}
+
+export async function addPermissionsToRole(
+  id: string,
+  opts: { permissionIds?: string[]; permissionKeys?: string[] },
+  actorId: string,
+  actorRoles: string[],
+  req: Request,
+) {
+  const role = await prisma.role.findUnique({ where: { id } });
+  if (!role) throw new AppError('Role not found.', 'NOT_FOUND', 404);
+  assertCanModifySuperAdminPermissions(role.name, actorRoles);
+
+  const permissions = await resolvePermissions(opts);
+  if (permissions.length === 0) {
+    throw new AppError('At least one permissionId or permissionKey is required.', 'VALIDATION_ERROR', 400);
+  }
+
+  await prisma.rolePermission.createMany({
+    data: permissions.map((p) => ({ roleId: id, permissionId: p.id })),
+    skipDuplicates: true,
+  });
+
+  await writeAuditLog({
+    userId: actorId,
+    action: 'PERMISSION_GRANTED',
+    resource: 'role',
+    resourceId: id,
+    metadata: { roleName: role.name, permissionNames: permissions.map((p) => p.name) },
+    req,
+  });
+
+  return getRoleById(id);
+}
+
+export async function removePermissionFromRole(
+  id: string,
+  permissionId: string,
+  actorId: string,
+  actorRoles: string[],
+  req: Request,
+) {
+  const role = await prisma.role.findUnique({ where: { id } });
+  if (!role) throw new AppError('Role not found.', 'NOT_FOUND', 404);
+  assertCanModifySuperAdminPermissions(role.name, actorRoles);
+
+  if (isSuperAdminRoleName(role.name)) {
+    const remaining = await prisma.rolePermission.count({ where: { roleId: id } });
+    if (remaining <= 1) {
+      throw new AppError('Cannot remove the last permission from the SUPER_ADMIN role.', 'FORBIDDEN', 403);
+    }
+  }
+
+  const permission = await prisma.permission.findUnique({ where: { id: permissionId } });
+  if (!permission) throw new AppError('Permission not found.', 'NOT_FOUND', 404);
+
+  await prisma.rolePermission.deleteMany({ where: { roleId: id, permissionId } });
+
+  await writeAuditLog({
+    userId: actorId,
+    action: 'PERMISSION_REVOKED',
+    resource: 'role',
+    resourceId: id,
+    metadata: { roleName: role.name, permissionName: permission.name },
+    req,
+  });
+
+  return getRoleById(id);
+}
+
+export async function replaceRolePermissions(
+  id: string,
+  opts: { permissionIds?: string[]; permissionKeys?: string[] },
+  actorId: string,
+  actorRoles: string[],
+  req: Request,
+) {
+  const role = await prisma.role.findUnique({ where: { id } });
+  if (!role) throw new AppError('Role not found.', 'NOT_FOUND', 404);
+  assertCanModifySuperAdminPermissions(role.name, actorRoles);
+
+  const permissions = await resolvePermissions(opts);
+  if (isSuperAdminRoleName(role.name) && permissions.length === 0) {
+    throw new AppError('Cannot remove all permissions from the SUPER_ADMIN role.', 'FORBIDDEN', 403);
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.rolePermission.deleteMany({ where: { roleId: id } });
+    if (permissions.length) {
+      await tx.rolePermission.createMany({
+        data: permissions.map((p) => ({ roleId: id, permissionId: p.id })),
+        skipDuplicates: true,
+      });
+    }
+  });
+
+  await writeAuditLog({
+    userId: actorId,
+    action: 'ROLE_UPDATED',
+    resource: 'role',
+    resourceId: id,
+    metadata: { roleName: role.name, permissionNames: permissions.map((p) => p.name), replaced: true },
+    req,
+  });
+
+  return getRoleById(id);
 }
 
 export async function listPermissions() {
-  return prisma.permission.findMany({
+  const permissions = await prisma.permission.findMany({
     select: { id: true, name: true, description: true, resource: true, action: true },
     orderBy: [{ resource: 'asc' }, { action: 'asc' }],
   });
+
+  // Grouped by `resource` (module/category) for the Larkon "Roles & Permissions" UI,
+  // e.g. { users: [...], roles: [...], communication.providers: [...] }.
+  const grouped: Record<string, typeof permissions> = {};
+  for (const p of permissions) {
+    (grouped[p.resource] ??= []).push(p);
+  }
+
+  return { items: permissions, groupedByResource: grouped };
 }
 
 export async function assignRoleToUser(

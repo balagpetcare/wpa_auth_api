@@ -1,3 +1,12 @@
+// ⚠️ LEGACY / UNMOUNTED (Phase 1 audit fix, see docs/wpa-central-auth-api-complete-audit.md)
+// This router is NOT mounted in src/routes/index.ts. It previously exposed
+// /api/v1/clients with only `authGuard` (no admin/permission check), letting any
+// authenticated user create OAuth clients and rotate client secrets. Fully
+// admin-guarded equivalents exist under /admin/clients in
+// src/modules/admin/admin.routes.ts + admin.service.ts. Do not re-mount this
+// router without adding `authGuard, requireAdmin` (and ideally requirePermission)
+// at the router level.
+
 import { Router } from 'express';
 import { prisma } from '../../lib/db.js';
 import { authGuard } from '../../middleware/auth.js';

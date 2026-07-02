@@ -34,6 +34,13 @@ export interface RenderedEmail {
   text: string;
 }
 
+export interface ResolvedSenderInfo {
+  senderName: string;
+  senderEmail: string;
+  // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md)
+  replyTo?: string | null;
+}
+
 export interface EmailBrandingData {
   id: string;
   brandName: string;
@@ -53,6 +60,8 @@ export interface EmailBrandingData {
   footerText?: string | null;
   address?: string | null;
   legalDisclaimer?: string | null;
+  // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md)
+  replyTo?: string | null;
 }
 
 export interface EmailTemplateData {

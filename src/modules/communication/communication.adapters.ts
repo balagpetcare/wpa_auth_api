@@ -172,6 +172,7 @@ class GenericSmtpEmailAdapter implements EmailProviderAdapter {
     try {
       const info = await transporter.sendMail({
         from: input.config.fromName ? `${input.config.fromName} <${input.config.fromEmail}>` : input.config.fromEmail,
+        ...(input.config.replyTo ? { replyTo: input.config.replyTo } : {}),
         to: input.to,
         subject: input.subject,
         text: input.text,

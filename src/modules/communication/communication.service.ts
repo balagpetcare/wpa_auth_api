@@ -5,6 +5,7 @@ import {
   CommunicationHealthStatus,
   CommunicationPurpose,
   CommunicationProviderStatus,
+  CommunicationProviderEnvironment,
   OtpTemplateLanguage,
   OtpTemplatePurpose,
   Prisma,
@@ -17,6 +18,8 @@ import { writeAuditLog } from '../../lib/audit.js';
 import { createAdminNotification } from '../../lib/adminNotifications.js';
 import { config } from '../../config/index.js';
 import { resolveEmailAdapter, resolveSmsAdapter } from './communication.adapters.js';
+import { getRedisClient } from '../../lib/redis.js';
+import { ChannelDisabledError } from './communication.types.js';
 import type {
   OtpCommunicationInput,
   ProviderCredentialSecrets,
@@ -175,37 +178,93 @@ async function logDeliveryAttempt(input: {
   });
 }
 
+// Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
+// resolves the single most-specific active routing rule for a given
+// app/country/channel/purpose scope. Precedence (most specific wins):
+//   1. appId exact match + countryCode exact match
+//   2. appId exact match + countryCode null (app's own global default)
+//   3. appId null      + countryCode exact match (system-wide country default)
+//   4. appId null      + countryCode null (system-wide default)
+// Rules with an `environment` set are only eligible when it matches the
+// caller's environment (or the caller didn't specify one). Mirrors the
+// nullable-override precedence pattern already used by EmailTemplate.clientId.
+function resolveMostSpecificRule<
+  T extends { appId: string | null; countryCode: string | null; environment: string | null; priority: number; createdAt: Date },
+>(rules: T[], input: RoutingSelectionInput): T | null {
+  const envCompatible = rules.filter((r) => !r.environment || !input.environment || r.environment === input.environment);
+
+  const tiers: Array<(r: T) => boolean> = [
+    (r) => !!input.appId && r.appId === input.appId && !!input.countryCode && r.countryCode === input.countryCode,
+    (r) => !!input.appId && r.appId === input.appId && r.countryCode === null,
+    (r) => r.appId === null && !!input.countryCode && r.countryCode === input.countryCode,
+    (r) => r.appId === null && r.countryCode === null,
+  ];
+
+  for (const matchesTier of tiers) {
+    const tierMatches = envCompatible.filter(matchesTier);
+    if (tierMatches.length > 0) {
+      // Within a tier, lowest priority number wins (existing convention),
+      // tie-broken by oldest rule first — same ordering already used
+      // elsewhere in this file.
+      return tierMatches.sort((a, b) => a.priority - b.priority || a.createdAt.getTime() - b.createdAt.getTime())[0];
+    }
+  }
+  return null;
+}
+
 async function findCandidateProviders(input: RoutingSelectionInput) {
   const rules = await prisma.communicationRoutingRule.findMany({
     where: {
       channel: input.channel,
       purpose: input.purpose,
       isActive: true,
-      OR: [
-        { countryCode: input.countryCode ?? null },
-        { countryCode: null },
+      // Broad DB-side filter (any rule that could conceivably apply to
+      // this app or globally, this country or globally) — the precedence
+      // logic above narrows it down to exactly one rule in application code.
+      appId: input.appId ? undefined : null,
+      ...(input.appId ? { OR: [{ appId: input.appId }, { appId: null }] } : {}),
+      AND: [
+        {
+          OR: [{ countryCode: input.countryCode ?? null }, { countryCode: null }],
+        },
       ],
     },
     orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
   });
 
-  const routedProviderIds = [
-    ...rules.map((rule) => rule.providerId).filter(Boolean),
-    ...rules.flatMap((rule) => {
-      const ids = rule.fallbackProviderIds as string[] | null;
-      return Array.isArray(ids) ? ids : [];
-    }),
-  ];
+  const selectedRule = resolveMostSpecificRule(rules, input);
 
-  const where: Prisma.CommunicationProviderWhereInput = {
-    deletedAt: null,
-    type: input.channel,
-    status: { in: ['ACTIVE', 'TESTING'] },
-    healthStatus: { not: 'DOWN' },
-    supportedPurposes: { has: input.purpose },
-  };
+  if (selectedRule && !selectedRule.enabled) {
+    // Hard kill-switch: the most specific matching rule explicitly disables
+    // this channel for this scope. No fallback is attempted — the caller
+    // (dispatchEmail/dispatchSms) is responsible for catching this,
+    // auditing the block, and returning a clean CHANNEL_DISABLED error.
+    throw new ChannelDisabledError(selectedRule.id);
+  }
 
-  if (input.channel === 'SMS') {
+  const routedProviderIds = selectedRule
+    ? [selectedRule.providerId, ...(Array.isArray(selectedRule.fallbackProviderIds) ? (selectedRule.fallbackProviderIds as string[]) : [])].filter(
+        (id): id is string => !!id,
+      )
+    : [];
+
+  // fallbackEnabled=false on the selected rule means: only the rule's own
+  // explicit provider + fallback chain may be tried — do not fall through
+  // to the general eligible-provider pool or the international-fallback tier.
+  const restrictToExplicitChain = !!selectedRule && !selectedRule.fallbackEnabled && routedProviderIds.length > 0;
+
+  const where: Prisma.CommunicationProviderWhereInput = restrictToExplicitChain
+    ? { deletedAt: null, id: { in: routedProviderIds } }
+    : {
+        deletedAt: null,
+        type: input.channel,
+        status: { in: ['ACTIVE', 'TESTING'] },
+        healthStatus: { not: 'DOWN' },
+        supportedPurposes: { has: input.purpose },
+        ...(input.environment ? { environment: input.environment } : {}),
+      };
+
+  if (!restrictToExplicitChain && input.channel === 'SMS') {
     where.OR = [{ countryCode: input.countryCode ?? undefined }, { isGlobal: true }];
   }
 
@@ -252,6 +311,105 @@ async function resolveOtpTemplate(channel: CommunicationChannel, purpose: OtpTem
   });
 }
 
+// Phase 2 module (docs/phase-2-core-identity-admin-modules.md): the
+// CommunicationProvider model already had rateLimitPerMinute/dailyLimit/
+// monthlyLimit fields (editable via the admin UI), but nothing enforced
+// them at send time — a misconfigured or compromised OTP flow could hammer
+// a provider (and rack up real SMS/email costs) with no backend guard.
+//
+// Enforcement uses Redis INCR+EXPIRE counters keyed per provider per
+// window, mirroring the pattern in middleware/rateLimit.ts. If Redis is
+// unavailable, this fails OPEN (does not block sends) rather than taking
+// down OTP/password-reset/email-verification for a rate-limiting outage —
+// the primary auth rate limiters (loginRateLimit etc.) already fail closed
+// in production for the security-critical login path; this is a cost/abuse
+// guard for outbound provider traffic, not an auth boundary, so
+// availability is prioritized here.
+async function checkProviderRateLimit(provider: { id: string; rateLimitPerMinute: number | null; dailyLimit: number | null; monthlyLimit: number | null }): Promise<{ allowed: boolean; reason?: string }> {
+  const redisClient = getRedisClient();
+  if (!redisClient) return { allowed: true };
+
+  const now = new Date();
+  const windows: Array<{ key: string; ttlSeconds: number; limit: number | null; reason: string }> = [
+    {
+      key: `comm-limit:${provider.id}:minute:${Math.floor(now.getTime() / 60000)}`,
+      ttlSeconds: 60,
+      limit: provider.rateLimitPerMinute,
+      reason: 'rateLimitPerMinute',
+    },
+    {
+      key: `comm-limit:${provider.id}:day:${now.toISOString().slice(0, 10)}`,
+      ttlSeconds: 24 * 60 * 60,
+      limit: provider.dailyLimit,
+      reason: 'dailyLimit',
+    },
+    {
+      key: `comm-limit:${provider.id}:month:${now.toISOString().slice(0, 7)}`,
+      ttlSeconds: 31 * 24 * 60 * 60,
+      limit: provider.monthlyLimit,
+      reason: 'monthlyLimit',
+    },
+  ];
+
+  for (const window of windows) {
+    if (window.limit === null || window.limit === undefined) continue;
+    try {
+      const current = await redisClient.incr(window.key);
+      if (current === 1) {
+        await redisClient.expire(window.key, window.ttlSeconds);
+      }
+      if (current > window.limit) {
+        return { allowed: false, reason: window.reason };
+      }
+    } catch (err) {
+      console.error('Communication rate limit check failed, failing open:', err);
+      return { allowed: true };
+    }
+  }
+
+  return { allowed: true };
+}
+
+async function logRateLimitBlock(provider: { id: string }, recipient: string, reason: string) {
+  try {
+    await writeProviderAuditLog({
+      providerId: provider.id,
+      action: 'COMMUNICATION_RATE_LIMIT_BLOCKED',
+      metadata: { recipient, reason },
+    });
+  } catch (err) {
+    console.error('Failed to write rate-limit-blocked audit log:', err);
+  }
+}
+
+// Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
+// audit trail for a hard channel-disable block, so an admin can see exactly
+// when/why a send attempt was refused, distinct from a delivery failure.
+async function logChannelDisabledBlock(input: {
+  ruleId: string;
+  channel: CommunicationChannel;
+  purpose: OtpTemplatePurpose;
+  recipient: string;
+  appId?: string | null;
+  countryCode?: string | null;
+}) {
+  try {
+    await writeProviderAuditLog({
+      action: 'COMMUNICATION_CHANNEL_DISABLED_BLOCKED',
+      metadata: {
+        ruleId: input.ruleId,
+        channel: input.channel,
+        purpose: input.purpose,
+        recipient: input.recipient,
+        appId: input.appId ?? null,
+        countryCode: input.countryCode ?? null,
+      },
+    });
+  } catch (err) {
+    console.error('Failed to write channel-disabled audit log:', err);
+  }
+}
+
 export async function dispatchEmail(input: {
   to: string;
   subject: string;
@@ -261,18 +419,49 @@ export async function dispatchEmail(input: {
   clientId?: string | null;
   senderName?: string | null;
   senderEmail?: string | null;
+  replyTo?: string | null;
+  // Phase 2.6A: optional provider environment restriction (SANDBOX/LIVE).
+  // Omitted by existing callers, who keep their prior behavior unchanged.
+  environment?: 'SANDBOX' | 'LIVE' | null;
 }) {
-  const providers = await findCandidateProviders({
-    channel: 'EMAIL',
-    purpose: purposeToCommunicationPurpose(input.purpose),
-  });
+  const communicationPurpose = purposeToCommunicationPurpose(input.purpose);
+  let providers;
+  try {
+    providers = await findCandidateProviders({
+      channel: 'EMAIL',
+      purpose: communicationPurpose,
+      appId: input.clientId,
+      environment: input.environment,
+    });
+  } catch (err) {
+    if (err instanceof ChannelDisabledError) {
+      await logChannelDisabledBlock({
+        ruleId: err.ruleId,
+        channel: 'EMAIL',
+        purpose: input.purpose,
+        recipient: input.to,
+        appId: input.clientId,
+      });
+      throw new AppError('Email is disabled for this application.', 'CHANNEL_DISABLED', 403);
+    }
+    throw err;
+  }
   if (!providers.length) {
     throw new AppError('Email delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
   }
 
   const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
+  let rateLimitedCount = 0;
   for (let index = 0; index < attemptsLimit; index += 1) {
     const provider = providers[index];
+
+    const limitCheck = await checkProviderRateLimit(provider);
+    if (!limitCheck.allowed) {
+      rateLimitedCount += 1;
+      await logRateLimitBlock(provider, input.to, limitCheck.reason!);
+      continue;
+    }
+
     const credentials = getCredentialSecrets(provider);
     const adapter = resolveEmailAdapter(provider.code);
     const result = await adapter.sendEmail({
@@ -285,6 +474,7 @@ export async function dispatchEmail(input: {
       config: {
         fromEmail: input.senderEmail ?? provider.activeCredential?.fromEmail ?? null,
         fromName: input.senderName ?? provider.activeCredential?.fromName ?? null,
+        replyTo: input.replyTo ?? null,
         smtpHost: provider.activeCredential?.smtpHost ?? null,
         smtpPort: provider.activeCredential?.smtpPort ?? null,
         smtpSecure: provider.activeCredential?.smtpSecure ?? null,
@@ -303,6 +493,10 @@ export async function dispatchEmail(input: {
     if (result.success) return result;
   }
 
+  if (rateLimitedCount > 0 && rateLimitedCount === attemptsLimit) {
+    throw new AppError('Email delivery is temporarily rate-limited. Please try again shortly.', 'COMMUNICATION_RATE_LIMITED', 429);
+  }
+
   await createAdminNotification({
     type: 'EMAIL_DELIVERY_FAILED',
     title: 'Email OTP delivery failed',
@@ -318,20 +512,52 @@ export async function dispatchSms(input: {
   to: string;
   message: string;
   purpose: OtpTemplatePurpose;
+  // Phase 2.6A: app scope + optional environment restriction, same
+  // backward-compatible pattern as dispatchEmail above.
+  clientId?: string | null;
+  environment?: 'SANDBOX' | 'LIVE' | null;
 }) {
   const countryCode = extractCountryCode(input.to);
-  const providers = await findCandidateProviders({
-    channel: 'SMS',
-    purpose: purposeToCommunicationPurpose(input.purpose),
-    countryCode,
-  });
+  const communicationPurpose = purposeToCommunicationPurpose(input.purpose);
+  let providers;
+  try {
+    providers = await findCandidateProviders({
+      channel: 'SMS',
+      purpose: communicationPurpose,
+      countryCode,
+      appId: input.clientId,
+      environment: input.environment,
+    });
+  } catch (err) {
+    if (err instanceof ChannelDisabledError) {
+      await logChannelDisabledBlock({
+        ruleId: err.ruleId,
+        channel: 'SMS',
+        purpose: input.purpose,
+        recipient: input.to,
+        appId: input.clientId,
+        countryCode,
+      });
+      throw new AppError('SMS is disabled for this application/country.', 'CHANNEL_DISABLED', 403);
+    }
+    throw err;
+  }
   if (!providers.length) {
     throw new AppError('SMS delivery is temporarily unavailable.', 'COMMUNICATION_UNAVAILABLE', 503);
   }
 
   const attemptsLimit = Math.min(providers.length, MAX_DELIVERY_ATTEMPTS);
+  let rateLimitedCount = 0;
   for (let index = 0; index < attemptsLimit; index += 1) {
     const provider = providers[index];
+
+    const limitCheck = await checkProviderRateLimit(provider);
+    if (!limitCheck.allowed) {
+      rateLimitedCount += 1;
+      await logRateLimitBlock(provider, input.to, limitCheck.reason!);
+      continue;
+    }
+
     const credentials = getCredentialSecrets(provider);
     const adapter = resolveSmsAdapter(provider.code);
     const result = await adapter.sendSms({
@@ -353,6 +579,10 @@ export async function dispatchSms(input: {
     });
     await updateProviderHealth(provider.id, result);
     if (result.success) return result;
+  }
+
+  if (rateLimitedCount > 0 && rateLimitedCount === attemptsLimit) {
+    throw new AppError('SMS delivery is temporarily rate-limited. Please try again shortly.', 'COMMUNICATION_RATE_LIMITED', 429);
   }
 
   await createAdminNotification({
@@ -385,6 +615,7 @@ export async function sendOtpEmail(input: OtpCommunicationInput & { email: strin
     text: body.replace(/<[^>]+>/g, ''),
     html: body.replace(/\n/g, '<br />'),
     purpose: input.purpose,
+    clientId: input.clientId,
   });
 }
 
@@ -399,7 +630,7 @@ export async function sendOtpSms(input: OtpCommunicationInput & { phone: string 
     purpose: input.purpose,
     supportEmail: config.OTP_SUPPORT_EMAIL,
   });
-  return dispatchSms({ to: input.phone, message, purpose: input.purpose });
+  return dispatchSms({ to: input.phone, message, purpose: input.purpose, clientId: input.clientId });
 }
 
 export async function sendOtpMultiChannel(input: OtpCommunicationInput) {
@@ -626,6 +857,9 @@ export async function upsertRoutingRule(input: {
   req: Request;
   ruleId?: string;
   data: {
+    // Phase 2.6A: nullable app scope — null/omitted keeps the existing
+    // system-default-rule behavior exactly as before this change.
+    appId?: string | null;
     channel: CommunicationChannel;
     countryCode?: string | null;
     purpose: CommunicationPurpose;
@@ -633,6 +867,9 @@ export async function upsertRoutingRule(input: {
     providerId?: string | null;
     fallbackProviderIds?: string[] | null;
     priority?: number;
+    enabled?: boolean;
+    fallbackEnabled?: boolean;
+    environment?: CommunicationProviderEnvironment | null;
     isActive?: boolean;
   };
 }) {
@@ -812,7 +1049,10 @@ export async function getProviderAuditLogs(limit: number) {
 
 export async function listRoutingRules() {
   return prisma.communicationRoutingRule.findMany({
-    include: { provider: { select: { id: true, name: true, code: true, type: true } } },
+    include: {
+      provider: { select: { id: true, name: true, code: true, type: true } },
+      app: { select: { id: true, name: true, slug: true } },
+    },
     orderBy: [{ channel: 'asc' }, { priority: 'asc' }],
   });
 }

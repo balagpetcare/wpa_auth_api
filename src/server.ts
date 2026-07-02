@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import { config } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { createRedisClient, closeRedisClient } from './lib/redis.js';
@@ -29,6 +30,18 @@ if (config.TRUST_PROXY) {
     app.set('trust proxy', v);
   }
 }
+
+// Security headers (Phase 1 audit fix — see docs/wpa-central-auth-api-complete-audit.md).
+// Mounted before CORS/routes. crossOriginResourcePolicy is relaxed to
+// 'cross-origin' so that avatar images served from /uploads/avatars can still
+// be loaded by other allowed origins (the admin panel, first-party apps).
+// contentSecurityPolicy is disabled: this is a JSON API (not serving HTML
+// pages), so a CSP designed for browser-rendered pages isn't applicable here
+// and defaults could unexpectedly interfere with API responses/tools.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 
 const allowedOrigins = config.ALLOWED_PUBLIC_ORIGINS.split(',').map(o => o.trim());
 

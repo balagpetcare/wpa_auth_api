@@ -14,9 +14,13 @@ import {
   EmailBrandingData,
   EmailTemplateData,
   VariableValidationResult,
+  ResolvedSenderInfo,
 } from './emailRenderer.types.js';
 
-// Default branding fallbacks
+// Default branding fallbacks — non-secret, hardcoded. This is the final
+// fallback tier when no DB EmailBrandingSetting/ClientBranding row applies;
+// it must never be replaced with ENV-sourced values (product policy: ENV
+// holds only system-level secrets, not identity/branding data).
 const DEFAULT_BRANDING: Partial<EmailBrandingData> = {
   brandName: 'World Pet Association',
   primaryColor: '#0f3a7d',
@@ -30,6 +34,9 @@ const DEFAULT_BRANDING: Partial<EmailBrandingData> = {
   contactUrl: 'https://worldpetassociation.org/contact',
   legalDisclaimer: 'This is an automated message. Please do not reply directly to this email.',
 };
+
+const DEFAULT_SENDER_NAME = DEFAULT_BRANDING.brandName as string;
+const DEFAULT_SENDER_EMAIL = 'noreply@worldpetassociation.org';
 
 // Global variables available in all templates
 const GLOBAL_VARIABLES = [
@@ -56,16 +63,21 @@ const GLOBAL_VARIABLES = [
  * 5. DEFAULT_EMAIL_TEMPLATES built-in template
  *
  * Sender Resolution Priority:
- * 1. ClientBranding.senderName/senderEmail if clientId provided
- * 2. EmailBrandingSetting.senderName/senderEmail (global)
- * 3. Fallback: env SMTP_FROM_NAME / SMTP_FROM_EMAIL
+ * 1. ClientBranding.senderName/senderEmail/replyTo if clientId provided
+ * 2. EmailBrandingSetting.senderName/senderEmail/replyTo (global)
+ * 3. Fallback: DEFAULT_BRANDING constant (non-secret, hardcoded — see
+ *    Phase 2.6A, docs/phase-2-6a-app-aware-communication-routing-ui.md).
+ *    Credentials must never live in ENV per product policy; this fallback
+ *    used to read process.env.SMTP_FROM_NAME/SMTP_FROM_EMAIL directly,
+ *    bypassing both the DB branding system and the validated config
+ *    schema — removed.
  */
 export async function renderEmailTemplate(
   templateKey: EmailTemplateKey,
   variables: EmailVariables,
   clientId?: string | null,
   locale?: string | null
-): Promise<RenderedEmail & { senderName?: string; senderEmail?: string }> {
+): Promise<RenderedEmail & ResolvedSenderInfo> {
   try {
     const normalizedLocale = locale || 'en';
 
@@ -105,6 +117,7 @@ export async function renderEmailTemplate(
       text,
       senderName: senderInfo.senderName,
       senderEmail: senderInfo.senderEmail,
+      replyTo: senderInfo.replyTo,
     };
   } catch (error) {
     // Log error without exposing sensitive data
@@ -175,16 +188,17 @@ async function getEmailBrandingWithClientFallback(clientId?: string | null): Pro
 }
 
 /**
- * Resolves sender name and email with fallback chain:
- * 1. ClientBranding.senderName/senderEmail (if clientId provided)
- * 2. EmailBrandingSetting.senderName/senderEmail (global)
- * 3. Env fallback: SMTP_FROM_NAME / SMTP_FROM_EMAIL
+ * Resolves sender name, email, and reply-to with fallback chain:
+ * 1. ClientBranding.senderName/senderEmail/replyTo (if clientId provided)
+ * 2. EmailBrandingSetting.senderName/senderEmail/replyTo (global)
+ * 3. DEFAULT_SENDER_NAME / DEFAULT_SENDER_EMAIL constants (non-secret,
+ *    hardcoded — see Phase 2.6A). No ENV fallback: credentials/identity
+ *    values must not live in ENV per product policy.
  */
-async function getEmailSenderInfo(clientId?: string | null): Promise<{ senderName: string; senderEmail: string }> {
-  try {
-    const senderName = process.env.SMTP_FROM_NAME || 'World Pet Association';
-    const senderEmail = process.env.SMTP_FROM_EMAIL || 'noreply@worldpetassociation.org';
+async function getEmailSenderInfo(clientId?: string | null): Promise<ResolvedSenderInfo> {
+  const defaults: ResolvedSenderInfo = { senderName: DEFAULT_SENDER_NAME, senderEmail: DEFAULT_SENDER_EMAIL, replyTo: null };
 
+  try {
     // Try client-specific sender first
     if (clientId) {
       const clientBranding = await prisma.clientBranding.findUnique({
@@ -193,38 +207,32 @@ async function getEmailSenderInfo(clientId?: string | null): Promise<{ senderNam
 
       if (clientBranding?.isActive) {
         return {
-          senderName: clientBranding.senderName || senderName,
-          senderEmail: clientBranding.senderEmail || senderEmail,
+          senderName: clientBranding.senderName || defaults.senderName,
+          senderEmail: clientBranding.senderEmail || defaults.senderEmail,
+          replyTo: (clientBranding as any).replyTo ?? null,
         };
       }
     }
 
     // Try global branding sender
-    try {
-      const globalBranding = await prisma.emailBrandingSetting.findFirst({
-        where: { isActive: true },
-      });
+    const globalBranding = await prisma.emailBrandingSetting.findFirst({
+      where: { isActive: true },
+    });
 
-      if (globalBranding) {
-        return {
-          senderName: (globalBranding as any).senderName || senderName,
-          senderEmail: (globalBranding as any).senderEmail || senderEmail,
-        };
-      }
-    } catch {
-      // Fall through to env defaults
+    if (globalBranding) {
+      return {
+        senderName: (globalBranding as any).senderName || defaults.senderName,
+        senderEmail: (globalBranding as any).senderEmail || defaults.senderEmail,
+        replyTo: (globalBranding as any).replyTo ?? null,
+      };
     }
 
-    // Env defaults
-    return { senderName, senderEmail };
+    return defaults;
   } catch (error) {
-    console.warn('Failed to resolve sender info, using env defaults', {
+    console.warn('Failed to resolve sender info, using non-secret defaults', {
       error: error instanceof Error ? error.message : 'Unknown error',
     });
-    return {
-      senderName: process.env.SMTP_FROM_NAME || 'World Pet Association',
-      senderEmail: process.env.SMTP_FROM_EMAIL || 'noreply@worldpetassociation.org',
-    };
+    return defaults;
   }
 }
 

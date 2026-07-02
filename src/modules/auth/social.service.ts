@@ -405,6 +405,17 @@ async function loginOrCreateSocialUser(opts: {
   const refreshToken = signRefreshToken(user.id);
   const tokenHash = hashToken(refreshToken);
 
+  const session = await prisma.loginSession.create({
+    data: {
+      userId: user.id,
+      clientId,
+      sessionToken: generateOpaqueToken(),
+      expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
+      ipAddress: req.ip ?? req.socket.remoteAddress,
+      userAgent: req.headers['user-agent'],
+    },
+  });
+
   await prisma.refreshToken.create({
     data: {
       userId: user.id,
@@ -414,17 +425,7 @@ async function loginOrCreateSocialUser(opts: {
       expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
       ipAddress: req.ip ?? req.socket.remoteAddress,
       userAgent: req.headers['user-agent'],
-    },
-  });
-
-  await prisma.loginSession.create({
-    data: {
-      userId: user.id,
-      clientId,
-      sessionToken: generateOpaqueToken(),
-      expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
-      ipAddress: req.ip ?? req.socket.remoteAddress,
-      userAgent: req.headers['user-agent'],
+      familyId: session.id,
     },
   });
 

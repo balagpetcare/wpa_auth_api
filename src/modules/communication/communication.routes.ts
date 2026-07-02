@@ -12,6 +12,7 @@ import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
 import { requireAdmin } from '../../middleware/requireRole.js';
 import { validateBody } from '../../middleware/validate.js';
 import { requirePermission } from '../../middleware/requirePermission.js';
+import { sendTestEmailRateLimit } from '../../middleware/rateLimit.js';
 import * as communicationService from './communication.service.js';
 
 const router = Router();
@@ -45,6 +46,9 @@ const credentialSchema = z.object({
 });
 
 const routingRuleSchema = z.object({
+  // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
+  // null/omitted = system-wide default rule (existing behavior, unchanged).
+  appId: z.string().nullable().optional(),
   channel: z.nativeEnum(CommunicationChannel),
   countryCode: z.string().regex(/^\d{1,4}$/).nullable().optional(),
   purpose: z.nativeEnum(CommunicationPurpose),
@@ -52,6 +56,9 @@ const routingRuleSchema = z.object({
   providerId: z.string().nullable().optional(),
   fallbackProviderIds: z.array(z.string()).nullable().optional(),
   priority: z.number().int().min(0).max(9999).optional(),
+  enabled: z.boolean().optional(),
+  fallbackEnabled: z.boolean().optional(),
+  environment: z.enum(['SANDBOX', 'LIVE']).nullable().optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -248,9 +255,14 @@ router.patch(
   },
 );
 
+// Phase 2 fix (docs/phase-2-core-identity-admin-modules.md): sendTestEmailRateLimit
+// already existed in middleware/rateLimit.ts but was never wired to a route.
+// Applied here (and to test-sms) so repeated "test" clicks can't be used to
+// mass-send real messages to arbitrary recipients through a live provider.
 router.post(
   '/providers/:id/test-sms',
   requirePermission('communication.providers.test'),
+  sendTestEmailRateLimit,
   validateBody(testSmsSchema),
   async (req: AuthenticatedRequest, res, next) => {
     try {
@@ -265,6 +277,7 @@ router.post(
 router.post(
   '/providers/:id/test-email',
   requirePermission('communication.providers.test'),
+  sendTestEmailRateLimit,
   validateBody(testEmailSchema),
   async (req: AuthenticatedRequest, res, next) => {
     try {
@@ -324,6 +337,7 @@ router.patch(
         req,
         ruleId: req.params.id,
         data: {
+          appId: req.body.appId === undefined ? existing.appId : req.body.appId,
           channel: req.body.channel ?? existing.channel,
           countryCode: req.body.countryCode === undefined ? existing.countryCode : req.body.countryCode,
           purpose: req.body.purpose ?? existing.purpose,
@@ -331,6 +345,9 @@ router.patch(
           providerId: req.body.providerId === undefined ? existing.providerId : req.body.providerId,
           fallbackProviderIds: req.body.fallbackProviderIds === undefined ? ((existing.fallbackProviderIds as string[] | null) ?? []) : req.body.fallbackProviderIds,
           priority: req.body.priority ?? existing.priority,
+          enabled: req.body.enabled === undefined ? (existing as any).enabled : req.body.enabled,
+          fallbackEnabled: req.body.fallbackEnabled === undefined ? (existing as any).fallbackEnabled : req.body.fallbackEnabled,
+          environment: req.body.environment === undefined ? (existing as any).environment : req.body.environment,
           isActive: req.body.isActive ?? existing.isActive,
         },
       });

@@ -18,6 +18,7 @@ import { sendEmail } from '../../lib/mailer.js';
 import { sendTemplatedEmail, sendTemplatedEmailWithFallback } from '../../lib/sendTemplatedEmail.js';
 import { sendLoginAlertEmail, sendWelcomeEmail } from '../../lib/emailNotifications.js';
 import { Request } from 'express';
+import { logAbuseSignal, clearRisk } from '../../lib/antiAbuse.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -147,7 +148,13 @@ export async function registerUser(
       await prisma.emailVerificationToken.create({
         data: { userId: user.id, email: opts.email, tokenHash, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) },
       });
-      const verificationLink = `${config.APP_URL || 'http://localhost:5010'}/verify-email?token=${token}`;
+      // Phase 2.5 incidental fix (docs/phase-2-5-public-auth-rs256-oidc.md):
+      // this pointed at config.APP_URL, which is this API server's own base
+      // URL (http://localhost:5010 by default) — not a frontend page, so
+      // the link in every verification email 404'd. ADMIN_PANEL_ORIGIN is
+      // the Next.js frontend that now hosts the real public verify-email
+      // page at /auth/user/verify-email.
+      const verificationLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/verify-email?token=${token}`;
       await sendTemplatedEmailWithFallback(
         {
           templateKey: 'email_verification',
@@ -185,12 +192,14 @@ export async function loginUser(
   });
 
   if (!user || !user.passwordHash) {
+    await logAbuseSignal({ route: 'auth-login', req, identifier: identifier, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
   }
 
   const valid = await bcrypt.compare(opts.password, user.passwordHash);
   if (!valid) {
     await writeAuditLog({ userId: user.id, action: 'LOGIN', metadata: { success: false }, req });
+    await logAbuseSignal({ route: 'auth-login', req, identifier: identifier, userId: user.id, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
   }
 
@@ -215,19 +224,7 @@ export async function loginUser(
   const refreshToken = signRefreshToken(user.id);
   const tokenHash = hashToken(refreshToken);
 
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      clientId: client?.id ?? (await getOrCreateInternalClientId()),
-      tokenHash,
-      scopes: ['openid', 'offline_access'],
-      expiresAt: buildTokenExpiry(config.REFRESH_TOKEN_TTL),
-      ipAddress: req.ip ?? req.socket.remoteAddress,
-      userAgent: req.headers['user-agent'],
-    },
-  });
-
-  await prisma.loginSession.create({
+  const session = await prisma.loginSession.create({
     data: {
       userId: user.id,
       clientId: client?.id ?? (await getOrCreateInternalClientId()),
@@ -238,12 +235,26 @@ export async function loginUser(
     },
   });
 
+  await prisma.refreshToken.create({
+    data: {
+      userId: user.id,
+      clientId: client?.id ?? (await getOrCreateInternalClientId()),
+      tokenHash,
+      scopes: ['openid', 'offline_access'],
+      expiresAt: buildTokenExpiry(config.REFRESH_TOKEN_TTL),
+      ipAddress: req.ip ?? req.socket.remoteAddress,
+      userAgent: req.headers['user-agent'],
+      familyId: session.id,
+    },
+  });
+
   await prisma.user.update({
     where: { id: user.id },
     data: { lastLoginAt: new Date() },
   });
 
   await writeAuditLog({ userId: user.id, clientId: client?.id, action: 'LOGIN', metadata: { success: true }, req });
+  await clearRisk({ req, identifier });
 
   // Send login alert email
   if (user.email) {
@@ -285,6 +296,26 @@ export async function loginUser(
 
 // ─── Refresh ─────────────────────────────────────────────────────────────────
 
+export async function revokeSessionFamily(userId: string, familyId: string, reason: string) {
+  // Revoke all refresh tokens in the family
+  await prisma.refreshToken.updateMany({
+    where: { familyId, userId, revokedAt: null },
+    data: {
+      revokedAt: new Date(),
+      revocationReason: reason,
+    },
+  });
+
+  // Revoke the related LoginSession
+  await prisma.loginSession.updateMany({
+    where: { id: familyId, userId, revokedAt: null },
+    data: {
+      revokedAt: new Date(),
+      revocationReason: reason,
+    },
+  });
+}
+
 export async function refreshTokens(rawRefreshToken: string, req: Request) {
   let payload: { sub: string };
   try {
@@ -296,9 +327,73 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
   const tokenHash = hashToken(rawRefreshToken);
   const stored = await prisma.refreshToken.findUnique({ where: { tokenHash } });
 
-  if (!stored || stored.revokedAt || stored.expiresAt < new Date()) {
+  if (!stored) {
     throw new AppError('Refresh token is invalid or has been revoked.', 'TOKEN_REVOKED', 401);
   }
+
+  // Reuse detection:
+  if (stored.revokedAt || stored.expiresAt < new Date()) {
+    if (stored.revokedAt && stored.revocationReason === 'ROTATED') {
+      // Reused a rotated token!
+      if (!stored.reusedAt) {
+        // Mark as reused to prevent duplicate processing
+        await prisma.refreshToken.update({
+          where: { id: stored.id },
+          data: { reusedAt: new Date() },
+        });
+
+        // Revoke the session family
+        if (stored.familyId) {
+          await revokeSessionFamily(stored.userId, stored.familyId, 'REUSE_DETECTED');
+        }
+
+        // Increase abuse risk score for IP
+        await logAbuseSignal({
+          route: 'auth-refresh',
+          req,
+          identifier: rawRefreshToken.slice(0, 16),
+          threat: 'REFRESH_TOKEN_REUSE_DETECTED',
+          blockAfter: 3,
+        });
+
+        // Write SecurityEvent
+        await writeSecurityEvent({
+          type: 'TOKEN_REUSE_DETECTED',
+          severity: 'HIGH',
+          metadata: {
+            userId: stored.userId,
+            clientId: stored.clientId,
+            familyId: stored.familyId,
+            ipAddress: req.ip ?? req.socket.remoteAddress,
+            userAgent: req.headers['user-agent'],
+          },
+          req,
+        });
+
+        // Create AdminNotification/security notification
+        await createAdminNotification({
+          userId: stored.userId,
+          type: 'REFRESH_TOKEN_REUSE_DETECTED',
+          title: 'Potential refresh token theft detected',
+          message: `Refresh token reuse detected for user ${stored.userId}. Entire session family has been revoked.`,
+          severity: 'SECURITY',
+          category: 'SECURITY',
+          metadata: {
+            userId: stored.userId,
+            clientId: stored.clientId,
+            familyId: stored.familyId,
+          },
+        });
+      }
+
+      throw new AppError('Refresh token reuse detected.', 'TOKEN_REVOKED', 401);
+    }
+
+    // Normal invalid/revoked/expired token
+    await logAbuseSignal({ route: 'auth-refresh', req, identifier: rawRefreshToken.slice(0, 16), threat: 'SUSPICIOUS_ACTIVITY_BLOCKED', blockAfter: 8 });
+    throw new AppError('Refresh token is invalid or has been revoked.', 'TOKEN_REVOKED', 401);
+  }
+
   if (stored.userId !== payload.sub) {
     throw new AppError('Token mismatch.', 'TOKEN_INVALID', 401);
   }
@@ -308,24 +403,50 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
     throw new AppError('User is not active.', 'ACCOUNT_INACTIVE', 403);
   }
 
-  // Rotate: revoke old, issue new
-  await prisma.refreshToken.update({ where: { tokenHash }, data: { revokedAt: new Date() } });
+  // Verify that the login session is not revoked
+  if (stored.familyId) {
+    const session = await prisma.loginSession.findUnique({ where: { id: stored.familyId } });
+    if (!session || session.revokedAt) {
+      // The session family is already revoked, so we should revoke this token too
+      await prisma.refreshToken.update({
+        where: { id: stored.id },
+        data: { revokedAt: new Date(), revocationReason: 'SESSION_REVOKED' },
+      });
+      throw new AppError('Session is invalid or has been revoked.', 'TOKEN_REVOKED', 401);
+    }
+  }
 
-  const roles = await getUserRoles(user.id);
-  const newAccess = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
+  // Rotate: create new, mark old as rotated
   const newRefresh = signRefreshToken(user.id);
+  const newHash = hashToken(newRefresh);
+  const familyId = stored.familyId; // keep family consistent
 
-  await prisma.refreshToken.create({
+  // Create new refresh token
+  const newClientToken = await prisma.refreshToken.create({
     data: {
       userId: user.id,
       clientId: stored.clientId,
-      tokenHash: hashToken(newRefresh),
+      tokenHash: newHash,
       scopes: stored.scopes,
       expiresAt: buildTokenExpiry(config.REFRESH_TOKEN_TTL),
       ipAddress: req.ip ?? req.socket.remoteAddress,
       userAgent: req.headers['user-agent'],
+      familyId,
     },
   });
+
+  // Mark old token as rotated and link to new one
+  await prisma.refreshToken.update({
+    where: { id: stored.id },
+    data: {
+      revokedAt: new Date(),
+      revocationReason: 'ROTATED',
+      replacedByTokenId: newClientToken.id,
+    },
+  });
+
+  const roles = await getUserRoles(user.id);
+  const newAccess = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
 
   await writeAuditLog({ userId: user.id, action: 'TOKEN_REFRESHED', req });
 
@@ -340,23 +461,33 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
 // ─── Logout ──────────────────────────────────────────────────────────────────
 
 export async function logoutUser(userId: string, rawRefreshToken: string | undefined, req: Request) {
+  let familyIdRevoked = false;
+
   if (rawRefreshToken) {
     const tokenHash = hashToken(rawRefreshToken);
-    await prisma.refreshToken.updateMany({
-      where: { tokenHash, userId, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    const stored = await prisma.refreshToken.findUnique({ where: { tokenHash } });
+    if (stored && stored.familyId) {
+      await revokeSessionFamily(userId, stored.familyId, 'LOGOUT');
+      familyIdRevoked = true;
+    } else {
+      await prisma.refreshToken.updateMany({
+        where: { tokenHash, userId, revokedAt: null },
+        data: { revokedAt: new Date(), revocationReason: 'LOGOUT' },
+      });
+    }
   }
 
-  // Revoke all active sessions for this user (or just the matching one)
-  await prisma.loginSession.updateMany({
-    where: {
-      userId,
-      revokedAt: null,
-      ipAddress: req.ip ?? req.socket.remoteAddress,
-    },
-    data: { revokedAt: new Date() },
-  });
+  // Revoke all active sessions for this user matching this IP if they weren't already revoked by familyId
+  if (!familyIdRevoked) {
+    await prisma.loginSession.updateMany({
+      where: {
+        userId,
+        revokedAt: null,
+        ipAddress: req.ip ?? req.socket.remoteAddress,
+      },
+      data: { revokedAt: new Date(), revocationReason: 'LOGOUT' },
+    });
+  }
 
   await writeAuditLog({ userId, action: 'LOGOUT', req });
 }
@@ -416,12 +547,23 @@ export async function forgotPassword(email: string, req: Request) {
     actionUrl: '/account',
   });
 
-  const resetLink = `${config.APP_URL || 'http://localhost:5010'}/reset-password?token=${token}`;
+  // Phase 2.5 incidental fix (docs/phase-2-5-public-auth-rs256-oidc.md):
+  // same APP_URL-instead-of-frontend bug as the email-verification link
+  // above — this pointed at the API server itself, not a real page.
+  const resetLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/reset-password?token=${token}`;
   await sendTemplatedEmailWithFallback(
     {
       templateKey: 'password_reset',
+      // Phase 2 incidental fix (docs/phase-2-core-identity-admin-modules.md):
+      // this was `resetPasswordLink`, but the actual template/renderer
+      // variable name is `resetLink` (see emailRenderer.examples.ts) — the
+      // mismatch caused renderEmailTemplate() to throw "Missing required
+      // variable: resetLink" on every real password-reset request, silently
+      // falling back to the plain-text fallback email. Found while manually
+      // verifying the OTP/communication rate limiter didn't break the
+      // password-reset flow.
       variables: {
-        resetPasswordLink: resetLink,
+        resetLink,
         expiresIn: '1 hour',
       },
       to: email,
@@ -510,8 +652,11 @@ export async function requestEmailVerification(userId: string, email: string, re
   });
 
   await writeAuditLog({ userId, action: 'EMAIL_VERIFIED', metadata: { step: 'request' }, req });
+  await logAbuseSignal({ route: 'auth-verify-email-request', req, identifier: email, userId, threat: 'OTP_ABUSE_DETECTED', blockAfter: 8 });
 
-  const verificationLink = `${config.APP_URL || 'http://localhost:5010'}/verify-email?token=${token}`;
+  // Phase 2.5 incidental fix (docs/phase-2-5-public-auth-rs256-oidc.md):
+  // same APP_URL-instead-of-frontend bug fixed above.
+  const verificationLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/verify-email?token=${token}`;
   const requestUser = await prisma.user.findUnique({ where: { id: userId } });
   await sendTemplatedEmailWithFallback(
     {
@@ -538,6 +683,7 @@ export async function confirmEmailVerification(token: string, req: Request) {
   const record = await prisma.emailVerificationToken.findUnique({ where: { tokenHash } });
 
   if (!record || record.usedAt || record.expiresAt < new Date()) {
+    await logAbuseSignal({ route: 'auth-verify-email-confirm', req, identifier: token.slice(0, 16), threat: 'OTP_ABUSE_DETECTED', blockAfter: 8 });
     throw new AppError('Verification token is invalid or has expired.', 'TOKEN_INVALID', 400);
   }
 

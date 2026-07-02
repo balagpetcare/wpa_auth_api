@@ -3,13 +3,14 @@ import { z } from 'zod';
 import { UserStatus, AuthClientStatus, AuthClientType, OAuthProvider, AdminNotificationCategory, AdminNotificationSeverity } from '@prisma/client';
 import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
 import { requireAdmin } from '../../middleware/requireRole.js';
+import { requirePermission } from '../../middleware/requirePermission.js';
 import { validateBody } from '../../middleware/validate.js';
 import { parsePagination, paginatedResponse } from '../../lib/pagination.js';
 import * as adminService from './admin.service.js';
 import * as authService from '../auth/auth.service.js';
-import { loginRateLimit } from '../../middleware/rateLimit.js';
 import { avatarUpload } from '../../middleware/upload.js';
 import { AppError } from '../../lib/errors.js';
+import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
 
 const router = Router();
 
@@ -30,7 +31,7 @@ const adminLoginSchema = z.object({
 // POST /admin/auth/login  â€” public (no authGuard here, override router middleware)
 const adminAuthRouter = Router();
 
-adminAuthRouter.post('/login', loginRateLimit, validateBody(adminLoginSchema), async (req, res, next) => {
+adminAuthRouter.post('/login', enterpriseRateLimit({ route: 'admin-login', windowMs: 15 * 60 * 1000, max: 5, identifierFrom: (req) => req.body?.emailOrUsername, threat: 'ADMIN_LOGIN_ABUSE', blockAfter: 8, blockTtlMs: 60 * 60 * 1000 }), validateBody(adminLoginSchema), async (req, res, next) => {
   try {
     const result = await authService.loginUser(req.body, req);
     const isAdmin = result.user.roles.some((r) => ['admin', 'super_admin'].includes(r.toLowerCase()));
@@ -53,10 +54,25 @@ adminAuthRouter.get('/me', authGuard, requireAdmin, async (req: AuthenticatedReq
   }
 });
 
-adminAuthRouter.post('/logout', authGuard, requireAdmin, validateBody(z.object({ refreshToken: z.string().optional() })), async (req: AuthenticatedRequest, res, next) => {
+const adminLogoutSchema = z.object({
+  refreshToken: z.string().min(1).optional(),
+});
+
+adminAuthRouter.post('/logout', authGuard, requireAdmin, async (req: AuthenticatedRequest, res, next) => {
   try {
-    await authService.logoutUser(req.user!.id, req.body.refreshToken, req);
-    res.json({ success: true, message: 'Logged out successfully.' });
+    const parsed = adminLogoutSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid logout request.',
+        code: 'VALIDATION_ERROR',
+        issues: parsed.error.flatten(),
+      });
+      return;
+    }
+
+    await authService.logoutUser(req.user!.id, parsed.data.refreshToken, req);
+    res.json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
     next(err);
   }
@@ -89,7 +105,7 @@ const usersQuerySchema = z.object({
 });
 
 // GET /admin/users/summary
-router.get('/users/summary', async (req, res, next) => {
+router.get('/users/summary', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
     const summary = await adminService.getUsersSummary();
     res.json({ success: true, summary });
@@ -98,11 +114,158 @@ router.get('/users/summary', async (req, res, next) => {
   }
 });
 
+// Query schema for the admin-team ("Admin Users" panel) listing below. Kept
+// next to usersQuerySchema for visibility even though it is also referenced
+// by the invite/assign-existing section further down this file.
+const adminUsersQuerySchema = z.object({
+  q: z.string().optional(),
+  role: z.string().optional(),
+  status: z.string().optional(),
+  limit: z.coerce.number().min(1).max(100).optional().default(20),
+  cursor: z.string().optional(),
+});
+
 // GET /admin/users
-router.get('/users', async (req, res, next) => {
+// NOTE (Phase 1 audit fix, see docs/central-auth-api-admin-scalability-audit.md
+// section E): this path used to be registered twice — once here backed by
+// adminService.listUsers() (all users, rich filters), and again further down
+// this file backed by adminService.listAdminUsers() (admin/super_admin
+// operators only, with an `isLastSuperAdmin` flag). Express dispatches only
+// the first-registered handler for a given method+path, so the second
+// registration was completely unreachable dead code. The admin panel's
+// admin-users feature (wpa_auth_admin/src/features/admin-users/api.ts) calls
+// this exact path expecting the admin-team shape (and relies on
+// `isLastSuperAdmin` to protect the last super admin), so that is the
+// implementation kept live here. adminService.listUsers() (general
+// all-users listing with rich filters) is left in admin.service.ts, unused,
+// for the future dedicated end-user-management API called out as a missing
+// module in the audit — it is intentionally not wired to a route yet.
+router.get('/users', requirePermission('users:read', 'admin:read'), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const query = adminUsersQuerySchema.parse(req.query);
+    const data = await adminService.listAdminUsers(query);
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /admin/users/:id
+router.get('/users/:id', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
+  try {
+    const user = await adminService.getUserById((req.params.id as string));
+    res.json({ success: true, user });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /admin/users/:id/status
+// NOTE (Phase 1 audit fix): this path used to be registered twice. The
+// duplicate further down this file carried the self-suspend guard below, but
+// Express dispatches only the first-registered handler for a given
+// method+path, so that guard was dead code — an admin could suspend their
+// own account. The guard now lives on this, the only registration of this
+// route. Last-super-admin protection is enforced independently and
+// authoritatively inside adminService.updateUserStatus() via
+// guardLastSuperAdmin(), so it applies here regardless of which admin calls it.
+router.patch('/users/:id/status', requirePermission('users:manage', 'admin:manage'), validateBody(z.object({ status: z.nativeEnum(UserStatus) })), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    if (req.params.id === req.user!.id && req.body.status !== UserStatus.ACTIVE) {
+      throw new AppError('You cannot change your own account status.', 'FORBIDDEN', 403);
+    }
+    const user = await adminService.updateUserStatus((req.params.id as string), req.body.status, req.user!.id, req);
+    res.json({ success: true, user });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /admin/users/:id
+router.patch('/users/:id', requirePermission('users:manage', 'admin:manage'), validateBody(z.object({
+  displayName: z.string().max(64).optional(),
+  avatarUrl: z.string().url().optional(),
+  username: z.string().min(3).max(32).regex(/^[a-zA-Z0-9_]+$/).optional(),
+})), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const user = await adminService.updateUser((req.params.id as string), req.body, req.user!.id, req);
+    res.json({ success: true, user });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /admin/users/:id
+router.delete('/users/:id', requirePermission('users:manage', 'admin:manage'), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const user = await adminService.deleteUserAccount(req.params.id, req.user!.id, req);
+    res.json({ success: true, message: 'User account deactivated safely.', user });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /admin/users/:id/reset-password
+router.post('/users/:id/reset-password', requirePermission('users:manage', 'admin:manage'), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const result = await adminService.resetUserPasswordAdmin(req.params.id, req.user!.id, req);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /admin/users/:id/revoke-sessions
+router.post('/users/:id/revoke-sessions', requirePermission('users:manage', 'admin:manage'), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const result = await adminService.revokeUserSessions(req.params.id, req.user!.id, req);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /admin/users/:id/sessions
+router.get('/users/:id/sessions', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
+  try {
+    const sessions = await adminService.getUserSessions((req.params.id as string));
+    res.json({ success: true, sessions });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /admin/users/:id/audit-logs
+router.get('/users/:id/audit-logs', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
+  try {
+    const pagination = parsePagination(req);
+    const { logs, total } = await adminService.getUserAuditLogs((req.params.id as string), pagination);
+    res.json({ success: true, ...paginatedResponse(logs, total, pagination) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── End Users (Customer / Platform Accounts) ─────────────────────────────────
+// Phase 2 module (docs/phase-2-core-identity-admin-modules.md). The admin
+// panel previously only had a screen for internal admin operators (see the
+// "─── Users ───" section above, backed by adminService.listAdminUsers()).
+// adminService.listUsers() — a general, cursor-pagination-ready listing with
+// rich filters (status/role/verification/OAuth/date-range) — already existed
+// but was unused (it used to sit at the shadowed GET /users route fixed in
+// Phase 1). It's reused here, unmodified, under its own dedicated path so it
+// never collides with the admin-team routes again. getUserById/
+// updateUserStatus/getUserSessions/getUserAuditLogs are likewise reused
+// as-is — they already exclude password hashes and other sensitive fields
+// via safeUserSelect, and updateUserStatus already runs guardLastSuperAdmin
+// (a no-op for ordinary end users, but keeps the same safety net if a
+// legacy record somehow holds an admin role).
+
+// GET /admin/end-users
+router.get('/end-users', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
     const query = usersQuerySchema.parse(req.query);
-    
+
     const data = await adminService.listUsers({
       search: query.q,
       status: query.status as UserStatus | 'ALL',
@@ -122,15 +285,15 @@ router.get('/users', async (req, res, next) => {
       page: query.page,
       includeCount: query.includeCount === 'true'
     });
-    
+
     res.json({ success: true, data });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /admin/users/:id
-router.get('/users/:id', async (req, res, next) => {
+// GET /admin/end-users/:id
+router.get('/end-users/:id', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
     const user = await adminService.getUserById((req.params.id as string));
     res.json({ success: true, user });
@@ -139,8 +302,8 @@ router.get('/users/:id', async (req, res, next) => {
   }
 });
 
-// PATCH /admin/users/:id/status
-router.patch('/users/:id/status', validateBody(z.object({ status: z.nativeEnum(UserStatus) })), async (req: AuthenticatedRequest, res, next) => {
+// PATCH /admin/end-users/:id/status
+router.patch('/end-users/:id/status', requirePermission('users:manage', 'admin:manage'), validateBody(z.object({ status: z.nativeEnum(UserStatus) })), async (req: AuthenticatedRequest, res, next) => {
   try {
     const user = await adminService.updateUserStatus((req.params.id as string), req.body.status, req.user!.id, req);
     res.json({ success: true, user });
@@ -149,52 +312,8 @@ router.patch('/users/:id/status', validateBody(z.object({ status: z.nativeEnum(U
   }
 });
 
-// PATCH /admin/users/:id
-router.patch('/users/:id', validateBody(z.object({
-  displayName: z.string().max(64).optional(),
-  avatarUrl: z.string().url().optional(),
-  username: z.string().min(3).max(32).regex(/^[a-zA-Z0-9_]+$/).optional(),
-})), async (req: AuthenticatedRequest, res, next) => {
-  try {
-    const user = await adminService.updateUser((req.params.id as string), req.body, req.user!.id, req);
-    res.json({ success: true, user });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// DELETE /admin/users/:id
-router.delete('/users/:id', async (req: AuthenticatedRequest, res, next) => {
-  try {
-    const user = await adminService.deleteUserAccount(req.params.id, req.user!.id, req);
-    res.json({ success: true, message: 'User account deactivated safely.', user });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /admin/users/:id/reset-password
-router.post('/users/:id/reset-password', async (req: AuthenticatedRequest, res, next) => {
-  try {
-    const result = await adminService.resetUserPasswordAdmin(req.params.id, req.user!.id, req);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /admin/users/:id/revoke-sessions
-router.post('/users/:id/revoke-sessions', async (req: AuthenticatedRequest, res, next) => {
-  try {
-    const result = await adminService.revokeUserSessions(req.params.id, req.user!.id, req);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /admin/users/:id/sessions
-router.get('/users/:id/sessions', async (req, res, next) => {
+// GET /admin/end-users/:id/sessions
+router.get('/end-users/:id/sessions', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
     const sessions = await adminService.getUserSessions((req.params.id as string));
     res.json({ success: true, sessions });
@@ -203,8 +322,8 @@ router.get('/users/:id/sessions', async (req, res, next) => {
   }
 });
 
-// GET /admin/users/:id/audit-logs
-router.get('/users/:id/audit-logs', async (req, res, next) => {
+// GET /admin/end-users/:id/audit-logs
+router.get('/end-users/:id/audit-logs', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
   try {
     const pagination = parsePagination(req);
     const { logs, total } = await adminService.getUserAuditLogs((req.params.id as string), pagination);
@@ -215,9 +334,26 @@ router.get('/users/:id/audit-logs', async (req, res, next) => {
 });
 
 // â”€â”€â”€ Roles & Permissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Phase 2 role-permission management API (see
+// docs/wpa-central-auth-api-complete-audit.md, "Phase 2 Role-Permission API Update").
+//
+// Permission keys: `roles:read` gates all GET routes below; `roles:manage` gates
+// all mutating routes (create/update/delete role, and add/remove/replace
+// permissions on a role). `roles:write`/`roles:delete` are also accepted where
+// they existed previously, so any role that already had `roles:write` keeps
+// working. `requirePermission()` still lets `super_admin` bypass all of these
+// via its existing fast-path (see src/middleware/requirePermission.ts) — no
+// change was needed there.
+const permissionIdsOrKeysSchema = z.object({
+  permissionIds: z.array(z.string().min(1)).optional(),
+  permissionKeys: z.array(z.string().min(1)).optional(),
+}).refine((d) => (d.permissionIds && d.permissionIds.length > 0) || (d.permissionKeys && d.permissionKeys.length > 0), {
+  message: 'At least one of permissionIds or permissionKeys is required.',
+});
+
 
 // GET /admin/roles
-router.get('/roles', async (_req, res, next) => {
+router.get('/roles', requirePermission('roles:read'), async (_req, res, next) => {
   try {
     const roles = await adminService.listRoles();
     res.json({ success: true, roles });
@@ -226,13 +362,25 @@ router.get('/roles', async (_req, res, next) => {
   }
 });
 
+// GET /admin/roles/:id
+router.get('/roles/:id', requirePermission('roles:read'), async (req, res, next) => {
+  try {
+    const role = await adminService.getRoleById(req.params.id as string);
+    res.json({ success: true, role });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /admin/roles
-router.post('/roles', validateBody(z.object({
+router.post('/roles', requirePermission('roles:manage', 'roles:write'), validateBody(z.object({
   name: z.string().min(2),
   description: z.string().optional(),
-})), async (_req, res, next) => {
+  permissionIds: z.array(z.string().min(1)).optional(),
+  permissionKeys: z.array(z.string().min(1)).optional(),
+})), async (req: AuthenticatedRequest, res, next) => {
   try {
-    const role = await adminService.createRole(_req.body);
+    const role = await adminService.createRoleAudited(req.body, req.user!.id, req);
     res.status(201).json({ success: true, role });
   } catch (err) {
     next(err);
@@ -240,20 +388,95 @@ router.post('/roles', validateBody(z.object({
 });
 
 // PATCH /admin/roles/:id
-router.patch('/roles/:id', validateBody(z.object({
+// NOTE: modifying the SUPER_ADMIN role's *permission assignments* (permissionIds/
+// permissionKeys) is blocked unless the actor themself holds the super_admin
+// role — see adminService.assertCanModifySuperAdminPermissions(). Renaming/
+// re-describing the SUPER_ADMIN role (name/description only, no permission
+// change) is still allowed for any admin with roles:manage.
+router.patch('/roles/:id', requirePermission('roles:manage', 'roles:write'), validateBody(z.object({
   name: z.string().min(2).optional(),
   description: z.string().optional(),
-})), async (req, res, next) => {
+  permissionIds: z.array(z.string().min(1)).optional(),
+  permissionKeys: z.array(z.string().min(1)).optional(),
+})), async (req: AuthenticatedRequest, res, next) => {
   try {
-    const role = await adminService.updateRole((req.params.id as string), req.body);
+    const role = await adminService.updateRole(
+      req.params.id as string,
+      req.body,
+      req.user!.id,
+      req.user!.roles ?? [],
+      req,
+    );
     res.json({ success: true, role });
   } catch (err) {
     next(err);
   }
 });
 
+// DELETE /admin/roles/:id
+// Blocked if the role is SUPER_ADMIN, or if any user is still assigned to it.
+router.delete('/roles/:id', requirePermission('roles:manage', 'roles:delete'), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    await adminService.deleteRole(req.params.id as string, req.user!.id, req);
+    res.json({ success: true, message: 'Role deleted.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /admin/roles/:id/permissions — add one or more permissions to a role.
+router.post('/roles/:id/permissions', requirePermission('roles:manage'), validateBody(permissionIdsOrKeysSchema), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const role = await adminService.addPermissionsToRole(
+      req.params.id as string,
+      req.body,
+      req.user!.id,
+      req.user!.roles ?? [],
+      req,
+    );
+    res.json({ success: true, role, message: 'Permissions added to role.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /admin/roles/:id/permissions — replace the full permission set for a role.
+router.patch('/roles/:id/permissions', requirePermission('roles:manage'), validateBody(z.object({
+  permissionIds: z.array(z.string().min(1)).optional(),
+  permissionKeys: z.array(z.string().min(1)).optional(),
+})), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const role = await adminService.replaceRolePermissions(
+      req.params.id as string,
+      req.body,
+      req.user!.id,
+      req.user!.roles ?? [],
+      req,
+    );
+    res.json({ success: true, role, message: 'Role permissions replaced.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /admin/roles/:id/permissions/:permissionId
+router.delete('/roles/:id/permissions/:permissionId', requirePermission('roles:manage'), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const role = await adminService.removePermissionFromRole(
+      req.params.id as string,
+      req.params.permissionId as string,
+      req.user!.id,
+      req.user!.roles ?? [],
+      req,
+    );
+    res.json({ success: true, role, message: 'Permission removed from role.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /admin/permissions
-router.get('/permissions', async (_req, res, next) => {
+router.get('/permissions', requirePermission('roles:read', 'permissions:read'), async (_req, res, next) => {
   try {
     const permissions = await adminService.listPermissions();
     res.json({ success: true, permissions });
@@ -263,7 +486,12 @@ router.get('/permissions', async (_req, res, next) => {
 });
 
 // POST /admin/users/:id/roles
-router.post('/users/:id/roles', validateBody(z.object({ roleId: z.string().min(1) })), async (req: AuthenticatedRequest, res, next) => {
+// NOTE (Phase 1 audit fix — privilege escalation): this route previously had
+// no permission check at all beyond the router-level requireAdmin, so any
+// admin-level account (not just super_admin) could grant any role, including
+// SUPER_ADMIN, to any user. Gated the same way as the sibling
+// PATCH /users/:id/roles route below.
+router.post('/users/:id/roles', requirePermission('roles:manage', 'users:manage'), validateBody(z.object({ roleId: z.string().min(1) })), async (req: AuthenticatedRequest, res, next) => {
   try {
     await adminService.assignRoleToUser((req.params.id as string), req.body.roleId, req.user!.id, req);
     res.json({ success: true, message: 'Role assigned.' });
@@ -273,7 +501,9 @@ router.post('/users/:id/roles', validateBody(z.object({ roleId: z.string().min(1
 });
 
 // DELETE /admin/users/:id/roles/:roleId
-router.delete('/users/:id/roles/:roleId', async (req: AuthenticatedRequest, res, next) => {
+// NOTE (Phase 1 audit fix — privilege escalation): same gap as above, applied
+// to role removal.
+router.delete('/users/:id/roles/:roleId', requirePermission('roles:manage', 'users:manage'), async (req: AuthenticatedRequest, res, next) => {
   try {
     await adminService.removeRoleFromUser((req.params.id as string), (req.params.roleId as string), req.user!.id, req);
     res.json({ success: true, message: 'Role removed.' });
@@ -480,17 +710,15 @@ router.get('/settings', async (_req, res, next) => {
   }
 });
 
-// ─── User Actions ───────────────────────────────────────────────────────────
-router.post('/users/:id/reset-password', async (req: AuthenticatedRequest, res, next) => {
-  try {
-    const result = await adminService.triggerPasswordReset(req.params.id, req.user!.id, req);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    next(err);
-  }
-});
-
 // ─── My Account ───────────────────────────────────────────────────────────────
+// NOTE (Phase 1 audit fix): POST /users/:id/reset-password was previously defined
+// twice in this file. The duplicate (which called adminService.triggerPasswordReset)
+// has been removed here — the earlier definition above (using
+// adminService.resetUserPasswordAdmin) is the intended implementation: it writes
+// an audit log AND creates an admin notification for the affected user, whereas
+// triggerPasswordReset only wrote an audit log. adminService.triggerPasswordReset
+// is now unused; left in admin.service.ts in case a future email-based reset flow
+// needs it, but it is not wired to any route.
 router.get('/account/me', async (req: AuthenticatedRequest, res, next) => {
   try {
     const account = await adminService.getMyAccount(req.user!.id);
@@ -607,20 +835,65 @@ router.delete('/notifications/:notificationId', async (req: AuthenticatedRequest
 });
 
 // ─── Admin Team / Invitation System ──────────────────────────────────────────
+// NOTE (Phase 1 audit fix): GET /users, GET /users/:id, PATCH /users/:id, and
+// PATCH /users/:id/status used to be re-registered in this section, duplicating
+// the routes already defined above under "─── Users ───". Express only ever
+// dispatched the first-registered handler for each of those paths, so these
+// copies were unreachable dead code (and in the case of PATCH /users/:id/status,
+// the copy that carried the self-suspend guard was the dead one — see the fix
+// above). They have been removed; adminInviteSchema and adminUserRolesUpdateSchema
+// remain in use by POST /users/invite and PATCH /users/:id/roles below.
 
-const adminUsersQuerySchema = z.object({
-  q: z.string().optional(),
-  role: z.string().optional(),
-  status: z.string().optional(),
-  limit: z.coerce.number().min(1).max(100).optional().default(20),
-  cursor: z.string().optional(),
+const adminInviteSchema = z.object({
+  email: z.string().email(),
+  roleIds: z.array(z.string().min(1)).min(1),
+  message: z.string().optional(),
 });
 
-router.get('/admin-users', async (req: AuthenticatedRequest, res, next) => {
+const adminUserRolesUpdateSchema = z.object({
+  roleIds: z.array(z.string().min(1)).min(1).optional(),
+  roleId: z.string().min(1).optional(),
+});
+
+// POST /admin/users/invite
+router.post('/users/invite', requirePermission('users:manage', 'admin:manage'), validateBody(adminInviteSchema), async (req: AuthenticatedRequest, res, next) => {
   try {
-    const query = adminUsersQuerySchema.parse(req.query);
-    const data = await adminService.listAdminUsers(query);
-    res.json({ success: true, data });
+    const result = await adminService.createAdminInvitation({
+      email: req.body.email,
+      roleIds: req.body.roleIds,
+      message: req.body.message,
+      actorId: req.user!.id,
+      req,
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /admin/users/:id/roles
+router.patch('/users/:id/roles', requirePermission('roles:manage', 'users:manage'), validateBody(adminUserRolesUpdateSchema), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const requestedRoleIds: string[] = req.body.roleIds ?? (req.body.roleId ? [req.body.roleId] : []);
+    if (requestedRoleIds.length === 0) {
+      throw new AppError('At least one roleId is required.', 'VALIDATION_ERROR', 400);
+    }
+
+    const currentUser = await adminService.getUserById(req.params.id as string);
+    const currentRoleIds = (currentUser.roles || []).map((r: any) => r.id);
+
+    const toAdd = requestedRoleIds.filter((id) => !currentRoleIds.includes(id));
+    const toRemove = currentRoleIds.filter((id) => !requestedRoleIds.includes(id));
+
+    for (const roleId of toAdd) {
+      await adminService.assignRoleToUser(req.params.id as string, roleId, req.user!.id, req);
+    }
+    for (const roleId of toRemove) {
+      await adminService.removeRoleFromUser(req.params.id as string, roleId, req.user!.id, req);
+    }
+
+    const user = await adminService.getUserById(req.params.id as string);
+    res.json({ success: true, user });
   } catch (err) {
     next(err);
   }
@@ -631,7 +904,10 @@ const assignExistingSchema = z.object({
   roleIds: z.array(z.string()),
 });
 
-router.post('/admin-users/assign-existing', validateBody(assignExistingSchema), async (req: AuthenticatedRequest, res, next) => {
+// NOTE (Phase 1 audit fix — privilege escalation): user-to-admin promotion
+// previously had no permission check beyond the router-level requireAdmin,
+// letting any admin-level account grant itself or others admin roles.
+router.post('/admin-users/assign-existing', requirePermission('users:manage', 'admin:manage'), validateBody(assignExistingSchema), async (req: AuthenticatedRequest, res, next) => {
   try {
     const result = await adminService.assignExistingUserAdmin({
       userId: req.body.userId,
@@ -651,7 +927,12 @@ const createInviteSchema = z.object({
   message: z.string().optional(),
 });
 
-router.post('/admin-invitations', validateBody(createInviteSchema), async (req: AuthenticatedRequest, res, next) => {
+// NOTE (Phase 1 audit fix — privilege escalation): admin invitation creation
+// previously had no permission check beyond the router-level requireAdmin,
+// letting any admin-level account invite new admins (including granting
+// arbitrary roles via roleIds). Now requires the same permission as the
+// equivalent POST /users/invite route above.
+router.post('/admin-invitations', requirePermission('users:manage', 'admin:manage'), validateBody(createInviteSchema), async (req: AuthenticatedRequest, res, next) => {
   try {
     const result = await adminService.createAdminInvitation({
       email: req.body.email,
@@ -673,7 +954,7 @@ const listInvitationsQuerySchema = z.object({
   cursor: z.string().optional(),
 });
 
-router.get('/admin-invitations', async (req: AuthenticatedRequest, res, next) => {
+router.get('/admin-invitations', requirePermission('users:read', 'admin:read'), async (req: AuthenticatedRequest, res, next) => {
   try {
     const query = listInvitationsQuerySchema.parse(req.query);
     const data = await adminService.listAdminInvitations(query);
@@ -683,7 +964,7 @@ router.get('/admin-invitations', async (req: AuthenticatedRequest, res, next) =>
   }
 });
 
-router.post('/admin-invitations/:invitationId/resend', async (req: AuthenticatedRequest, res, next) => {
+router.post('/admin-invitations/:invitationId/resend', requirePermission('users:manage', 'admin:manage'), async (req: AuthenticatedRequest, res, next) => {
   try {
     const result = await adminService.resendAdminInvitation({
       invitationId: req.params.invitationId,
@@ -696,7 +977,7 @@ router.post('/admin-invitations/:invitationId/resend', async (req: Authenticated
   }
 });
 
-router.post('/admin-invitations/:invitationId/revoke', async (req: AuthenticatedRequest, res, next) => {
+router.post('/admin-invitations/:invitationId/revoke', requirePermission('users:manage', 'admin:manage'), async (req: AuthenticatedRequest, res, next) => {
   try {
     const result = await adminService.revokeAdminInvitation({
       invitationId: req.params.invitationId,

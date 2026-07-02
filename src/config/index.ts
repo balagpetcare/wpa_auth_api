@@ -27,6 +27,10 @@ const envSchema = z.object({
   // Optional RSA keys for JWKS (PEM, base64-encoded in env). Falls back to HS256 if absent.
   JWT_RSA_PRIVATE_KEY: z.string().optional(),
   JWT_RSA_PUBLIC_KEY: z.string().optional(),
+  // kid advertised in the JWKS response and (once RS256 signing is wired up)
+  // embedded in the JWT header — lets relying parties pick the right key
+  // during rotation. See getJwks() in oauth.service.ts.
+  JWT_KEY_ID: z.string().default('wpa-key-1'),
   AUTH_CODE_TTL_SECONDS: z.coerce.number().default(600), // 10 minutes
   SERVICE_TOKEN_TTL_SECONDS: z.coerce.number().default(3600), // 1 hour
   // Social
@@ -51,6 +55,9 @@ const envSchema = z.object({
   // so Express reads X-Forwarded-For and sets req.ip correctly.
   TRUST_PROXY: z.string().optional(),
   REDIS_URL: z.string().optional(),
+  CAPTCHA_PROVIDER: z.enum(['none', 'turnstile', 'recaptcha']).default('none'),
+  CAPTCHA_SECRET: z.string().optional(),
+  CAPTCHA_REQUIRED_ON_HIGH_RISK: z.coerce.boolean().default(false),
   CREDENTIAL_ENCRYPTION_KEY: z.string().min(32),
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
   OTP_APP_NAME: z.string().default('WPA Central Auth'),

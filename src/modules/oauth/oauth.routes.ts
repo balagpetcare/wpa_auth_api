@@ -4,7 +4,7 @@ import { validateBody } from '../../middleware/validate.js';
 import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
 import * as oauthService from './oauth.service.js';
 import { AppError } from '../../lib/errors.js';
-import { oauthAuthorizeRateLimit, oauthTokenRateLimit, oauthIntrospectRateLimit, oauthRevokeRateLimit } from '../../middleware/rateLimit.js';
+import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
 
 const router = Router();
 
@@ -21,9 +21,18 @@ const authorizeSchema = z.object({
   state: z.string().optional(),
   code_challenge: z.string().optional(),
   code_challenge_method: z.enum(['S256', 'plain']).optional(),
+  // Phase 2.5 (docs/phase-2-5-public-auth-rs256-oidc.md): OIDC nonce, echoed
+  // back verbatim in the id_token to let the client detect replay.
+  nonce: z.string().optional(),
 });
 
-router.get('/authorize', oauthAuthorizeRateLimit, authGuard, async (req: AuthenticatedRequest, res, next) => {
+// Phase 2 fix (docs/phase-2-core-identity-admin-modules.md): previously this
+// always called createAuthorizationCode() directly, so every client —
+// including THIRD_PARTY_APP ones — was auto-approved with no consent step.
+// Now delegates to startAuthorization(), which only auto-approves
+// FIRST_PARTY_APP/SERVICE clients (unchanged behavior) and returns a
+// requiresConsent ticket for THIRD_PARTY_APP clients instead of a code.
+router.get('/authorize', enterpriseRateLimit({ route: 'oauth-authorize', windowMs: 15 * 60 * 1000, max: 20, identifierFrom: (req) => `${req.query.client_id ?? ''}:${req.ip ?? ''}`, threat: 'SUSPICIOUS_ACTIVITY_BLOCKED' }), authGuard, async (req: AuthenticatedRequest, res, next) => {
   try {
     const parsed = authorizeSchema.safeParse(req.query);
     if (!parsed.success) {
@@ -34,19 +43,45 @@ router.get('/authorize', oauthAuthorizeRateLimit, authGuard, async (req: Authent
     const q = parsed.data;
     const scopes = q.scope.split(' ').filter(Boolean);
 
-    const result = await oauthService.createAuthorizationCode({
+    const result = await oauthService.startAuthorization({
       clientId: q.client_id,
       redirectUri: q.redirect_uri,
       scopes,
       state: q.state,
       codeChallenge: q.code_challenge,
       codeChallengeMethod: q.code_challenge_method,
+      nonce: q.nonce,
       userId: req.user!.id,
       req,
     });
 
     // In a real browser flow the server would redirect to redirect_uri?code=...&state=...
     // For API-first first-party apps, return JSON and let the client handle the redirect.
+    // requiresConsent=true means the client is THIRD_PARTY_APP — the caller
+    // (admin panel's /oauth/consent page) must render the consent screen and
+    // call POST /oauth/consent with the returned consentTicket before a code
+    // is issued.
+    res.json({ success: true, ...result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /oauth/consent ─────────────────────────────────────────────────────
+// Resolves a pending third-party consent ticket from GET /oauth/authorize.
+const consentSchema = z.object({
+  consentTicket: z.string().min(1),
+  decision: z.enum(['approve', 'deny']),
+});
+
+router.post('/consent', enterpriseRateLimit({ route: 'oauth-consent', windowMs: 15 * 60 * 1000, max: 20, identifierFrom: (req) => `${req.body?.consentTicket ?? ''}:${req.ip ?? ''}`, threat: 'SUSPICIOUS_ACTIVITY_BLOCKED' }), authGuard, validateBody(consentSchema), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const result = await oauthService.resolveConsent({
+      consentTicket: req.body.consentTicket,
+      decision: req.body.decision,
+      userId: req.user!.id,
+      req,
+    });
     res.json({ success: true, ...result });
   } catch (err) {
     next(err);
@@ -80,7 +115,7 @@ const clientCredsSchema = tokenBaseSchema.extend({
   scope: z.string().optional(),
 });
 
-router.post('/token', oauthTokenRateLimit, async (req, res, next) => {
+router.post('/token', enterpriseRateLimit({ route: 'oauth-token', windowMs: 15 * 60 * 1000, max: 50, identifierFrom: (req) => `${req.body?.client_id ?? ''}:${req.ip ?? ''}`, threat: 'OAUTH_CLIENT_SECRET_ABUSE' }), async (req, res, next) => {
   try {
     const { grant_type } = req.body;
 
@@ -163,7 +198,7 @@ router.get('/jwks', (_req, res) => {
 
 // ─── POST /oauth/introspect ──────────────────────────────────────────────────
 
-router.post('/introspect', oauthIntrospectRateLimit, validateBody(z.object({
+router.post('/introspect', enterpriseRateLimit({ route: 'oauth-introspect', windowMs: 15 * 60 * 1000, max: 100, identifierFrom: (req) => `${req.body?.client_id ?? ''}:${req.ip ?? ''}` }), validateBody(z.object({
   token: z.string().min(1),
   client_id: z.string().min(1),
   client_secret: z.string().optional(),
@@ -183,7 +218,7 @@ router.post('/introspect', oauthIntrospectRateLimit, validateBody(z.object({
 
 // ─── POST /oauth/revoke ──────────────────────────────────────────────────────
 
-router.post('/revoke', oauthRevokeRateLimit, validateBody(z.object({
+router.post('/revoke', enterpriseRateLimit({ route: 'oauth-revoke', windowMs: 15 * 60 * 1000, max: 50, identifierFrom: (req) => `${req.body?.client_id ?? ''}:${req.ip ?? ''}` }), validateBody(z.object({
   token: z.string().min(1),
   client_id: z.string().min(1),
   client_secret: z.string().optional(),
