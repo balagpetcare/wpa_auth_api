@@ -817,14 +817,33 @@ router.delete('/account/avatar', async (req: AuthenticatedRequest, res, next) =>
   }
 });
 
-router.post('/account/change-password', async (req: AuthenticatedRequest, res, next) => {
-  try {
-    const result = await adminService.changeMyPassword(req.user!.id, req.body, req);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
+const changeMyPasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8),
+  confirmPassword: z.string().min(8),
 });
+
+router.post(
+  '/account/change-password',
+  enterpriseRateLimit({
+    route: 'admin-change-password',
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    identifierFrom: (req) => (req as AuthenticatedRequest).user!.id,
+    threat: 'SUSPICIOUS_ACTIVITY_BLOCKED',
+    blockAfter: 8,
+    blockTtlMs: 60 * 60 * 1000,
+  }),
+  validateBody(changeMyPasswordSchema),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const result = await adminService.changeMyPassword(req.user!.id, req.body, req);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 const notificationsQuerySchema = z.object({
   status: z.enum(['unread', 'read', 'all']).optional().default('all'),

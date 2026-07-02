@@ -1478,7 +1478,11 @@ export async function changeMyPassword(userId: string, data: any, req: Request) 
     }
   });
 
-  // Optional: revoke other sessions here
+  // Password change invalidates all other logged-in sessions for this account.
+  await prisma.loginSession.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date(), revocationReason: 'PASSWORD_CHANGED' },
+  });
 
   await writeAuditLog({
     userId: userId,
