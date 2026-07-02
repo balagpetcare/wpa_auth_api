@@ -62,6 +62,16 @@ const envSchema = z.object({
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
   OTP_APP_NAME: z.string().default('WPA Central Auth'),
   OTP_SUPPORT_EMAIL: z.string().email().default('support@wpa.local'),
+  AUDIT_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(365),
+  SECURITY_EVENT_RETENTION_DAYS: z.coerce.number().int().positive().default(365),
+  ADMIN_NOTIFICATION_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
+  COMMUNICATION_DELIVERY_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
+  COMMUNICATION_PROVIDER_AUDIT_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(365),
+  EMAIL_SEND_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
+  LOGIN_SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
+  AUTHORIZATION_CODE_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
+  REFRESH_TOKEN_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
+  RETENTION_PRUNE_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
 });
 
 const parsed = envSchema.safeParse(process.env);
