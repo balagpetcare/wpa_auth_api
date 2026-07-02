@@ -17,6 +17,7 @@ import { decryptCredentialPayload, encryptCredentialPayload, maskSecret } from '
 import { writeAuditLog } from '../../lib/audit.js';
 import { createAdminNotification } from '../../lib/adminNotifications.js';
 import { config } from '../../config/index.js';
+import { logger } from '../../lib/logger.js';
 import { resolveEmailAdapter, resolveSmsAdapter } from './communication.adapters.js';
 import { getRedisClient } from '../../lib/redis.js';
 import { enqueueCommunicationJob } from '../../lib/communicationQueue.js';
@@ -629,12 +630,29 @@ export async function dispatchEmail(input: {
       userId: null,
     },
   });
-  incrementMetric('otp_send_total');
-  return {
-    success: true,
-    queued: true,
-    jobId: result.jobId,
-  };
+  if (result.queued) {
+    incrementMetric('otp_send_total');
+    return {
+      success: true,
+      queued: true,
+      jobId: result.jobId,
+    };
+  }
+
+  logger.warn({ reason: result.reason, recipient: input.to }, 'Queue unavailable, sending email synchronously');
+  const direct = await deliverQueuedEmail({
+    to: input.to,
+    subject: input.subject,
+    text: input.text,
+    html: input.html,
+    purpose: input.purpose,
+    clientId: input.clientId ?? null,
+    senderName: input.senderName ?? null,
+    senderEmail: input.senderEmail ?? null,
+    replyTo: input.replyTo ?? null,
+    environment: input.environment ?? null,
+  });
+  return { success: direct.success, queued: false, jobId: null };
 }
 
 export async function dispatchSms(input: {
@@ -656,12 +674,24 @@ export async function dispatchSms(input: {
       userId: null,
     },
   });
-  incrementMetric('otp_send_total');
-  return {
-    success: true,
-    queued: true,
-    jobId: result.jobId,
-  };
+  if (result.queued) {
+    incrementMetric('otp_send_total');
+    return {
+      success: true,
+      queued: true,
+      jobId: result.jobId,
+    };
+  }
+
+  logger.warn({ reason: result.reason, recipient: input.to }, 'Queue unavailable, sending SMS synchronously');
+  const direct = await deliverQueuedSms({
+    to: input.to,
+    message: input.message,
+    purpose: input.purpose,
+    clientId: input.clientId ?? null,
+    environment: input.environment ?? null,
+  });
+  return { success: direct.success, queued: false, jobId: null };
 }
 
 export async function sendOtpEmail(input: OtpCommunicationInput & { email: string }) {

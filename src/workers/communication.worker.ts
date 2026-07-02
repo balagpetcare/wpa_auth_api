@@ -1,8 +1,15 @@
 import { logger } from '../lib/logger.js';
 import { closeRedisClient, createRedisClient } from '../lib/redis.js';
 import { prisma } from '../lib/db.js';
-import { createAdminNotification } from '../lib/adminNotifications.js';
-import { reserveNextCommunicationJob, acknowledgeCommunicationJob, moveCommunicationJobToDlq } from '../lib/communicationQueue.js';
+import { createAdminNotificationRecord } from '../lib/adminNotifications.js';
+import {
+  reserveNextCommunicationJob,
+  acknowledgeCommunicationJob,
+  moveCommunicationJobToDlq,
+  scheduleCommunicationRetry,
+  promoteDueCommunicationJobs,
+  recoverStalledCommunicationJobs,
+} from '../lib/communicationQueue.js';
 import { deliverQueuedEmail, deliverQueuedSms } from '../modules/communication/communication.service.js';
 import type { Prisma } from '@prisma/client';
 
@@ -33,7 +40,7 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
         });
         break;
       case 'send_admin_notification':
-        await createAdminNotification({
+        await createAdminNotificationRecord({
           type: job.payload.type,
           title: job.payload.title,
           message: job.payload.message,
@@ -55,13 +62,20 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error({ error: errorMessage, jobType: job.type, jobId: job.id }, 'Communication job failed');
-    await moveCommunicationJobToDlq(job, errorMessage);
+    if (job.attempts + 1 < job.maxAttempts) {
+      const backoffMs = Math.min(60_000 * Math.pow(2, job.attempts), 24 * 60 * 60 * 1000);
+      await scheduleCommunicationRetry(job, backoffMs, errorMessage);
+    } else {
+      await moveCommunicationJobToDlq(job, errorMessage);
+    }
   }
 }
 
 async function loop() {
   logger.info('Communication worker started');
   while (running) {
+    await promoteDueCommunicationJobs();
+    await recoverStalledCommunicationJobs();
     const job = await reserveNextCommunicationJob(5);
     if (!job) continue;
     await handleJob(job as any);
