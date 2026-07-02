@@ -9,6 +9,7 @@
     "worker:communication": "tsx src/workers/communication.worker.ts",
     "worker:presence": "tsx src/workers/presence.worker.ts",
     "retention:prune": "tsx src/scripts/retentionPrune.ts",
+    "credentials:reencrypt": "tsx src/scripts/reencryptProviderCredentials.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",

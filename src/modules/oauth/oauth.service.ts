@@ -1,4 +1,4 @@
-import { createHash, createPublicKey } from 'crypto';
+import { createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../../lib/db.js';
 import { config } from '../../config/index.js';
@@ -16,6 +16,7 @@ import { writeAuditLog, writeSecurityEvent } from '../../lib/audit.js';
 import { getRedisClient } from '../../lib/redis.js';
 import { Request } from 'express';
 import { logAbuseSignal } from '../../lib/antiAbuse.js';
+import { exportJwks } from '../../lib/signingKeys.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,15 @@ export async function startAuthorization(opts: {
   const client = await requireActiveClient(opts.clientId, opts.req);
   await validateRedirectUri(client, opts.redirectUri, opts.req);
   const scopes = validateScopes(client, opts.scopes.length ? opts.scopes : ['openid']);
+
+  if (!client.clientSecretHash && client.type !== 'SERVICE') {
+    if (!opts.codeChallenge) {
+      throw new AppError('PKCE code_challenge is required for public clients.', 'INVALID_REQUEST', 400);
+    }
+    if ((opts.codeChallengeMethod ?? 'S256') !== 'S256') {
+      throw new AppError('Public clients must use PKCE S256.', 'INVALID_REQUEST', 400);
+    }
+  }
 
   if (client.type !== 'THIRD_PARTY_APP') {
     const result = await createAuthorizationCode({ ...opts, scopes });
@@ -593,52 +603,12 @@ export async function getUserInfo(userId: string) {
 // signRefreshToken to RS256 with JWT_RSA_PRIVATE_KEY once a key rotation
 // story (see rotation note below) is in place.
 //
-// Key rotation TODO: this returns exactly one key (from the current
-// JWT_KEY_ID/JWT_RSA_PUBLIC_KEY env values). Real rotation needs a small
-// key-registry (e.g. a table of {kid, publicKey, notBefore/notAfter}) so
-// `keys` can hold both the outgoing and incoming key during a rotation
-// window — out of scope for this pass, noted for Phase 3+.
-export function getJwks() {
-  if (config.JWT_RSA_PUBLIC_KEY) {
-    try {
-      const pem = config.JWT_RSA_PUBLIC_KEY.replace(/\\n/g, '\n');
-      const keyObject = createPublicKey(pem);
-      if (keyObject.asymmetricKeyType !== 'rsa') {
-        throw new Error(`Expected an RSA public key, got "${keyObject.asymmetricKeyType}".`);
-      }
-      const jwk = keyObject.export({ format: 'jwk' }) as { kty: string; n: string; e: string };
-      return {
-        keys: [
-          {
-            kty: jwk.kty,
-            n: jwk.n,
-            e: jwk.e,
-            use: 'sig',
-            alg: 'RS256',
-            kid: config.JWT_KEY_ID,
-          },
-        ],
-      };
-    } catch (err) {
-      console.error('Failed to export RSA JWK from JWT_RSA_PUBLIC_KEY, falling back to HS256 descriptor:', err);
-    }
-  }
-
-  // Dev/symmetric fallback. Not usable for external signature verification —
-  // HS256 is symmetric, so publishing anything derived from the secret here
-  // would leak it. This entry only signals "tokens are HS256 right now" to
-  // a relying party smart enough to check `alg`; it deliberately omits `k`.
-  return {
-    keys: [
-      {
-        kty: 'oct',
-        use: 'sig',
-        alg: 'HS256',
-        kid: config.JWT_KEY_ID,
-        note: 'Symmetric key in use — set JWT_RSA_PRIVATE_KEY and JWT_RSA_PUBLIC_KEY, and switch token signing to RS256, for standards-based third-party verification.',
-      },
-    ],
-  };
+// JWKS now comes from the signing-key registry helper so active public keys
+// can overlap during rotation windows without exposing retired material.
+// The helper falls back to the configured RSA env key and then the legacy
+// HS256 descriptor when no public signing key material is available.
+export async function getJwks() {
+  return exportJwks();
 }
 
 // ─── /oauth/introspect ───────────────────────────────────────────────────────

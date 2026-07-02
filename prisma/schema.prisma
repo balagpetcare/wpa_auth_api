@@ -488,11 +488,12 @@ model CommunicationProvider {
 }
 
 model CommunicationProviderCredential {
-  id                   String                            @id @default(cuid())
-  providerId           String                            @map("provider_id")
-  encryptedSecrets     Json                              @map("encrypted_secrets")
-  maskedSecretsPreview Json?                             @map("masked_secrets_preview")
-  apiBaseUrl           String?                           @map("api_base_url")
+    id                   String                            @id @default(cuid())
+    providerId           String                            @map("provider_id")
+    encryptedSecrets     Json                              @map("encrypted_secrets")
+    encryptionKeyVersion Int                               @default(1) @map("encryption_key_version")
+    maskedSecretsPreview Json?                             @map("masked_secrets_preview")
+    apiBaseUrl           String?                           @map("api_base_url")
   senderId             String?                           @map("sender_id")
   fromName             String?                           @map("from_name")
   fromEmail            String?                           @map("from_email")
@@ -509,8 +510,22 @@ model CommunicationProviderCredential {
   updatedAt            DateTime                          @updatedAt @map("updated_at")
   provider             CommunicationProvider             @relation(fields: [providerId], references: [id], onDelete: Cascade)
 
-  @@index([providerId, isActive])
-  @@map("communication_provider_credentials")
+    @@index([providerId, isActive])
+    @@map("communication_provider_credentials")
+}
+
+model OidcSigningKey {
+    id         String    @id @default(cuid())
+    kid        String    @unique
+    publicKey  String    @map("public_key")
+    algorithm  String    @default("RS256")
+    active     Boolean   @default(true)
+    createdAt  DateTime  @default(now()) @map("created_at")
+    retiredAt  DateTime? @map("retired_at")
+
+    @@index([active, createdAt])
+    @@index([kid, active])
+    @@map("oidc_signing_keys")
 }
 
 model CommunicationRoutingRule {

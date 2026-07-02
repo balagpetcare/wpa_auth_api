@@ -2,27 +2,56 @@ import crypto from 'crypto';
 import { config } from '../config/index.js';
 
 type EncryptedPayload = {
+  version?: number;
   iv: string;
   authTag: string;
   ciphertext: string;
 };
 
-function getKey() {
-  const raw = config.CREDENTIAL_ENCRYPTION_KEY;
+type KeyRing = Record<number, Buffer>;
+
+function normalizeKey(raw: string) {
   if (/^[a-f0-9]{64}$/i.test(raw)) {
     return Buffer.from(raw, 'hex');
   }
   return crypto.createHash('sha256').update(raw).digest();
 }
 
+function parseKeyRing(): KeyRing {
+  const ring: KeyRing = {
+    [config.CREDENTIAL_ENCRYPTION_KEY_VERSION]: normalizeKey(config.CREDENTIAL_ENCRYPTION_KEY),
+  };
+
+  if (config.CREDENTIAL_ENCRYPTION_KEYS_JSON) {
+    try {
+      const parsed = JSON.parse(config.CREDENTIAL_ENCRYPTION_KEYS_JSON) as Record<string, string>;
+      for (const [version, key] of Object.entries(parsed)) {
+        const parsedVersion = Number(version);
+        if (Number.isInteger(parsedVersion) && parsedVersion > 0 && key) {
+          ring[parsedVersion] = normalizeKey(key);
+        }
+      }
+    } catch {
+      // Ignore malformed key rings and fall back to the active key only.
+    }
+  }
+
+  return ring;
+}
+
+export function getActiveCredentialEncryptionVersion() {
+  return config.CREDENTIAL_ENCRYPTION_KEY_VERSION;
+}
+
 export function encryptCredentialPayload(payload: Record<string, unknown>): EncryptedPayload {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', getKey(), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', parseKeyRing()[getActiveCredentialEncryptionVersion()], iv);
   const plaintext = Buffer.from(JSON.stringify(payload), 'utf8');
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
   return {
+    version: getActiveCredentialEncryptionVersion(),
     iv: iv.toString('base64'),
     authTag: authTag.toString('base64'),
     ciphertext: ciphertext.toString('base64'),
@@ -30,7 +59,16 @@ export function encryptCredentialPayload(payload: Record<string, unknown>): Encr
 }
 
 export function decryptCredentialPayload(payload: EncryptedPayload): Record<string, unknown> {
-  const decipher = crypto.createDecipheriv('aes-256-gcm', getKey(), Buffer.from(payload.iv, 'base64'));
+  return decryptCredentialPayloadByVersion(payload, payload.version ?? getActiveCredentialEncryptionVersion());
+}
+
+export function decryptCredentialPayloadByVersion(payload: EncryptedPayload, version: number): Record<string, unknown> {
+  const ring = parseKeyRing();
+  const key = ring[version] ?? ring[getActiveCredentialEncryptionVersion()];
+  if (!key) {
+    throw new Error(`Missing credential encryption key for version ${version}.`);
+  }
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64'));
   decipher.setAuthTag(Buffer.from(payload.authTag, 'base64'));
   const plaintext = Buffer.concat([
     decipher.update(Buffer.from(payload.ciphertext, 'base64')),

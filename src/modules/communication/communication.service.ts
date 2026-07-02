@@ -853,6 +853,7 @@ export async function upsertProviderCredential(input: {
           where: { id: input.credentialId },
           data: {
             encryptedSecrets,
+            encryptionKeyVersion: encryptedSecrets.version ?? 1,
             maskedSecretsPreview,
             apiBaseUrl: input.data.apiBaseUrl,
             senderId: input.data.senderId,
@@ -869,6 +870,7 @@ export async function upsertProviderCredential(input: {
           data: {
             providerId: input.providerId,
             encryptedSecrets,
+            encryptionKeyVersion: encryptedSecrets.version ?? 1,
             maskedSecretsPreview,
             apiBaseUrl: input.data.apiBaseUrl,
             senderId: input.data.senderId,

@@ -27,6 +27,7 @@ const envSchema = z.object({
   // Optional RSA keys for JWKS (PEM, base64-encoded in env). Falls back to HS256 if absent.
   JWT_RSA_PRIVATE_KEY: z.string().optional(),
   JWT_RSA_PUBLIC_KEY: z.string().optional(),
+  JWT_RSA_PUBLIC_KEYS_JSON: z.string().optional(),
   // kid advertised in the JWKS response and (once RS256 signing is wired up)
   // embedded in the JWT header — lets relying parties pick the right key
   // during rotation. See getJwks() in oauth.service.ts.
@@ -61,6 +62,8 @@ const envSchema = z.object({
   PRESENCE_TTL_SECONDS: z.coerce.number().int().positive().default(90),
   PRESENCE_HEARTBEAT_MIN_INTERVAL_SECONDS: z.coerce.number().int().positive().default(30),
   CREDENTIAL_ENCRYPTION_KEY: z.string().min(32),
+  CREDENTIAL_ENCRYPTION_KEY_VERSION: z.coerce.number().int().positive().default(1),
+  CREDENTIAL_ENCRYPTION_KEYS_JSON: z.string().optional(),
   OTP_EXPIRY_MINUTES: z.coerce.number().default(10),
   OTP_APP_NAME: z.string().default('WPA Central Auth'),
   OTP_SUPPORT_EMAIL: z.string().email().default('support@wpa.local'),
