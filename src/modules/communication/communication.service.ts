@@ -1928,9 +1928,37 @@ export async function processDueRetries(limit = 20): Promise<{ processed: number
   return { processed };
 }
 
-export async function getProviderAuditLogs(opts: { limit: number; cursor?: string }) {
+export async function getProviderAuditLogs(opts: {
+  limit: number;
+  cursor?: string;
+  action?: string;
+  providerId?: string;
+  actorAdminId?: string;
+  search?: string;
+  createdFrom?: Date;
+  createdTo?: Date;
+}) {
   const limit = Math.min(opts.limit, 100);
   const where: Prisma.CommunicationProviderAuditLogWhereInput = {};
+  if (opts.action?.trim()) {
+    where.action = { contains: opts.action.trim(), mode: 'insensitive' };
+  }
+  if (opts.providerId) where.providerId = opts.providerId;
+  if (opts.actorAdminId) where.actorAdminId = opts.actorAdminId;
+  if (opts.search?.trim()) {
+    const search = opts.search.trim();
+    where.OR = [
+      { action: { contains: search, mode: 'insensitive' } },
+      { provider: { is: { OR: [{ name: { contains: search, mode: 'insensitive' } }, { code: { contains: search, mode: 'insensitive' } }] } } },
+      { actorAdmin: { is: { OR: [{ email: { contains: search, mode: 'insensitive' } }, { username: { contains: search, mode: 'insensitive' } }] } } },
+    ];
+  }
+  if (opts.createdFrom || opts.createdTo) {
+    where.createdAt = {
+      ...(opts.createdFrom ? { gte: opts.createdFrom } : {}),
+      ...(opts.createdTo ? { lte: opts.createdTo } : {}),
+    };
+  }
   if (opts.cursor) {
     const decoded = decodeCursor(opts.cursor);
     where.AND = [
@@ -1949,11 +1977,13 @@ export async function getProviderAuditLogs(opts: { limit: number; cursor?: strin
   });
   const hasNextPage = logs.length > limit;
   const items = hasNextPage ? logs.slice(0, -1) : logs;
+  const totalCount = await prisma.communicationProviderAuditLog.count({ where });
   return {
     items,
     nextCursor: hasNextPage ? encodeCursor({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }) : null,
     hasNextPage,
     limit,
+    totalCount,
   };
 }
 

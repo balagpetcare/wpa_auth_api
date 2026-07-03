@@ -1697,6 +1697,9 @@ export async function listMyNotifications(opts: {
   status: 'unread' | 'read' | 'archived' | 'all';
   category?: AdminNotificationCategory;
   severity?: AdminNotificationSeverity;
+  search?: string;
+  createdFrom?: Date;
+  createdTo?: Date;
   limit: number;
   cursor?: string;
 }) {
@@ -1706,6 +1709,25 @@ export async function listMyNotifications(opts: {
     category: opts.category,
     severity: opts.severity,
   });
+  if (opts.search?.trim()) {
+    const search = opts.search.trim();
+    where.AND = [
+      ...(where.AND as Prisma.AdminNotificationWhereInput[] ?? []),
+      {
+        OR: [
+          { title: { contains: search, mode: 'insensitive' } },
+          { message: { contains: search, mode: 'insensitive' } },
+          { type: { contains: search, mode: 'insensitive' } },
+        ],
+      },
+    ];
+  }
+  if (opts.createdFrom || opts.createdTo) {
+    where.createdAt = {
+      ...(opts.createdFrom ? { gte: opts.createdFrom } : {}),
+      ...(opts.createdTo ? { lte: opts.createdTo } : {}),
+    };
+  }
 
   const items = await prisma.adminNotification.findMany({
     where,
@@ -1722,6 +1744,13 @@ export async function listMyNotifications(opts: {
   const unreadCount = await prisma.adminNotification.count({
     where: buildVisibleNotificationsWhere(opts.userId, { status: 'unread' }),
   });
+  const totalCount = await prisma.adminNotification.count({ where });
+  const readCount = await prisma.adminNotification.count({
+    where: buildVisibleNotificationsWhere(opts.userId, { status: 'read', category: opts.category, severity: opts.severity }),
+  });
+  const archivedCount = await prisma.adminNotification.count({
+    where: buildVisibleNotificationsWhere(opts.userId, { status: 'archived', category: opts.category, severity: opts.severity }),
+  });
 
   const hasNextPage = items.length > limit;
   const sliced = hasNextPage ? items.slice(0, -1) : items;
@@ -1730,6 +1759,9 @@ export async function listMyNotifications(opts: {
   return {
     items: sliced,
     unreadCount,
+    totalCount,
+    readCount,
+    archivedCount,
     pagination: {
       limit,
       nextCursor,
@@ -1762,6 +1794,23 @@ export async function markNotificationRead(userId: string, notificationId: strin
   });
 }
 
+export async function markNotificationUnread(userId: string, notificationId: string) {
+  const notification = await prisma.adminNotification.findFirst({
+    where: {
+      id: notificationId,
+      archivedAt: null,
+      OR: [{ userId }, { userId: null }],
+    },
+  });
+  if (!notification) throw new AppError('Notification not found.', 'NOT_FOUND', 404);
+
+  return prisma.adminNotification.update({
+    where: { id: notificationId },
+    data: { readAt: null, status: 'UNREAD' },
+    select: adminNotificationSelect,
+  });
+}
+
 export async function markAllNotificationsRead(userId: string) {
   const result = await prisma.adminNotification.updateMany({
     where: buildVisibleNotificationsWhere(userId, { status: 'unread' }),
@@ -1785,6 +1834,16 @@ export async function dismissNotification(userId: string, notificationId: string
     data: { archivedAt: new Date(), status: 'ARCHIVED', readAt: notification.readAt ?? new Date() },
     select: adminNotificationSelect,
   });
+}
+
+export async function clearArchivedNotifications(userId: string) {
+  const result = await prisma.adminNotification.deleteMany({
+    where: {
+      archivedAt: { not: null },
+      OR: [{ userId }, { userId: null }],
+    },
+  });
+  return { deletedCount: result.count };
 }
 
 export async function createUserStatusNotification(userId: string, status: UserStatus) {

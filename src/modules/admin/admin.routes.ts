@@ -938,6 +938,9 @@ const notificationsQuerySchema = z.object({
   status: z.enum(['unread', 'read', 'archived', 'all']).optional().default('all'),
   category: z.nativeEnum(AdminNotificationCategory).optional(),
   severity: z.nativeEnum(AdminNotificationSeverity).optional(),
+  search: z.string().optional(),
+  createdFrom: z.string().datetime().optional(),
+  createdTo: z.string().datetime().optional(),
   limit: z.coerce.number().min(1).max(50).optional().default(20),
   cursor: z.string().optional(),
 });
@@ -950,6 +953,9 @@ router.get('/notifications', async (req: AuthenticatedRequest, res, next) => {
       status: query.status,
       category: query.category,
       severity: query.severity,
+      search: query.search,
+      createdFrom: query.createdFrom ? new Date(query.createdFrom) : undefined,
+      createdTo: query.createdTo ? new Date(query.createdTo) : undefined,
       limit: query.limit,
       cursor: query.cursor,
     });
@@ -977,9 +983,27 @@ router.patch('/notifications/read-all', async (req: AuthenticatedRequest, res, n
   }
 });
 
+router.delete('/notifications/archived', async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const data = await adminService.clearArchivedNotifications(req.user!.id);
+    res.json({ success: true, data, message: 'Archived notifications cleared.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.patch('/notifications/:notificationId/read', async (req: AuthenticatedRequest, res, next) => {
   try {
     const notification = await adminService.markNotificationRead(req.user!.id, req.params.notificationId);
+    res.json({ success: true, data: notification });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/notifications/:notificationId/unread', async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const notification = await adminService.markNotificationUnread(req.user!.id, req.params.notificationId);
     res.json({ success: true, data: notification });
   } catch (err) {
     next(err);

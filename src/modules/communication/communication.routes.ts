@@ -97,6 +97,17 @@ const deliveryLogQuerySchema = z.object({
   limit: z.coerce.number().min(1).max(100).optional().default(50),
 });
 
+const providerAuditLogQuerySchema = z.object({
+  action: z.string().optional(),
+  providerId: z.string().optional(),
+  actorAdminId: z.string().optional(),
+  search: z.string().optional(),
+  createdFrom: z.coerce.date().optional(),
+  createdTo: z.coerce.date().optional(),
+  limit: z.coerce.number().min(1).max(100).optional().default(50),
+  cursor: z.string().optional(),
+});
+
 const bulkIdsSchema = z.object({
   ids: z.array(z.string()).min(1).max(config.COMMUNICATION_MAX_BULK_RETRY_COUNT),
 });
@@ -575,9 +586,17 @@ router.get(
   requirePermission('communication.logs.read'),
   async (req, res, next) => {
     try {
-      const limit = Math.min(Number(req.query['limit'] ?? 50), 100);
-      const cursor = typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined;
-      const data = await communicationService.getProviderAuditLogs({ limit, cursor });
+      const query = providerAuditLogQuerySchema.parse(req.query);
+      const data = await communicationService.getProviderAuditLogs({
+        action: query.action,
+        providerId: query.providerId,
+        actorAdminId: query.actorAdminId,
+        search: query.search,
+        createdFrom: query.createdFrom,
+        createdTo: query.createdTo,
+        limit: query.limit,
+        cursor: query.cursor,
+      });
       res.json({ success: true, data });
     } catch (error) {
       next(error);
