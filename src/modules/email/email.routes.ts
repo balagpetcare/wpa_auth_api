@@ -15,7 +15,6 @@ import { AppError } from '../../lib/errors.js';
 import { renderEmailTemplate } from '../../lib/emailRenderer.js';
 import { sendEmail } from '../../lib/mailer.js';
 import { writeAuditLog } from '../../lib/audit.js';
-import { getQueueStats, retryFailedEmail, processEmailQueue } from '../../lib/emailQueueProcessor.js';
 
 const router = Router();
 
@@ -91,14 +90,6 @@ const templatePreviewSchema = z.object({
 const sendTestEmailSchema = z.object({
   testEmail: z.string().email(),
   variables: z.record(z.any()).optional(),
-});
-
-const sendLogsQuerySchema = z.object({
-  templateKey: z.string().optional(),
-  status: z.enum(['PENDING', 'SENT', 'FAILED', 'BOUNCED']).optional(),
-  recipientEmail: z.string().optional(),
-  limit: z.coerce.number().min(1).max(100).optional().default(50),
-  cursor: z.string().optional(),
 });
 
 // ─── Email Branding ──────────────────────────────────────────────────────────
@@ -591,79 +582,6 @@ router.post(
   }
 );
 
-// ─── Email Send Logs ─────────────────────────────────────────────────────────
-
-/**
- * GET /admin/email-send-logs
- * View email delivery logs
- */
-router.get(
-  '/email-send-logs',
-  requirePermission('email_logs.read'),
-  async (req: AuthenticatedRequest, res, next) => {
-    try {
-      const query = sendLogsQuerySchema.parse(req.query);
-
-      // Build where clause for filtering
-      const where: any = {};
-      if (query.templateKey) {
-        // Assuming there's a way to link templates to send logs
-        // This may need adjustment based on actual schema
-      }
-      if (query.status) {
-        where.status = query.status;
-      }
-      if (query.recipientEmail) {
-        where.recipientEmail = {
-          contains: query.recipientEmail,
-          mode: 'insensitive',
-        };
-      }
-
-      if (query.cursor) {
-        const { decodeCursor } = await import('../../lib/pagination.js');
-        const decoded = decodeCursor(query.cursor);
-        where.AND = [
-          ...(where.AND ?? []),
-          { OR: [{ createdAt: { lt: decoded.createdAt } }, { createdAt: decoded.createdAt, id: { lt: decoded.id } }] },
-        ];
-      }
-
-      const logs = await prisma.emailSendLog.findMany({
-        where,
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        take: query.limit + 1,
-        select: {
-          id: true,
-          templateKey: true,
-          recipientEmail: true,
-          subject: true,
-          status: true,
-          errorMessage: true,
-          createdAt: true,
-        },
-      });
-      const hasNextPage = logs.length > query.limit;
-      const items = hasNextPage ? logs.slice(0, -1) : logs;
-      const nextCursor = hasNextPage
-        ? Buffer.from(JSON.stringify({ createdAt: items[items.length - 1].createdAt, id: items[items.length - 1].id }), 'utf8').toString('base64url')
-        : null;
-
-      res.json({
-        success: true,
-        data: {
-          items,
-          nextCursor,
-          hasNextPage,
-          limit: query.limit,
-        },
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
 // ─── Template Versioning & Rollback ──────────────────────────────────────────
 
 /**
@@ -886,137 +804,9 @@ router.patch(
   }
 );
 
-// ─── Email Delivery Status & Retry ──────────────────────────────────────────
-
-/**
- * POST /admin/email-send-logs/:id/retry
- * Manually retry a failed email
- */
-router.post(
-  '/email-send-logs/:id/retry',
-  requirePermission('email_logs.manage'),
-  async (req: AuthenticatedRequest, res, next) => {
-    try {
-      const { EmailQueueService } = await import('../../services/emailQueueService.js');
-
-      const log = await prisma.emailSendLog.findUnique({
-        where: { id: req.params.id },
-      });
-
-      if (!log) {
-        throw new AppError('Email log not found', 'NOT_FOUND', 404);
-      }
-
-      if (log.status === 'sent') {
-        throw new AppError('Cannot retry a successfully sent email', 'INVALID_REQUEST', 400);
-      }
-
-      // Queue the email for retry
-      const queue = await EmailQueueService.enqueueEmail({
-        templateKey: log.templateKey,
-        locale: (log as any).locale || 'en',
-        clientId: (log as any).clientId || undefined,
-        recipientEmail: log.recipientEmail,
-        recipientName: (log as any).recipientName || undefined,
-        subject: log.subject,
-        variables: log.variables as any,
-        userId: log.userId || undefined,
-        maxRetries: 3,
-      });
-
-      // Update log to reflect retry
-      const updateData: any = { status: 'retrying' };
-      if ((log as any).deliveryStatus !== undefined) {
-        updateData.deliveryStatus = 'pending';
-      }
-      if ((log as any).attemptCount !== undefined) {
-        updateData.attemptCount = (log as any).attemptCount + 1;
-      }
-
-      await prisma.emailSendLog.update({
-        where: { id: req.params.id },
-        data: updateData,
-      });
-
-      res.json({
-        success: true,
-        data: queue,
-        message: 'Email queued for retry',
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// ─── Email Queue Statistics ────────────────────────────────────────────────
-
-/**
- * GET /admin/email-queue
- * Get email queue statistics and pending items
- */
-router.get(
-  '/email-queue',
-  requirePermission('email_logs.read'),
-  async (req: AuthenticatedRequest, res, next) => {
-    try {
-      const stats = await getQueueStats();
-
-      res.json({
-        success: true,
-        data: stats,
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-/**
- * POST /admin/email-queue/process
- * Manually trigger email queue processing
- */
-router.post(
-  '/email-queue/process',
-  requirePermission('email_logs.manage'),
-  async (req: AuthenticatedRequest, res, next) => {
-    try {
-      const stats = await processEmailQueue();
-
-      res.json({
-        success: true,
-        data: stats,
-        message: 'Email queue processing completed',
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-/**
- * POST /admin/email-queue/:queueId/retry
- * Retry a failed email queue item
- */
-router.post(
-  '/email-queue/:queueId/retry',
-  requirePermission('email_logs.manage'),
-  async (req: AuthenticatedRequest, res, next) => {
-    try {
-      const success = await retryFailedEmail(req.params.queueId);
-
-      if (!success) {
-        throw new AppError('Email queue item not found or not in failed status', 'INVALID_REQUEST', 400);
-      }
-
-      res.json({
-        success: true,
-        message: 'Email queue item reset for retry',
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
+// Note: email delivery status, retry, and resend are now handled by the
+// CommunicationDeliveryLog-based resend center — see
+// modules/communication/communication.routes.ts (GET /delivery-logs,
+// POST /delivery-logs/:id/retry, etc.) — not this module.
 
 export default router;

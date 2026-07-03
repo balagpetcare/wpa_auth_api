@@ -26,6 +26,19 @@ model User {
   lastLoginAt                    DateTime?                       @map("last_login_at")
   lastSeenAt                     DateTime?                       @map("last_seen_at")
   lastPasswordChangedAt          DateTime?                       @map("last_password_changed_at")
+  country                        String?
+  state                          String?
+  city                           String?
+  timezone                       String?
+  externalRefId                  String?                         @map("external_ref_id")
+  registrationSource             String?                         @map("registration_source")
+  riskScore                      Int                             @default(0) @map("risk_score")
+  failedLoginCount               Int                             @default(0) @map("failed_login_count")
+  lastLoginIp                    String?                         @map("last_login_ip")
+  lastLoginIpCountry             String?                         @map("last_login_ip_country")
+  lastLoginDeviceType            String?                         @map("last_login_device_type")
+  lastLoginOs                    String?                         @map("last_login_os")
+  lastLoginBrowser               String?                         @map("last_login_browser")
   notificationPreferences        Json?                           @map("notification_preferences")
   organization                   String?
   adminNotifications             AdminNotification[]
@@ -36,8 +49,6 @@ model User {
   createdCommunicationProviders  CommunicationProvider[]         @relation("CommunicationProviderCreatedBy")
   updatedCommunicationProviders  CommunicationProvider[]         @relation("CommunicationProviderUpdatedBy")
   emailBrandingSettingsUpdated   EmailBrandingSetting[]          @relation("EmailBrandingSettingUpdatedBy")
-  emailQueues                    EmailQueue[]
-  emailSendLogs                  EmailSendLog[]
   emailTemplateAuditLogs         EmailTemplateAuditLog[]
   emailTemplatesUpdated          EmailTemplate[]                 @relation("EmailTemplateUpdatedBy")
   emailVerificationTokens        EmailVerificationToken[]
@@ -55,6 +66,18 @@ model User {
   @@index([status])
   @@index([createdAt])
   @@index([lastLoginAt])
+  @@index([lastSeenAt])
+  @@index([country])
+  @@index([state])
+  @@index([city])
+  @@index([timezone])
+  @@index([externalRefId])
+  @@index([registrationSource])
+  @@index([emailVerifiedAt])
+  @@index([phoneVerifiedAt])
+  @@index([lastLoginIpCountry])
+  @@index([riskScore])
+  @@index([failedLoginCount])
   @@index([createdAt, id])
   @@index([lastLoginAt, id])
   @@index([status, createdAt, id])
@@ -62,23 +85,24 @@ model User {
 }
 
 model AuthClient {
-  id                 String               @id @default(cuid())
+  id                 String                     @id @default(cuid())
   name               String
-  slug               String               @unique
+  slug               String                     @unique
   type               AuthClientType
-  clientId           String               @unique @map("client_id")
-  clientSecretHash   String?              @map("client_secret_hash")
-  allowedOrigins     String[]             @map("allowed_origins")
-  redirectUris       String[]             @map("redirect_uris")
-  allowedScopes      String[]             @map("allowed_scopes")
-  status             AuthClientStatus     @default(ACTIVE)
-  createdAt          DateTime             @default(now()) @map("created_at")
-  updatedAt          DateTime             @updatedAt @map("updated_at")
+  clientId           String                     @unique @map("client_id")
+  clientSecretHash   String?                    @map("client_secret_hash")
+  allowedOrigins     String[]                   @map("allowed_origins")
+  redirectUris       String[]                   @map("redirect_uris")
+  allowedScopes      String[]                   @map("allowed_scopes")
+  status             AuthClientStatus           @default(ACTIVE)
+  createdAt          DateTime                   @default(now()) @map("created_at")
+  updatedAt          DateTime                   @updatedAt @map("updated_at")
   apiKeys            ApiKey[]
   auditLogs          AuditLog[]
   authorizationCodes AuthorizationCode[]
   emailBranding      ClientBranding?
   emailTemplates     EmailTemplate[]
+  externalEvents     ExternalCommunicationEvent[]
   loginSessions      LoginSession[]
   refreshTokens      RefreshToken[]
   serviceTokens      ServiceAccessToken[]
@@ -174,24 +198,24 @@ model UserRole {
 }
 
 model RefreshToken {
-  id                String     @id @default(cuid())
-  userId            String     @map("user_id")
-  clientId          String     @map("client_id")
-  tokenHash         String     @unique @map("token_hash")
-  scopes            String[]
-  expiresAt         DateTime   @map("expires_at")
-  revokedAt         DateTime?  @map("revoked_at")
-  userAgent         String?    @map("user_agent")
-  ipAddress         String?    @map("ip_address")
-  createdAt         DateTime   @default(now()) @map("created_at")
-  client            AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id        String     @id @default(cuid())
+  userId    String     @map("user_id")
+  clientId  String     @map("client_id")
+  tokenHash String     @unique @map("token_hash")
+  scopes    String[]
+  expiresAt DateTime   @map("expires_at")
+  revokedAt DateTime?  @map("revoked_at")
+  userAgent String?    @map("user_agent")
+  ipAddress String?    @map("ip_address")
+  createdAt DateTime   @default(now()) @map("created_at")
+  client    AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Additive fields for Phase 3.2
-  familyId          String?    @map("family_id")
-  replacedByTokenId String?    @map("replaced_by_token_id")
-  reusedAt          DateTime?  @map("reused_at")
-  revocationReason  String?    @map("revocation_reason")
+  familyId          String?   @map("family_id")
+  replacedByTokenId String?   @map("replaced_by_token_id")
+  reusedAt          DateTime? @map("reused_at")
+  revocationReason  String?   @map("revocation_reason")
 
   @@index([userId])
   @@index([clientId])
@@ -202,22 +226,22 @@ model RefreshToken {
 }
 
 model LoginSession {
-  id               String     @id @default(cuid())
-  userId           String     @map("user_id")
-  clientId         String     @map("client_id")
-  sessionToken     String     @unique @map("session_token")
-  userAgent        String?    @map("user_agent")
-  ipAddress        String?    @map("ip_address")
-  country          String?
-  expiresAt        DateTime   @map("expires_at")
-  revokedAt        DateTime?  @map("revoked_at")
-  lastActiveAt     DateTime   @default(now()) @map("last_active_at")
-  createdAt        DateTime   @default(now()) @map("created_at")
-  client           AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  user             User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id           String     @id @default(cuid())
+  userId       String     @map("user_id")
+  clientId     String     @map("client_id")
+  sessionToken String     @unique @map("session_token")
+  userAgent    String?    @map("user_agent")
+  ipAddress    String?    @map("ip_address")
+  country      String?
+  expiresAt    DateTime   @map("expires_at")
+  revokedAt    DateTime?  @map("revoked_at")
+  lastActiveAt DateTime   @default(now()) @map("last_active_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  client       AuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Additive fields for Phase 3.2
-  revocationReason String?    @map("revocation_reason")
+  revocationReason String? @map("revocation_reason")
 
   @@index([userId])
   @@index([clientId])
@@ -389,26 +413,27 @@ model SecurityEvent {
 }
 
 model AdminNotification {
-  id          String                    @id @default(cuid())
-  userId      String?                   @map("user_id")
-  type        String
-  title       String
-  message     String
-  severity    AdminNotificationSeverity
-  category    AdminNotificationCategory
-  actionUrl   String?                   @map("action_url")
-  metadata    Json?
-  readAt      DateTime?                 @map("read_at")
-  dismissedAt DateTime?                 @map("dismissed_at")
-  createdAt   DateTime                  @default(now()) @map("created_at")
-  updatedAt   DateTime                  @updatedAt @map("updated_at")
-  user        User?                     @relation(fields: [userId], references: [id])
+  id         String                    @id @default(cuid())
+  userId     String?                   @map("user_id")
+  type       String
+  title      String
+  message    String
+  severity   AdminNotificationSeverity
+  category   AdminNotificationCategory
+  status     AdminNotificationStatus   @default(UNREAD)
+  actionUrl  String?                   @map("action_url")
+  metadata   Json?
+  readAt     DateTime?                 @map("read_at")
+  archivedAt DateTime?                 @map("archived_at")
+  createdAt  DateTime                  @default(now()) @map("created_at")
+  updatedAt  DateTime                  @updatedAt @map("updated_at")
+  user       User?                     @relation(fields: [userId], references: [id])
 
   @@index([userId, readAt, createdAt])
   @@index([createdAt])
   @@index([severity])
   @@index([category])
-  @@index([dismissedAt])
+  @@index([archivedAt])
   @@index([userId, createdAt, id])
   @@map("admin_notifications")
 }
@@ -488,12 +513,12 @@ model CommunicationProvider {
 }
 
 model CommunicationProviderCredential {
-    id                   String                            @id @default(cuid())
-    providerId           String                            @map("provider_id")
-    encryptedSecrets     Json                              @map("encrypted_secrets")
-    encryptionKeyVersion Int                               @default(1) @map("encryption_key_version")
-    maskedSecretsPreview Json?                             @map("masked_secrets_preview")
-    apiBaseUrl           String?                           @map("api_base_url")
+  id                   String                            @id @default(cuid())
+  providerId           String                            @map("provider_id")
+  encryptedSecrets     Json                              @map("encrypted_secrets")
+  encryptionKeyVersion Int                               @default(1) @map("encryption_key_version")
+  maskedSecretsPreview Json?                             @map("masked_secrets_preview")
+  apiBaseUrl           String?                           @map("api_base_url")
   senderId             String?                           @map("sender_id")
   fromName             String?                           @map("from_name")
   fromEmail            String?                           @map("from_email")
@@ -510,57 +535,57 @@ model CommunicationProviderCredential {
   updatedAt            DateTime                          @updatedAt @map("updated_at")
   provider             CommunicationProvider             @relation(fields: [providerId], references: [id], onDelete: Cascade)
 
-    @@index([providerId, isActive])
-    @@map("communication_provider_credentials")
+  @@index([providerId, isActive])
+  @@map("communication_provider_credentials")
 }
 
 model OidcSigningKey {
-    id         String    @id @default(cuid())
-    kid        String    @unique
-    publicKey  String    @map("public_key")
-    algorithm  String    @default("RS256")
-    active     Boolean   @default(true)
-    createdAt  DateTime  @default(now()) @map("created_at")
-    retiredAt  DateTime? @map("retired_at")
+  id        String    @id @default(cuid())
+  kid       String    @unique
+  publicKey String    @map("public_key")
+  algorithm String    @default("RS256")
+  active    Boolean   @default(true)
+  createdAt DateTime  @default(now()) @map("created_at")
+  retiredAt DateTime? @map("retired_at")
 
-    @@index([active, createdAt])
-    @@index([kid, active])
-    @@map("oidc_signing_keys")
+  @@index([active, createdAt])
+  @@index([kid, active])
+  @@map("oidc_signing_keys")
 }
 
 model CommunicationRoutingRule {
-  id   String @id @default(cuid())
+  id                  String                            @id @default(cuid())
   // Phase 2.6A (docs/phase-2-6a-app-aware-communication-routing-ui.md):
   // nullable app scope — null means "system-wide default rule", non-null
   // means "override for this specific connected app/client". Mirrors the
   // existing EmailTemplate.clientId nullable-override pattern already used
   // successfully elsewhere in this schema. Existing rows (all appId=null
   // today) keep working unchanged as system defaults.
-  appId               String?                            @map("app_id")
+  appId               String?                           @map("app_id")
   channel             CommunicationChannel
-  countryCode         String?                            @map("country_code")
+  countryCode         String?                           @map("country_code")
   purpose             CommunicationPurpose
   language            OtpTemplateLanguage?
-  providerId          String?                            @map("provider_id")
-  fallbackProviderIds Json?                              @map("fallback_provider_ids")
-  priority            Int                                @default(100)
+  providerId          String?                           @map("provider_id")
+  fallbackProviderIds Json?                             @map("fallback_provider_ids")
+  priority            Int                               @default(100)
   // Hard kill-switch, distinct from isActive (row-level enable). When
   // false, the channel is blocked outright for the matching app/country/
   // purpose scope — no fallback providers are tried.
-  enabled             Boolean                            @default(true)
+  enabled             Boolean                           @default(true)
   // When true (default), if every explicit provider/fallback candidate is
   // unavailable, isGlobal=true providers may be tried as a last-resort
   // international fallback tier. When false, only the explicit chain is
   // tried.
-  fallbackEnabled     Boolean                            @default(true) @map("fallback_enabled")
+  fallbackEnabled     Boolean                           @default(true) @map("fallback_enabled")
   // Restricts this rule to a specific provider environment; null matches
   // either SANDBOX or LIVE.
   environment         CommunicationProviderEnvironment?
-  isActive            Boolean                            @default(true) @map("is_active")
-  createdAt           DateTime                           @default(now()) @map("created_at")
-  updatedAt           DateTime                           @updatedAt @map("updated_at")
-  app                 AuthClient?                        @relation(fields: [appId], references: [id], onDelete: Cascade)
-  provider            CommunicationProvider?             @relation(fields: [providerId], references: [id])
+  isActive            Boolean                           @default(true) @map("is_active")
+  createdAt           DateTime                          @default(now()) @map("created_at")
+  updatedAt           DateTime                          @updatedAt @map("updated_at")
+  app                 AuthClient?                       @relation(fields: [appId], references: [id], onDelete: Cascade)
+  provider            CommunicationProvider?            @relation(fields: [providerId], references: [id])
 
   @@index([channel, countryCode, purpose, priority])
   @@index([appId, channel, countryCode, purpose, priority])
@@ -603,8 +628,38 @@ model CommunicationDeliveryLog {
   sentAt           DateTime?                   @map("sent_at")
   failedAt         DateTime?                   @map("failed_at")
   createdAt        DateTime                    @default(now()) @map("created_at")
-  provider         CommunicationProvider?      @relation(fields: [providerId], references: [id])
-  template         OtpTemplate?                @relation(fields: [templateId], references: [id])
+
+  // Retry/resend center (communication retry & dead-letter system).
+  // isRetryable/retryPolicyKey are decided once at first-failure time from
+  // the message's purpose/templateKey (see communication.retryPolicy.ts)
+  // and never change afterwards, so the admin UI and worker always agree
+  // on whether a given row is eligible for retry/manual resend.
+  retryCount           Int       @default(0) @map("retry_count")
+  maxRetries           Int       @default(0) @map("max_retries")
+  nextRetryAt          DateTime? @map("next_retry_at")
+  lastRetryAt          DateTime? @map("last_retry_at")
+  lastErrorCode        String?   @map("last_error_code")
+  lastErrorMessage     String?   @map("last_error_message")
+  isRetryable          Boolean   @default(false) @map("is_retryable")
+  retryPolicyKey       String?   @map("retry_policy_key")
+  // Full chain of provider-level attempts across the original send and all
+  // retries: [{ attemptNo, providerId, providerCode, success, errorCode,
+  // errorMessage, at }]. Never contains secrets/credentials.
+  providerAttemptChain Json?     @map("provider_attempt_chain")
+  // Optimistic lock so the retry worker cannot double-send a row that's
+  // concurrently being retried by another worker instance.
+  lockedAt             DateTime? @map("locked_at")
+  lockedBy             String?   @map("locked_by")
+  cancelledAt          DateTime? @map("cancelled_at")
+  deadLetterAt         DateTime? @map("dead_letter_at")
+  // Safe resend payload (subject/text/html or SMS message + routing scope)
+  // captured only for isRetryable=true rows — never populated for OTP/token
+  // messages, so no raw OTP/verification code is ever persisted for retry.
+  resendPayload        Json?     @map("resend_payload")
+  redisJobId           String?   @map("redis_job_id")
+
+  provider CommunicationProvider? @relation(fields: [providerId], references: [id])
+  template OtpTemplate?           @relation(fields: [templateId], references: [id])
 
   @@index([channel, purpose, createdAt])
   @@index([recipient, createdAt])
@@ -613,6 +668,8 @@ model CommunicationDeliveryLog {
   @@index([channel, createdAt, id])
   @@index([providerId, createdAt, id])
   @@index([status, createdAt, id])
+  @@index([status, nextRetryAt])
+  @@index([isRetryable, status, createdAt, id])
   @@map("communication_delivery_logs")
 }
 
@@ -634,6 +691,33 @@ model CommunicationProviderAuditLog {
   @@index([providerId, createdAt, id], map: "communication_provider_audit_logs_provider_id_created_at_id_idx")
   @@index([actorAdminId, createdAt, id], map: "comm_provider_audit_actor_created_idx")
   @@map("communication_provider_audit_logs")
+}
+
+model ExternalCommunicationEvent {
+  id             String          @id @default(cuid())
+  clientId       String          @map("client_id")
+  event          String
+  idempotencyKey String          @map("idempotency_key")
+  channels       String[]
+  recipientPhone String?         @map("recipient_phone")
+  recipientEmail String?         @map("recipient_email")
+  recipientName  String?         @map("recipient_name")
+  locale         String?
+  payloadJson    Json            @map("payload_json")
+  status         String          @default("ACCEPTED")
+  resultJson     Json?           @map("result_json")
+  requestId      String?         @map("request_id")
+  sourceIp       String?         @map("source_ip")
+  processedAt    DateTime?       @map("processed_at")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  client         AuthClient      @relation(fields: [clientId], references: [id])
+
+  @@unique([clientId, event, idempotencyKey], map: "external_comm_events_client_event_idempotency_key_idx")
+  @@index([clientId, createdAt], map: "external_comm_events_client_created_idx")
+  @@index([event, createdAt], map: "external_comm_events_event_created_idx")
+  @@index([status, createdAt], map: "external_comm_events_status_created_idx")
+  @@map("external_communication_events")
 }
 
 model EmailBrandingSetting {
@@ -748,35 +832,6 @@ model ClientBranding {
   @@map("client_brandings")
 }
 
-model EmailQueue {
-  id             String        @id @default(cuid())
-  templateKey    String        @map("template_key")
-  locale         String        @default("en")
-  clientId       String?       @map("client_id")
-  recipientEmail String        @map("recipient_email")
-  recipientName  String?       @map("recipient_name")
-  subject        String
-  variables      Json?
-  status         String        @default("pending")
-  attempt        Int           @default(0)
-  maxRetries     Int           @default(3) @map("max_retries")
-  nextRetryAt    DateTime?     @map("next_retry_at")
-  lastError      String?       @map("last_error")
-  sendLogId      String?       @map("send_log_id")
-  userId         String?       @map("user_id")
-  metadata       Json?
-  createdAt      DateTime      @default(now()) @map("created_at")
-  updatedAt      DateTime      @default(now()) @updatedAt @map("updated_at")
-  sendLog        EmailSendLog? @relation(fields: [sendLogId], references: [id], onUpdate: NoAction)
-  user           User?         @relation(fields: [userId], references: [id], onUpdate: NoAction)
-
-  @@index([status, nextRetryAt])
-  @@index([templateKey, status])
-  @@index([recipientEmail, createdAt])
-  @@index([userId, status])
-  @@map("email_queues")
-}
-
 model EmailTemplateAuditLog {
   id            String        @id @default(cuid())
   templateId    String        @map("template_id")
@@ -794,41 +849,6 @@ model EmailTemplateAuditLog {
   @@index([templateId, createdAt])
   @@index([actorAdminId, createdAt])
   @@map("email_template_audit_logs")
-}
-
-model EmailSendLog {
-  id               String       @id @default(cuid())
-  templateKey      String       @map("template_key")
-  recipientEmail   String       @map("recipient_email")
-  subject          String
-  variables        Json?
-  status           String
-  userId           String?      @map("user_id")
-  errorMessage     String?      @map("error_message")
-  providerResponse Json?        @map("provider_response")
-  createdAt        DateTime     @default(now()) @map("created_at")
-  locale           String       @default("en")
-  clientId         String?      @map("client_id")
-  recipientName    String?      @map("recipient_name")
-  deliveryStatus   String       @default("pending") @map("delivery_status")
-  attemptCount     Int          @default(1) @map("attempt_count")
-  sentAt           DateTime?    @map("sent_at")
-  failedAt         DateTime?    @map("failed_at")
-  senderName       String?      @map("sender_name")
-  senderEmail      String?      @map("sender_email")
-  queues           EmailQueue[]
-  user             User?        @relation(fields: [userId], references: [id])
-
-  @@index([templateKey, createdAt])
-  @@index([recipientEmail, createdAt])
-  @@index([userId, createdAt])
-  @@index([status, createdAt])
-  @@index([clientId, createdAt])
-  @@index([createdAt, id])
-  @@index([templateKey, createdAt, id])
-  @@index([status, createdAt, id])
-  @@index([clientId, createdAt, id])
-  @@map("email_send_logs")
 }
 
 enum UserStatus {
@@ -910,6 +930,7 @@ enum AuditAction {
   ROLE_CREATED
   ROLE_UPDATED
   ROLE_DELETED
+  COMMUNICATION_EVENT_TRIGGERED
 }
 
 enum SecurityEventType {
@@ -936,16 +957,28 @@ enum AdminNotificationSeverity {
   WARNING
   ERROR
   SECURITY
+  CRITICAL
 }
 
 enum AdminNotificationCategory {
-  SYSTEM
   SECURITY
+  SYSTEM
   USER_MANAGEMENT
   AUTH
   SETTINGS
   BILLING
   INTEGRATION
+  ADMIN
+  OAUTH
+  MAIL
+  SMS
+  GENERAL
+}
+
+enum AdminNotificationStatus {
+  UNREAD
+  READ
+  ARCHIVED
 }
 
 enum CommunicationChannel {
@@ -1003,9 +1036,14 @@ enum OtpTemplateLanguage {
 
 enum CommunicationDeliveryStatus {
   QUEUED
+  PENDING
   SENT
   FAILED
   RETRIED
+  RETRY_SCHEDULED
+  RETRYING
+  DEAD_LETTER
+  CANCELLED
   BLOCKED
 }
 

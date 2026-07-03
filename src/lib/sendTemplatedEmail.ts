@@ -6,6 +6,7 @@
 import { EmailTemplateKey, EmailVariables } from './emailRenderer.types.js';
 import { renderEmailTemplate } from './emailRenderer.js';
 import type { OtpTemplatePurpose } from '@prisma/client';
+import type { Request } from 'express';
 import { dispatchEmail } from '../modules/communication/communication.service.js';
 
 interface SendTemplatedEmailInput {
@@ -18,6 +19,7 @@ interface SendTemplatedEmailInput {
   locale?: string | null;
   purpose?: OtpTemplatePurpose;
   userId?: string | null;
+  req?: Request;
   maskSensitiveData?: boolean;
 }
 
@@ -83,6 +85,9 @@ export async function sendTemplatedEmail(
       senderName: rendered.senderName,
       senderEmail: rendered.senderEmail,
       replyTo: rendered.replyTo,
+      templateKey: input.templateKey,
+      userId: input.userId ?? null,
+      req: input.req,
     });
 
     return {
@@ -123,10 +128,23 @@ export async function sendTemplatedEmailWithFallback(
   fallbackSubject: string,
   fallbackBody: string
 ): Promise<SendTemplatedEmailResult> {
+  let primaryError: unknown;
   try {
-    return await sendTemplatedEmail(input);
+    const primaryResult = await sendTemplatedEmail(input);
+    // sendTemplatedEmail() catches its own render/dispatch errors internally
+    // and resolves with { success: false } rather than throwing (see above) —
+    // without this check, a bad/missing template variable would never reach
+    // the fallback below and the caller would just get a hard failure.
+    if (primaryResult.success) {
+      return primaryResult;
+    }
+    primaryError = new Error(primaryResult.error || 'Templated email send failed');
   } catch (error) {
-    console.warn(`Falling back to basic email for ${input.templateKey}:`, error);
+    primaryError = error;
+  }
+
+  {
+    console.warn(`Falling back to basic email for ${input.templateKey}:`, primaryError);
 
     const recipientEmail = input.recipientEmail || input.to;
     if (!recipientEmail) {
@@ -145,6 +163,8 @@ export async function sendTemplatedEmailWithFallback(
         text: fallbackBody,
         html: `<p>${fallbackBody}</p>`,
         purpose,
+        userId: input.userId ?? null,
+        req: input.req,
       });
 
       return {

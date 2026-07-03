@@ -32,7 +32,7 @@ const adminLoginSchema = z.object({
 // POST /admin/auth/login  â€” public (no authGuard here, override router middleware)
 const adminAuthRouter = Router();
 
-adminAuthRouter.post('/login', enterpriseRateLimit({ route: 'admin-login', windowMs: 15 * 60 * 1000, max: 5, identifierFrom: (req) => req.body?.emailOrUsername, threat: 'ADMIN_LOGIN_ABUSE', blockAfter: 8, blockTtlMs: 60 * 60 * 1000 }), validateBody(adminLoginSchema), async (req, res, next) => {
+adminAuthRouter.post('/login', enterpriseRateLimit({ route: 'admin-login', windowMs: 15 * 60 * 1000, max: 5, identifierFrom: (req) => `${req.body?.emailOrUsername ?? ''}:${req.ip ?? ''}`, threat: 'ADMIN_LOGIN_ABUSE', blockAfter: 8, blockTtlMs: 60 * 60 * 1000, blockScope: 'identifier' }), validateBody(adminLoginSchema), async (req, res, next) => {
   try {
     const result = await authService.loginUser(req.body, req);
     const isAdmin = result.user.roles.some((r) => ['admin', 'super_admin'].includes(r.toLowerCase()));
@@ -89,19 +89,34 @@ const usersQuerySchema = z.object({
   q: z.string().optional(),
   status: z.enum(['ACTIVE', 'SUSPENDED', 'DELETED', 'PENDING_VERIFICATION', 'ALL']).optional(),
   role: z.string().optional(),
+  country: z.string().optional(),
+  state: z.string().optional(),
+  city: z.string().optional(),
+  timezone: z.string().optional(),
+  registrationSource: z.string().optional(),
   emailVerified: z.enum(['true', 'false', 'all']).optional(),
   phoneVerified: z.enum(['true', 'false', 'all']).optional(),
+  hasEmail: z.enum(['true', 'false', 'all']).optional(),
+  hasPhone: z.enum(['true', 'false', 'all']).optional(),
+  loginActivity: z.enum(['never', 'today', '7d', '30d', '90d', '180d', 'all']).optional(),
+  riskLevel: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).optional(),
   hasOAuth: z.enum(['true', 'false', 'all']).optional(),
   provider: z.nativeEnum(OAuthProvider).optional(),
   createdFrom: z.string().datetime().optional(),
   createdTo: z.string().datetime().optional(),
   lastLoginFrom: z.string().datetime().optional(),
   lastLoginTo: z.string().datetime().optional(),
+  lastPasswordChangedFrom: z.string().datetime().optional(),
+  lastPasswordChangedTo: z.string().datetime().optional(),
+  externalRefId: z.string().optional(),
+  email: z.string().optional(),
+  phone: z.string().optional(),
+  username: z.string().optional(),
+  userId: z.string().optional(),
   sortBy: z.enum(['createdAt', 'lastLoginAt', 'email', 'username', 'status']).optional(),
   sortOrder: z.enum(['asc', 'desc']).optional(),
   limit: z.coerce.number().min(1).max(100).optional().default(50),
-  cursor: z.string().optional(),
-  page: z.coerce.number().min(1).optional(),
+  page: z.coerce.number().min(1).optional().default(1),
   includeCount: z.enum(['true', 'false']).optional()
 });
 
@@ -274,18 +289,33 @@ router.get('/end-users', requirePermission('users:read', 'admin:read'), async (r
       search: query.q,
       status: query.status as UserStatus | 'ALL',
       role: query.role,
+      country: query.country,
+      state: query.state,
+      city: query.city,
+      timezone: query.timezone,
+      registrationSource: query.registrationSource,
       emailVerified: query.emailVerified,
       phoneVerified: query.phoneVerified,
+      hasEmail: query.hasEmail,
+      hasPhone: query.hasPhone,
+      loginActivity: query.loginActivity,
+      riskLevel: query.riskLevel,
       hasOAuth: query.hasOAuth,
       provider: query.provider,
       createdFrom: query.createdFrom ? new Date(query.createdFrom) : undefined,
       createdTo: query.createdTo ? new Date(query.createdTo) : undefined,
       lastLoginFrom: query.lastLoginFrom ? new Date(query.lastLoginFrom) : undefined,
       lastLoginTo: query.lastLoginTo ? new Date(query.lastLoginTo) : undefined,
+      lastPasswordChangedFrom: query.lastPasswordChangedFrom ? new Date(query.lastPasswordChangedFrom) : undefined,
+      lastPasswordChangedTo: query.lastPasswordChangedTo ? new Date(query.lastPasswordChangedTo) : undefined,
+      externalRefId: query.externalRefId,
+      email: query.email,
+      phone: query.phone,
+      username: query.username,
+      userId: query.userId,
       sortBy: query.sortBy,
       sortOrder: query.sortOrder,
       limit: query.limit,
-      cursor: query.cursor,
       page: query.page,
       includeCount: query.includeCount === 'true'
     });
@@ -833,6 +863,7 @@ router.post(
     threat: 'SUSPICIOUS_ACTIVITY_BLOCKED',
     blockAfter: 8,
     blockTtlMs: 60 * 60 * 1000,
+    blockScope: 'identifier',
   }),
   validateBody(changeMyPasswordSchema),
   async (req: AuthenticatedRequest, res, next) => {
@@ -846,7 +877,7 @@ router.post(
 );
 
 const notificationsQuerySchema = z.object({
-  status: z.enum(['unread', 'read', 'all']).optional().default('all'),
+  status: z.enum(['unread', 'read', 'archived', 'all']).optional().default('all'),
   category: z.nativeEnum(AdminNotificationCategory).optional(),
   severity: z.nativeEnum(AdminNotificationSeverity).optional(),
   limit: z.coerce.number().min(1).max(50).optional().default(20),

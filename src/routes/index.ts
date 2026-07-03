@@ -21,6 +21,12 @@ import { config } from '../config/index.js';
 
 const router = Router();
 
+const externalCommunicationRoutes = (
+  await import(process.env.NODE_ENV === 'production'
+    ? '../modules/communication/events.routes.js'
+    : '../modules/communication/events.routes.ts')
+).default;
+
 function buildOpenIdConfiguration(baseUrl: string) {
   return {
     issuer: config.OAUTH_ISSUER,
@@ -54,6 +60,7 @@ router.use('/users', usersRoutes);
 
 // Admin auth login is public — mount before the guarded admin router
 router.use('/admin/auth', adminAuthRouter);
+router.use('/communication', externalCommunicationRoutes);
 router.use('/admin/communication', communicationRoutes);
 router.use('/admin', emailRoutes);
 // All other /admin/* routes require authGuard + admin role (enforced inside adminRoutes)

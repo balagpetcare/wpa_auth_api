@@ -7,6 +7,7 @@ import { createAdminNotification, sanitizeAdminActionUrl } from '../../lib/admin
 import { getPublicAvatarUrl, removeAvatarByUrl } from '../../lib/avatarStorage.js';
 import { sendEmail } from '../../lib/mailer.js';
 import { sendTemplatedEmailWithFallback } from '../../lib/sendTemplatedEmail.js';
+import { checkCommunicationAbuseLimits } from '../../lib/antiAbuse.js';
 import { PaginationParams } from '../../lib/pagination.js';
 import { CursorPaginationInput, decodeCursor, encodeCursor, parseCursorLimit } from '../../lib/pagination.js';
 import { Request } from 'express';
@@ -29,6 +30,19 @@ const safeUserSelect = {
   lastLoginAt: true,
   lastSeenAt: true,
   lastPasswordChangedAt: true,
+  country: true,
+  state: true,
+  city: true,
+  timezone: true,
+  externalRefId: true,
+  registrationSource: true,
+  riskScore: true,
+  failedLoginCount: true,
+  lastLoginIp: true,
+  lastLoginIpCountry: true,
+  lastLoginDeviceType: true,
+  lastLoginOs: true,
+  lastLoginBrowser: true,
   roles: {
     select: {
       role: { select: { id: true, name: true } }
@@ -59,18 +73,33 @@ export async function listUsers(opts: {
   search?: string;
   status?: UserStatus | 'ALL';
   role?: string;
+  country?: string;
+  state?: string;
+  city?: string;
+  timezone?: string;
+  registrationSource?: string;
   emailVerified?: 'true' | 'false' | 'all';
   phoneVerified?: 'true' | 'false' | 'all';
+  hasEmail?: 'true' | 'false' | 'all';
+  hasPhone?: 'true' | 'false' | 'all';
+  loginActivity?: 'never' | 'today' | '7d' | '30d' | '90d' | '180d' | 'all';
+  riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
   hasOAuth?: 'true' | 'false' | 'all';
   provider?: OAuthProvider;
   createdFrom?: Date;
   createdTo?: Date;
   lastLoginFrom?: Date;
   lastLoginTo?: Date;
+  lastPasswordChangedFrom?: Date;
+  lastPasswordChangedTo?: Date;
+  externalRefId?: string;
+  email?: string;
+  phone?: string;
+  username?: string;
+  userId?: string;
   sortBy?: 'createdAt' | 'lastLoginAt' | 'email' | 'username' | 'status';
   sortOrder?: 'asc' | 'desc';
   limit: number;
-  cursor?: string;
   page?: number;
   includeCount?: boolean;
 }) {
@@ -80,8 +109,26 @@ export async function listUsers(opts: {
   
   if (opts.search) {
     const s = { contains: opts.search, mode: Prisma.QueryMode.insensitive };
-    where.OR = [{ email: s }, { username: s }, { displayName: s }, { phone: s }];
+    where.OR = [
+      { id: s },
+      { email: s },
+      { phone: s },
+      { username: s },
+      { displayName: s },
+      { externalRefId: s },
+    ];
   }
+
+  if (opts.userId) where.id = { contains: opts.userId, mode: Prisma.QueryMode.insensitive };
+  if (opts.email) where.email = { contains: opts.email, mode: Prisma.QueryMode.insensitive };
+  if (opts.phone) where.phone = { contains: opts.phone, mode: Prisma.QueryMode.insensitive };
+  if (opts.username) where.username = { contains: opts.username, mode: Prisma.QueryMode.insensitive };
+  if (opts.externalRefId) where.externalRefId = { contains: opts.externalRefId, mode: Prisma.QueryMode.insensitive };
+  if (opts.country) where.country = { contains: opts.country, mode: Prisma.QueryMode.insensitive };
+  if (opts.state) where.state = { contains: opts.state, mode: Prisma.QueryMode.insensitive };
+  if (opts.city) where.city = { contains: opts.city, mode: Prisma.QueryMode.insensitive };
+  if (opts.timezone) where.timezone = { contains: opts.timezone, mode: Prisma.QueryMode.insensitive };
+  if (opts.registrationSource) where.registrationSource = opts.registrationSource;
 
   if (opts.emailVerified === 'true') where.emailVerifiedAt = { not: null };
   else if (opts.emailVerified === 'false') where.emailVerifiedAt = null;
@@ -112,24 +159,48 @@ export async function listUsers(opts: {
     if (opts.lastLoginTo) where.lastLoginAt.lte = opts.lastLoginTo;
   }
 
+  if (opts.lastPasswordChangedFrom || opts.lastPasswordChangedTo) {
+    where.lastPasswordChangedAt = {};
+    if (opts.lastPasswordChangedFrom) where.lastPasswordChangedAt.gte = opts.lastPasswordChangedFrom;
+    if (opts.lastPasswordChangedTo) where.lastPasswordChangedAt.lte = opts.lastPasswordChangedTo;
+  }
+
+  if (opts.loginActivity === 'never') where.lastLoginAt = null;
+  if (opts.loginActivity === 'today') {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    where.lastLoginAt = { gte: start };
+  }
+  if (opts.loginActivity === '7d' || opts.loginActivity === '30d' || opts.loginActivity === '90d' || opts.loginActivity === '180d') {
+    const days = { '7d': 7, '30d': 30, '90d': 90, '180d': 180 }[opts.loginActivity];
+    where.lastLoginAt = { gte: new Date(Date.now() - days * 24 * 60 * 60 * 1000) };
+  }
+
+  if (opts.riskLevel) {
+    const riskMap: Record<string, Prisma.IntFilter> = {
+      LOW: { lt: 20 },
+      MEDIUM: { gte: 20, lt: 50 },
+      HIGH: { gte: 50, lt: 80 },
+      CRITICAL: { gte: 80 },
+    };
+    where.riskScore = riskMap[opts.riskLevel];
+  }
+
+  if (opts.hasEmail === 'true') where.email = { not: null };
+  else if (opts.hasEmail === 'false') where.email = null;
+  if (opts.hasPhone === 'true') where.phone = { not: null };
+  else if (opts.hasPhone === 'false') where.phone = null;
+
   const limit = Math.min(opts.limit || 50, 100);
   const sortBy = opts.sortBy || 'createdAt';
   const sortOrder = opts.sortOrder || 'desc';
+  const page = Math.max(1, opts.page || 1);
 
   const queryArgs: Prisma.UserFindManyArgs = {
     where,
     select: safeUserSelect,
-    take: limit + 1, // take one extra to determine hasNextPage
+    take: limit,
+    skip: (page - 1) * limit,
   };
-
-  // Cursor pagination preferred
-  if (opts.cursor) {
-    queryArgs.cursor = { id: opts.cursor };
-    queryArgs.skip = 1; // skip the cursor itself
-  } else if (opts.page) {
-    // Fallback to offset pagination
-    queryArgs.skip = (opts.page - 1) * limit;
-  }
 
   // Proper deterministic sort
   queryArgs.orderBy = [
@@ -138,10 +209,8 @@ export async function listUsers(opts: {
   ];
 
   const results = await prisma.user.findMany(queryArgs);
-  
-  const hasNextPage = results.length > limit;
-  const items = hasNextPage ? results.slice(0, -1) : results;
-  const nextCursor = hasNextPage ? items[items.length - 1].id : null;
+  const total = opts.includeCount === false ? results.length : await prisma.user.count({ where });
+  const totalPages = Math.max(1, Math.ceil(total / limit));
 
   const superAdminRole = await prisma.role.findFirst({ where: { name: { in: ['super_admin', 'SUPER_ADMIN'] } } });
   let superAdminIds: string[] = [];
@@ -152,7 +221,7 @@ export async function listUsers(opts: {
   const isLastSuperAdminSingle = superAdminIds.length <= 1;
 
   // Format nested relations
-  const formattedItems = items.map((u: any) => {
+  const formattedItems = results.map((u: any) => {
     const isSuperAdmin = superAdminRole ? u.roles.some((r: any) => r.role.id === superAdminRole.id) : false;
     return {
       ...u,
@@ -163,18 +232,18 @@ export async function listUsers(opts: {
   });
   formattedItems.forEach(i => delete (i as any).oauthAccounts);
 
-  let totalExact;
-  if (opts.includeCount) {
-    totalExact = await prisma.user.count({ where });
-  }
-
   return {
     items: formattedItems,
+    total,
+    page,
+    pageSize: limit,
+    totalPages,
     pagination: {
-      limit,
-      nextCursor,
-      hasNextPage,
-      totalExact
+      page,
+      pageSize: limit,
+      total,
+      totalPages,
+      hasNextPage: page < totalPages,
     }
   };
 }
@@ -394,7 +463,7 @@ export async function resetUserPasswordAdmin(id: string, actorId: string, req: R
     type: 'PASSWORD_RESET_TRIGGERED',
     title: 'Password reset triggered',
     message: 'A password reset was triggered for your account by an administrator.',
-    severity: 'SECURITY',
+    severity: 'WARNING',
     category: 'SECURITY',
     actionUrl: '/account',
   });
@@ -424,7 +493,7 @@ export async function revokeUserSessions(id: string, actorId: string, req: Reque
     type: 'SESSIONS_REVOKED',
     title: 'Sessions revoked',
     message: 'One or more active sessions for your account were revoked by an administrator.',
-    severity: 'SECURITY',
+    severity: 'WARNING',
     category: 'SECURITY',
     actionUrl: '/sessions',
   });
@@ -1287,7 +1356,7 @@ export async function unlinkOAuthAccount(id: string, actorId: string, req: Reque
     title: 'OAuth account unlinked',
     message: `A ${account.provider} sign-in connection was removed from your account.`,
     severity: 'INFO',
-    category: 'INTEGRATION',
+    category: 'OAUTH',
     actionUrl: '/account',
   });
 
@@ -1438,7 +1507,7 @@ export async function updateMyAccount(userId: string, data: any, req: Request) {
     title: 'Profile updated',
     message: 'Your WPA Central Auth profile details were updated successfully.',
     severity: 'SUCCESS',
-    category: 'SETTINGS',
+    category: 'SYSTEM',
     actionUrl: '/account',
   });
 
@@ -1497,7 +1566,7 @@ export async function changeMyPassword(userId: string, data: any, req: Request) 
     type: 'PASSWORD_CHANGED',
     title: 'Password changed',
     message: 'Your account password was changed. Review your recent sessions if this was unexpected.',
-    severity: 'SECURITY',
+    severity: 'WARNING',
     category: 'SECURITY',
     actionUrl: '/sessions',
   });
@@ -1533,7 +1602,7 @@ export async function updateMyAvatar(userId: string, avatarUrl: string, req: Req
     title: 'Profile photo updated',
     message: 'Your admin profile photo was updated.',
     severity: 'SUCCESS',
-    category: 'SETTINGS',
+    category: 'SYSTEM',
     actionUrl: '/account',
   });
 
@@ -1568,7 +1637,7 @@ export async function removeMyAvatar(userId: string, req: Request) {
     title: 'Profile photo removed',
     message: 'Your admin profile photo was removed and initials fallback is active.',
     severity: 'INFO',
-    category: 'SETTINGS',
+    category: 'SYSTEM',
     actionUrl: '/account',
   });
 
@@ -1576,40 +1645,44 @@ export async function removeMyAvatar(userId: string, req: Request) {
 }
 
 function buildVisibleNotificationsWhere(userId: string, filters?: {
-  status?: 'unread' | 'read' | 'all';
+  status?: 'unread' | 'read' | 'archived' | 'all';
   category?: AdminNotificationCategory;
   severity?: AdminNotificationSeverity;
 }) {
-  const where: Prisma.AdminNotificationWhereInput = {
-    dismissedAt: null,
-    OR: [
-      { userId },
-      { userId: null },
-    ],
+  const baseWhere: Prisma.AdminNotificationWhereInput = {
+    OR: [{ userId }, { userId: null }],
   };
 
-  if (filters?.status === 'unread') where.readAt = null;
-  if (filters?.status === 'read') where.readAt = { not: null };
-  if (filters?.category) where.category = filters.category;
-  if (filters?.severity) where.severity = filters.severity;
+  if (filters?.status === 'archived') {
+    baseWhere.archivedAt = { not: null };
+  } else {
+    baseWhere.archivedAt = null;
+  }
 
-  return where;
+  if (filters?.status === 'unread') baseWhere.status = 'UNREAD';
+  if (filters?.status === 'read') baseWhere.status = 'READ';
+  if (filters?.category) baseWhere.category = filters.category;
+  if (filters?.severity) baseWhere.severity = filters.severity;
+
+  return baseWhere;
 }
 
 const adminNotificationSelect = {
   id: true,
+  status: true,
   title: true,
   message: true,
   severity: true,
   category: true,
   actionUrl: true,
   readAt: true,
+  archivedAt: true,
   createdAt: true,
 } satisfies Prisma.AdminNotificationSelect;
 
 export async function listMyNotifications(opts: {
   userId: string;
-  status: 'unread' | 'read' | 'all';
+  status: 'unread' | 'read' | 'archived' | 'all';
   category?: AdminNotificationCategory;
   severity?: AdminNotificationSeverity;
   limit: number;
@@ -1664,7 +1737,7 @@ export async function markNotificationRead(userId: string, notificationId: strin
   const notification = await prisma.adminNotification.findFirst({
     where: {
       id: notificationId,
-      dismissedAt: null,
+      archivedAt: null,
       OR: [{ userId }, { userId: null }],
     },
   });
@@ -1672,7 +1745,7 @@ export async function markNotificationRead(userId: string, notificationId: strin
 
   return prisma.adminNotification.update({
     where: { id: notificationId },
-    data: { readAt: notification.readAt ?? new Date() },
+    data: { readAt: notification.readAt ?? new Date(), status: 'READ' },
     select: adminNotificationSelect,
   });
 }
@@ -1690,14 +1763,14 @@ export async function dismissNotification(userId: string, notificationId: string
     where: {
       id: notificationId,
       userId,
-      dismissedAt: null,
+      archivedAt: null,
     },
   });
   if (!notification) throw new AppError('Notification not found.', 'NOT_FOUND', 404);
 
   return prisma.adminNotification.update({
     where: { id: notificationId },
-    data: { dismissedAt: new Date(), readAt: notification.readAt ?? new Date() },
+    data: { archivedAt: new Date(), status: 'ARCHIVED', readAt: notification.readAt ?? new Date() },
     select: adminNotificationSelect,
   });
 }
@@ -1710,7 +1783,7 @@ export async function createUserStatusNotification(userId: string, status: UserS
     title: 'Account status updated',
     message: `Your account status was updated to ${normalizedStatus}.`,
     severity: status === 'SUSPENDED' ? 'WARNING' : 'INFO',
-    category: 'USER_MANAGEMENT',
+    category: 'ADMIN',
     actionUrl: '/account',
   });
 }
@@ -1727,7 +1800,7 @@ export async function createSecurityNotification(input: {
     type: input.type,
     title: input.title,
     message: input.message,
-    severity: 'SECURITY',
+    severity: 'CRITICAL',
     category: 'SECURITY',
     actionUrl: sanitizeAdminActionUrl(input.actionUrl ?? '/security-events'),
   });
@@ -1919,7 +1992,7 @@ export async function assignExistingUserAdmin(opts: {
     title: 'Admin Access Granted',
     message: `You were granted admin access with roles: ${rolesToAssign.map(r => r.name).join(', ')}.`,
     severity: 'SUCCESS',
-    category: 'AUTH',
+    category: 'ADMIN',
     actionUrl: '/account'
   });
 
@@ -2005,7 +2078,7 @@ export async function createAdminInvitation(opts: {
     title: 'Admin Invitation Sent',
     message: `Invitation sent to ${emailNormalized}.`,
     severity: 'INFO',
-    category: 'USER_MANAGEMENT',
+    category: 'ADMIN',
     actionUrl: '/admin-users'
   });
 
@@ -2028,6 +2101,7 @@ export async function createAdminInvitation(opts: {
         message: opts.message || '',
       },
       to: emailNormalized,
+      req: opts.req,
     },
     'WPA Central Auth admin invitation',
     inviteBody
@@ -2140,6 +2214,18 @@ export async function resendAdminInvitation(opts: {
     throw new AppError('Only pending invitations can be resent.', 'VALIDATION_ERROR', 400);
   }
 
+  const abuseDecision = await checkCommunicationAbuseLimits({
+    channel: 'EMAIL',
+    purpose: 'ADMIN_INVITE',
+    recipient: invitation.email,
+    req: opts.req,
+    actorAdminId: opts.actorId,
+    context: 'admin_invite',
+  });
+  if (!abuseDecision.allowed) {
+    throw new AppError(abuseDecision.message, abuseDecision.code, 429);
+  }
+
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
   const rawToken = randomBytes(32).toString('hex');
   const tokenHash = createHash('sha256').update(rawToken).digest('hex');
@@ -2171,17 +2257,23 @@ export async function resendAdminInvitation(opts: {
     `Accept invitation: ${inviteUrl}`,
   ].join('\n');
 
-  await sendTemplatedEmailWithFallback(
+  const sendResult = await sendTemplatedEmailWithFallback(
     {
       templateKey: 'admin_invitation',
+      purpose: 'ADMIN_INVITE',
       variables: {
         inviteLink: inviteUrl,
       },
       to: invitation.email,
+      req: opts.req,
     },
     'WPA Central Auth admin invitation reminder',
     inviteBody
   );
+
+  if (!sendResult.success) {
+    throw new AppError(sendResult.error || 'Unable to send invitation email right now.', 'COMMUNICATION_UNAVAILABLE', 503);
+  }
 
   return {
     success: true,
@@ -2355,7 +2447,7 @@ export async function acceptAdminInvitation(opts: {
     title: 'Admin Invitation Accepted',
     message: `${emailNormalized} has accepted your invitation and joined the admin team.`,
     severity: 'SUCCESS',
-    category: 'USER_MANAGEMENT',
+    category: 'ADMIN',
     actionUrl: '/admin-users'
   });
 

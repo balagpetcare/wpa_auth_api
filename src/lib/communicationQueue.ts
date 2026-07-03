@@ -23,6 +23,7 @@ export type CommunicationQueueJob =
         locale?: string | null;
         purpose?: string | null;
         userId?: string | null;
+        templateKey?: string | null;
       };
     }
   | {

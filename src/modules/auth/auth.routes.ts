@@ -63,7 +63,7 @@ const presenceHeartbeatSchema = z.object({
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 // POST /auth/register
-router.post('/register', enterpriseRateLimit({ route: 'auth-register', windowMs: 60 * 60 * 1000, max: 5, identifierFrom: (req) => (req.body?.email || req.body?.phone || req.body?.username) }), validateBody(registerSchema), async (req, res, next) => {
+router.post('/register', enterpriseRateLimit({ route: 'auth-register', windowMs: 60 * 60 * 1000, max: 5, identifierFrom: (req) => `${req.body?.email || req.body?.phone || req.body?.username || 'unknown'}:${req.ip ?? req.socket.remoteAddress ?? 'unknown'}` }), validateBody(registerSchema), async (req, res, next) => {
   try {
     const user = await authService.registerUser(req.body, req);
     res.status(201).json({ success: true, user });
@@ -73,7 +73,7 @@ router.post('/register', enterpriseRateLimit({ route: 'auth-register', windowMs:
 });
 
 // POST /auth/login
-router.post('/login', enterpriseRateLimit({ route: 'auth-login', windowMs: 15 * 60 * 1000, max: 10, identifierFrom: (req) => req.body?.emailOrUsername, threat: 'BOT_TRAFFIC_SPIKE' }), validateBody(loginSchema), async (req, res, next) => {
+router.post('/login', enterpriseRateLimit({ route: 'auth-login', windowMs: 15 * 60 * 1000, max: 10, identifierFrom: (req) => `${req.body?.emailOrUsername ?? ''}:${req.ip ?? ''}`, threat: 'BOT_TRAFFIC_SPIKE', blockScope: 'identifier' }), validateBody(loginSchema), async (req, res, next) => {
   try {
     const result = await authService.loginUser(req.body, req);
     res.json({ success: true, ...result });
@@ -113,7 +113,7 @@ router.get('/me', authGuard, async (req: AuthenticatedRequest, res, next) => {
 });
 
 // POST /auth/forgot-password
-router.post('/forgot-password', enterpriseRateLimit({ route: 'auth-forgot-password', windowMs: 60 * 60 * 1000, max: 5, identifierFrom: (req) => req.body?.email, threat: 'PASSWORD_RESET_ABUSE' }), validateBody(forgotPasswordSchema), async (req, res, next) => {
+router.post('/forgot-password', enterpriseRateLimit({ route: 'auth-forgot-password', windowMs: 60 * 60 * 1000, max: 3, identifierFrom: (req) => `${req.body?.email ?? 'unknown'}:${req.ip ?? req.socket.remoteAddress ?? 'unknown'}`, threat: 'PASSWORD_RESET_ABUSE', blockScope: 'identifier' }), validateBody(forgotPasswordSchema), async (req, res, next) => {
   try {
     await authService.forgotPassword(req.body.email, req);
     // Always return 200 to avoid user enumeration
@@ -134,7 +134,7 @@ router.post('/reset-password', enterpriseRateLimit({ route: 'auth-reset-password
 });
 
 // POST /auth/verify-email/request  (requires valid access token)
-router.post('/verify-email/request', enterpriseRateLimit({ route: 'auth-verify-email-request', windowMs: 60 * 60 * 1000, max: 5, identifierFrom: (req) => req.body?.email, threat: 'OTP_ABUSE_DETECTED' }), authGuard, validateBody(verifyEmailRequestSchema), async (req: AuthenticatedRequest, res, next) => {
+router.post('/verify-email/request', enterpriseRateLimit({ route: 'auth-verify-email-request', windowMs: 60 * 60 * 1000, max: 3, identifierFrom: (req) => `${req.body?.email ?? 'unknown'}:${req.ip ?? req.socket.remoteAddress ?? 'unknown'}`, threat: 'OTP_ABUSE_DETECTED', blockScope: 'identifier' }), authGuard, validateBody(verifyEmailRequestSchema), async (req: AuthenticatedRequest, res, next) => {
   try {
     await authService.requestEmailVerification(req.user!.id, req.body.email, req);
     res.json({ success: true, message: 'Verification email sent.' });

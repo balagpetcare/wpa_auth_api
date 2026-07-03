@@ -18,7 +18,7 @@ import { sendEmail } from '../../lib/mailer.js';
 import { sendTemplatedEmail, sendTemplatedEmailWithFallback } from '../../lib/sendTemplatedEmail.js';
 import { sendLoginAlertEmail, sendWelcomeEmail } from '../../lib/emailNotifications.js';
 import { Request } from 'express';
-import { logAbuseSignal, clearRisk } from '../../lib/antiAbuse.js';
+import { logAbuseSignal, clearRisk, clearLoginAbuseState } from '../../lib/antiAbuse.js';
 import { recordPresenceHeartbeat } from '../../lib/presence.js';
 import { incrementMetric } from '../../lib/metrics.js';
 
@@ -160,6 +160,7 @@ export async function registerUser(
       await sendTemplatedEmailWithFallback(
         {
           templateKey: 'email_verification',
+          purpose: 'REGISTER',
           variables: {
             userName: opts.displayName || opts.email,
             verificationLink,
@@ -168,6 +169,7 @@ export async function registerUser(
           to: opts.email,
           userId: user.id,
           clientId: client?.id || null,
+          req,
         },
         'Welcome! Please verify your email',
         `Please verify your email by clicking this link: ${verificationLink}`
@@ -187,6 +189,7 @@ export async function loginUser(
   req: Request,
 ) {
   const identifier = opts.emailOrUsername.trim().toLowerCase();
+  const loginAbuseIdentifier = `${identifier}:${req.ip ?? req.socket.remoteAddress ?? 'unknown'}`;
   const isEmail = identifier.includes('@');
 
   const user = await prisma.user.findFirst({
@@ -195,7 +198,7 @@ export async function loginUser(
 
   if (!user || !user.passwordHash) {
     incrementMetric('login_failure_total');
-    await logAbuseSignal({ route: 'auth-login', req, identifier: identifier, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
+    await logAbuseSignal({ route: 'auth-login', req, identifier: loginAbuseIdentifier, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
   }
 
@@ -203,7 +206,40 @@ export async function loginUser(
   if (!valid) {
     incrementMetric('login_failure_total');
     await writeAuditLog({ userId: user.id, action: 'LOGIN', metadata: { success: false }, req });
-    await logAbuseSignal({ route: 'auth-login', req, identifier: identifier, userId: user.id, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
+
+    // Check failed login attempts threshold (Requirement 2 & 11)
+    try {
+      const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+      const recentLoginAudits = await prisma.auditLog.findMany({
+        where: {
+          userId: user.id,
+          action: 'LOGIN',
+          createdAt: { gte: fifteenMinutesAgo },
+        },
+        take: 6,
+        orderBy: { createdAt: 'desc' },
+      });
+      const failedCount = recentLoginAudits.filter(log => {
+        const meta = log.metadata as any;
+        return meta && meta.success === false;
+      }).length;
+
+      if (failedCount >= 5) {
+        await createAdminNotification({
+          userId: user.id,
+          type: 'MULTIPLE_FAILED_LOGINS',
+          title: 'Multiple failed login attempts',
+          message: `Multiple failed login attempts (${failedCount}) were detected for your account.`,
+          severity: 'CRITICAL',
+          category: 'SECURITY',
+          actionUrl: '/security-events',
+        });
+      }
+    } catch (err) {
+      console.error('Failed to process failed login threshold:', err);
+    }
+
+    await logAbuseSignal({ route: 'auth-login', req, identifier: loginAbuseIdentifier, userId: user.id, threat: 'BOT_TRAFFIC_SPIKE', blockAfter: 6, blockTtlMs: 30 * 60 * 1000 });
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
   }
 
@@ -260,6 +296,58 @@ export async function loginUser(
   await writeAuditLog({ userId: user.id, clientId: client?.id, action: 'LOGIN', metadata: { success: true }, req });
   incrementMetric('login_success_total');
   await clearRisk({ req, identifier });
+  await clearLoginAbuseState({ req, identifier: loginAbuseIdentifier });
+
+  // Sensitive/security login checks (Requirement 2 & 11)
+  try {
+    const previousSession = await prisma.loginSession.findFirst({
+      where: {
+        userId: user.id,
+        NOT: { id: session.id },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (previousSession) {
+      if (session.ipAddress && previousSession.ipAddress && session.ipAddress !== previousSession.ipAddress) {
+        await createAdminNotification({
+          userId: user.id,
+          type: 'NEW_IP_LOGIN',
+          title: 'New IP login detected',
+          message: `A login was recorded from a new IP address: ${session.ipAddress}.`,
+          severity: 'WARNING',
+          category: 'SECURITY',
+          actionUrl: '/sessions',
+        });
+      }
+
+      if (session.userAgent && previousSession.userAgent && session.userAgent !== previousSession.userAgent) {
+        await createAdminNotification({
+          userId: user.id,
+          type: 'NEW_DEVICE_LOGIN',
+          title: 'New device login detected',
+          message: `A login was recorded from a new device or browser.`,
+          severity: 'WARNING',
+          category: 'SECURITY',
+          actionUrl: '/sessions',
+        });
+      }
+
+      if (session.country && previousSession.country && session.country !== previousSession.country) {
+        await createAdminNotification({
+          userId: user.id,
+          type: 'UNUSUAL_LOCATION_LOGIN',
+          title: 'Unusual location login detected',
+          message: `A login was recorded from a different country: ${session.country}.`,
+          severity: 'CRITICAL',
+          category: 'SECURITY',
+          actionUrl: '/sessions',
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Failed to process sensitive login checks:', err);
+  }
 
   // Send login alert email
   if (user.email) {
@@ -276,20 +364,6 @@ export async function loginUser(
       console.error('Failed to send login alert email', e);
     }
   }
-
-  await createAdminNotification({
-    userId: user.id,
-    type: 'LOGIN',
-    title: 'New login detected',
-    message: `A new sign-in to WPA Central Auth was recorded from ${req.ip ?? 'an unknown IP address'}.`,
-    severity: 'SECURITY',
-    category: 'AUTH',
-    actionUrl: '/sessions',
-    metadata: {
-      ipAddress: req.ip ?? req.socket.remoteAddress,
-      userAgent: req.headers['user-agent'] ?? null,
-    },
-  });
 
   return {
     accessToken,
@@ -382,7 +456,7 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
           type: 'REFRESH_TOKEN_REUSE_DETECTED',
           title: 'Potential refresh token theft detected',
           message: `Refresh token reuse detected for user ${stored.userId}. Entire session family has been revoked.`,
-          severity: 'SECURITY',
+          severity: 'CRITICAL',
           category: 'SECURITY',
           metadata: {
             userId: stored.userId,
@@ -548,7 +622,7 @@ export async function forgotPassword(email: string, req: Request) {
     type: 'PASSWORD_RESET_REQUESTED',
     title: 'Password reset requested',
     message: 'A password reset request was created for your account.',
-    severity: 'SECURITY',
+    severity: 'CRITICAL',
     category: 'SECURITY',
     actionUrl: '/account',
   });
@@ -557,9 +631,10 @@ export async function forgotPassword(email: string, req: Request) {
   // same APP_URL-instead-of-frontend bug as the email-verification link
   // above — this pointed at the API server itself, not a real page.
   const resetLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/reset-password?token=${token}`;
-  await sendTemplatedEmailWithFallback(
+  const resetEmailResult = await sendTemplatedEmailWithFallback(
     {
       templateKey: 'password_reset',
+      purpose: 'PASSWORD_RESET',
       // Phase 2 incidental fix (docs/phase-2-core-identity-admin-modules.md):
       // this was `resetPasswordLink`, but the actual template/renderer
       // variable name is `resetLink` (see emailRenderer.examples.ts) — the
@@ -574,11 +649,14 @@ export async function forgotPassword(email: string, req: Request) {
       },
       to: email,
       userId: user.id,
+      req,
     },
     'Password Reset Request',
     `You requested a password reset. Click here to reset: ${resetLink}`
   );
-  incrementMetric('otp_send_total');
+  if (resetEmailResult.success) {
+    incrementMetric('otp_send_total');
+  }
 
   // Never return raw token in production
   if (process.env.NODE_ENV === 'development') {
@@ -633,7 +711,7 @@ export async function resetPassword(token: string, newPassword: string, req: Req
     type: 'PASSWORD_RESET_COMPLETED',
     title: 'Password reset completed',
     message: 'Your account password was reset and existing sessions were revoked.',
-    severity: 'SECURITY',
+    severity: 'CRITICAL',
     category: 'SECURITY',
     actionUrl: '/sessions',
   });
@@ -665,9 +743,10 @@ export async function requestEmailVerification(userId: string, email: string, re
   // same APP_URL-instead-of-frontend bug fixed above.
   const verificationLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/verify-email?token=${token}`;
   const requestUser = await prisma.user.findUnique({ where: { id: userId } });
-  await sendTemplatedEmailWithFallback(
+  const verificationEmailResult = await sendTemplatedEmailWithFallback(
     {
       templateKey: 'email_verification',
+      purpose: 'REGISTER',
       variables: {
         userName: requestUser?.displayName || email,
         verificationLink,
@@ -675,11 +754,14 @@ export async function requestEmailVerification(userId: string, email: string, re
       },
       to: email,
       userId,
+      req,
     },
     'Verify your email',
     `Please verify your email by clicking this link: ${verificationLink}`
   );
-  incrementMetric('otp_send_total');
+  if (verificationEmailResult.success) {
+    incrementMetric('otp_send_total');
+  }
 
   if (process.env.NODE_ENV === 'development') {
     return token;

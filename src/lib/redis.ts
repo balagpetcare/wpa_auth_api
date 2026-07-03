@@ -25,7 +25,16 @@ export function createRedisClient(): Redis | null {
     // outage/reconnect (observed live: requests to enterpriseRateLimit-protected routes
     // hung 30s+ and never resolved even after Redis came back up). This bounds every
     // command so callers relying on try/catch fail-open behavior actually get an error.
-    commandTimeout: 1500,
+    //
+    // Must stay comfortably above the longest blocking command timeout used anywhere
+    // on this client — reserveNextCommunicationJob() issues BRPOPLPUSH with a 5s
+    // server-side block (communicationQueue.ts). A commandTimeout shorter than that
+    // (previously 1500ms) fires while the blocking pop is still legitimately waiting
+    // for a job, throwing "Command timed out" on every idle poll — this crashed the
+    // communication worker's main loop (uncaught, no queued jobs) within ~2s of
+    // startup. 7000ms leaves margin above the 5s block while still bounding genuine
+    // Redis-outage hangs for the fast-path rate-limit commands.
+    commandTimeout: 7000,
   }) as Redis;
 
   client.on('error', (err: Error) => {

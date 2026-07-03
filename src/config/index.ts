@@ -59,6 +59,24 @@ const envSchema = z.object({
   CAPTCHA_PROVIDER: z.enum(['none', 'turnstile', 'recaptcha']).default('none'),
   CAPTCHA_SECRET: z.string().optional(),
   CAPTCHA_REQUIRED_ON_HIGH_RISK: z.coerce.boolean().default(false),
+  AUTH_ABUSE_PROTECTION_ENABLED: z.coerce.boolean().default(true),
+  AUTH_ABUSE_DEV_RELAXED: z.coerce.boolean().default(true),
+  AUTH_LOGIN_FAILED_ATTEMPT_LIMIT: z.coerce.number().int().positive().default(5),
+  AUTH_LOGIN_BLOCK_MINUTES: z.coerce.number().int().positive().default(15),
+  AUTH_LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  AUTH_LOGIN_RATE_LIMIT_WINDOW_MINUTES: z.coerce.number().int().positive().default(15),
+  AUTH_LOGIN_LOCAL_BLOCK_MINUTES: z.coerce.number().int().positive().default(2),
+  COMMUNICATION_RATE_LIMIT_ENABLED: z.coerce.boolean().default(true),
+  COMMUNICATION_MAX_SMS_PER_PHONE_PER_HOUR: z.coerce.number().int().positive().default(5),
+  COMMUNICATION_MAX_SMS_PER_PHONE_PER_DAY: z.coerce.number().int().positive().default(10),
+  COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_HOUR: z.coerce.number().int().positive().default(5),
+  COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_DAY: z.coerce.number().int().positive().default(10),
+  COMMUNICATION_MAX_PROVIDER_TEST_PER_ADMIN_HOUR: z.coerce.number().int().positive().default(10),
+  COMMUNICATION_MAX_BULK_RETRY_COUNT: z.coerce.number().int().positive().default(50),
+  COMMUNICATION_SYSTEM_SMS_HOURLY_CAP: z.coerce.number().int().positive().default(200),
+  COMMUNICATION_SYSTEM_SMS_DAILY_CAP: z.coerce.number().int().positive().default(2000),
+  COMMUNICATION_SYSTEM_EMAIL_HOURLY_CAP: z.coerce.number().int().positive().default(1000),
+  COMMUNICATION_SYSTEM_EMAIL_DAILY_CAP: z.coerce.number().int().positive().default(10000),
   PRESENCE_TTL_SECONDS: z.coerce.number().int().positive().default(90),
   PRESENCE_HEARTBEAT_MIN_INTERVAL_SECONDS: z.coerce.number().int().positive().default(30),
   CREDENTIAL_ENCRYPTION_KEY: z.string().min(32),
@@ -72,11 +90,15 @@ const envSchema = z.object({
   ADMIN_NOTIFICATION_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
   COMMUNICATION_DELIVERY_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
   COMMUNICATION_PROVIDER_AUDIT_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(365),
-  EMAIL_SEND_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
   LOGIN_SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
   AUTHORIZATION_CODE_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
   REFRESH_TOKEN_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
   RETENTION_PRUNE_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
+  COMMUNICATION_RETRY_WORKER_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== 'false')
+    .default('true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

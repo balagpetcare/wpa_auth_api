@@ -2,7 +2,6 @@ import { config } from '../../config/index.js';
 import { prisma } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
 import { writeAuditLog, writeSecurityEvent } from '../../lib/audit.js';
-import { createAdminNotification } from '../../lib/adminNotifications.js';
 import { Request } from 'express';
 import jwt from 'jsonwebtoken';
 import { OAuthProvider, UserStatus } from '@prisma/client';
@@ -387,15 +386,6 @@ async function loginOrCreateSocialUser(opts: {
       },
     });
     await writeAuditLog({ userId: user.id, action: 'OAUTH_LINKED', metadata: { provider }, req });
-    await createAdminNotification({
-      userId: user.id,
-      type: 'OAUTH_LINKED',
-      title: 'OAuth account linked',
-      message: `${provider} sign-in was linked to your account.`,
-      severity: 'SUCCESS',
-      category: 'INTEGRATION',
-      actionUrl: '/account',
-    });
   }
 
   // 5. Generate tokens
@@ -435,16 +425,6 @@ async function loginOrCreateSocialUser(opts: {
   });
 
   await writeAuditLog({ userId: user.id, clientId, action: 'LOGIN', metadata: { success: true, method: 'social', provider }, req });
-
-  await createAdminNotification({
-    userId: user.id,
-    type: 'LOGIN_SOCIAL',
-    title: 'New social login detected',
-    message: `A new ${provider} sign-in to WPA Central Auth was recorded.`,
-    severity: 'SECURITY',
-    category: 'AUTH',
-    actionUrl: '/sessions',
-  });
 
   // Safe user obj
   const safeUser = {

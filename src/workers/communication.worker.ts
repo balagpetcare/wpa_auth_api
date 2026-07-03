@@ -12,10 +12,13 @@ import {
   promoteDueCommunicationJobs,
   recoverStalledCommunicationJobs,
 } from '../lib/communicationQueue.js';
-import { deliverQueuedEmail, deliverQueuedSms } from '../modules/communication/communication.service.js';
+import { deliverQueuedEmail, deliverQueuedSms, processDueRetries, executeRetry } from '../modules/communication/communication.service.js';
+import { config } from '../config/index.js';
 import type { Prisma } from '@prisma/client';
 
 let running = true;
+const RETRY_SCAN_INTERVAL_MS = 15_000;
+let lastRetryScanAt = 0;
 
 async function touchHeartbeat() {
   const redis = createRedisClient();
@@ -41,6 +44,7 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
           clientId: job.payload.clientId ?? null,
           senderName: job.payload.recipientName ?? null,
           senderEmail: null,
+          templateKey: job.payload.templateKey ?? null,
         });
         break;
       case 'send_sms':
@@ -63,6 +67,13 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
         });
         break;
       case 'communication_retry':
+        // On-demand nudge to retry a single CommunicationDeliveryLog row
+        // (payload.sourceId is the delivery log id). The periodic scan in
+        // loop() below is the primary path for RETRY_SCHEDULED rows; this
+        // job type exists for callers that want to force an immediate
+        // retry attempt without waiting for the next scan tick.
+        await executeRetry(job.payload.sourceId);
+        break;
       case 'provider_health_check':
         logger.info({ jobType: job.type, payload: job.payload }, 'Communication maintenance job received');
         break;
@@ -86,12 +97,27 @@ async function handleJob(job: Awaited<ReturnType<typeof reserveNextCommunication
   }
 }
 
+async function scanDueRetriesIfEnabled() {
+  if (!config.COMMUNICATION_RETRY_WORKER_ENABLED) return;
+  if (Date.now() - lastRetryScanAt < RETRY_SCAN_INTERVAL_MS) return;
+  lastRetryScanAt = Date.now();
+  try {
+    const { processed } = await processDueRetries();
+    if (processed > 0) {
+      logger.info({ processed }, 'Communication retry worker processed due retries');
+    }
+  } catch (error) {
+    logger.error({ error: error instanceof Error ? error.message : String(error) }, 'Communication retry scan failed');
+  }
+}
+
 async function loop() {
-  logger.info('Communication worker started');
+  logger.info({ retryWorkerEnabled: config.COMMUNICATION_RETRY_WORKER_ENABLED }, 'Communication worker started');
   while (running) {
     await touchHeartbeat();
     await promoteDueCommunicationJobs();
     await recoverStalledCommunicationJobs();
+    await scanDueRetriesIfEnabled();
     const job = await reserveNextCommunicationJob(5);
     if (!job) continue;
     await handleJob(job as any);

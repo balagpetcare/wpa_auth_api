@@ -13,6 +13,7 @@ import { requireAdmin } from '../../middleware/requireRole.js';
 import { validateBody } from '../../middleware/validate.js';
 import { requirePermission } from '../../middleware/requirePermission.js';
 import { sendTestEmailRateLimit } from '../../middleware/rateLimit.js';
+import { config } from '../../config/index.js';
 import * as communicationService from './communication.service.js';
 
 const router = Router();
@@ -34,7 +35,7 @@ const providerSchema = z.object({
 });
 
 const credentialSchema = z.object({
-  secrets: z.record(z.string(), z.string().min(1)),
+  secrets: z.record(z.string(), z.string().min(1)).optional(),
   apiBaseUrl: z.string().url().nullable().optional(),
   senderId: z.string().max(64).nullable().optional(),
   fromName: z.string().max(120).nullable().optional(),
@@ -75,15 +76,29 @@ const templateSchema = z.object({
 
 const providerListQuerySchema = z.object({
   type: z.nativeEnum(CommunicationChannel).optional(),
+  countryCode: z.string().regex(/^\d{1,4}$/).optional(),
+  environment: z.enum(['SANDBOX', 'LIVE']).optional(),
+  isActive: z.enum(['true', 'false']).optional(),
+  status: z.nativeEnum(CommunicationProviderStatus).optional(),
+  healthStatus: z.enum(['UNKNOWN', 'HEALTHY', 'DEGRADED', 'DOWN']).optional(),
 });
 
 const deliveryLogQuerySchema = z.object({
   channel: z.nativeEnum(CommunicationChannel).optional(),
   providerId: z.string().optional(),
   status: z.nativeEnum(CommunicationDeliveryStatus).optional(),
+  purpose: z.nativeEnum(OtpTemplatePurpose).optional(),
   recipient: z.string().optional(),
   countryCode: z.string().optional(),
+  retryableOnly: z.enum(['true', 'false']).optional(),
+  deadLetterOnly: z.enum(['true', 'false']).optional(),
+  createdFrom: z.coerce.date().optional(),
+  createdTo: z.coerce.date().optional(),
   limit: z.coerce.number().min(1).max(100).optional().default(50),
+});
+
+const bulkIdsSchema = z.object({
+  ids: z.array(z.string()).min(1).max(config.COMMUNICATION_MAX_BULK_RETRY_COUNT),
 });
 
 const testSmsSchema = z.object({
@@ -103,7 +118,14 @@ router.get(
   async (req, res, next) => {
     try {
       const query = providerListQuerySchema.parse(req.query);
-      const providers = await communicationService.listProviders(query);
+      const providers = await communicationService.listProviders({
+        type: query.type,
+        countryCode: query.countryCode,
+        environment: query.environment,
+        isActive: query.isActive === undefined ? null : query.isActive === 'true',
+        status: query.status,
+        healthStatus: query.healthStatus,
+      });
       res.json({ success: true, data: { items: providers } });
     } catch (error) {
       next(error);
@@ -210,6 +232,19 @@ router.post(
     try {
       const provider = await communicationService.setProviderStatus(req.params.id, 'INACTIVE', req.user!.id, req);
       res.json({ success: true, data: provider, message: 'Communication provider deactivated successfully.' });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+router.post(
+  '/providers/:id/health-check',
+  requirePermission('communication.health.read'),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const provider = await communicationService.checkProviderHealth(req.params.id, req.user!.id, req);
+      res.json({ success: true, data: provider, message: 'Provider health snapshot refreshed.' });
     } catch (error) {
       next(error);
     }
@@ -457,9 +492,78 @@ router.get(
       const query = deliveryLogQuerySchema.parse(req.query);
       const data = await communicationService.getDeliveryLogs({
         ...query,
+        retryableOnly: query.retryableOnly === 'true',
+        deadLetterOnly: query.deadLetterOnly === 'true',
         cursor: typeof req.query['cursor'] === 'string' ? req.query['cursor'] : undefined,
       });
       res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+router.get(
+  '/delivery-logs/:id',
+  requirePermission('communication.logs.read'),
+  async (req, res, next) => {
+    try {
+      const data = await communicationService.getDeliveryLogDetail(req.params.id);
+      res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+router.post(
+  '/delivery-logs/:id/retry',
+  requirePermission('communication.logs.manage'),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const result = await communicationService.retryDeliveryLogNow(req.params.id, req.user!.id, req);
+      res.json({ success: result.success, data: result, message: result.success ? 'Delivery retried and sent successfully.' : 'Retry attempted; delivery is still failing.' });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+router.post(
+  '/delivery-logs/:id/cancel',
+  requirePermission('communication.logs.manage'),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const data = await communicationService.cancelRetry(req.params.id, req.user!.id, req);
+      res.json({ success: true, data, message: 'Scheduled retry cancelled.' });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+router.post(
+  '/delivery-logs/bulk-retry',
+  requirePermission('communication.logs.manage'),
+  validateBody(bulkIdsSchema),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const data = await communicationService.bulkRetryDeliveryLogs(req.body.ids, req.user!.id, req);
+      res.json({ success: true, data, message: `Retried ${data.retried} of ${data.requested} deliveries (${data.skipped} skipped).` });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+router.post(
+  '/delivery-logs/bulk-cancel',
+  requirePermission('communication.logs.manage'),
+  validateBody(bulkIdsSchema),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const data = await communicationService.bulkCancelRetries(req.body.ids, req.user!.id, req);
+      res.json({ success: true, data, message: `Cancelled ${data.cancelled} of ${data.requested} scheduled retries (${data.skipped} skipped).` });
     } catch (error) {
       next(error);
     }

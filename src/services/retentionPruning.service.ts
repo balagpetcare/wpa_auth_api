@@ -69,7 +69,7 @@ export async function runRetentionPruning(opts?: { dryRun?: boolean; batchSize?:
       model: prisma.adminNotification,
       where: {
         createdAt: { lt: cutoffDate(config.ADMIN_NOTIFICATION_RETENTION_DAYS) },
-        OR: [{ dismissedAt: { not: null } }, { readAt: { not: null } }],
+        OR: [{ archivedAt: { not: null } }, { readAt: { not: null } }],
       },
     },
     {
@@ -83,12 +83,6 @@ export async function runRetentionPruning(opts?: { dryRun?: boolean; batchSize?:
       retentionDays: config.COMMUNICATION_PROVIDER_AUDIT_LOG_RETENTION_DAYS,
       model: prisma.communicationProviderAuditLog,
       where: { createdAt: { lt: cutoffDate(config.COMMUNICATION_PROVIDER_AUDIT_LOG_RETENTION_DAYS) } },
-    },
-    {
-      name: 'EmailSendLog',
-      retentionDays: config.EMAIL_SEND_LOG_RETENTION_DAYS,
-      model: prisma.emailSendLog,
-      where: { createdAt: { lt: cutoffDate(config.EMAIL_SEND_LOG_RETENTION_DAYS) } },
     },
     {
       name: 'LoginSession',

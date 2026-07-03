@@ -11,6 +11,13 @@ const permissionsList = [
   { name: 'users:read', description: 'Read users', resource: 'users', action: 'read' },
   { name: 'users:write', description: 'Write users', resource: 'users', action: 'write' },
   { name: 'users:delete', description: 'Delete users', resource: 'users', action: 'delete' },
+  { name: 'end_users.read', description: 'Read end users', resource: 'end_users', action: 'read' },
+  { name: 'end_users.view_detail', description: 'View end user details', resource: 'end_users', action: 'view_detail' },
+  { name: 'end_users.update_status', description: 'Suspend, activate, block end users', resource: 'end_users', action: 'update_status' },
+  { name: 'end_users.force_logout', description: 'Force logout end user sessions', resource: 'end_users', action: 'force_logout' },
+  { name: 'end_users.send_verification', description: 'Send end user verification messages', resource: 'end_users', action: 'send_verification' },
+  { name: 'end_users.export', description: 'Export filtered end users', resource: 'end_users', action: 'export' },
+  { name: 'end_users.security_view', description: 'View end user security data', resource: 'end_users', action: 'security_view' },
   { name: 'clients:read', description: 'Read clients', resource: 'clients', action: 'read' },
   { name: 'clients:write', description: 'Write clients', resource: 'clients', action: 'write' },
   { name: 'roles:read', description: 'Read roles', resource: 'roles', action: 'read' },
@@ -45,6 +52,7 @@ const permissionsList = [
   { name: 'communication.templates.read', description: 'Read OTP communication templates', resource: 'communication.templates', action: 'read' },
   { name: 'communication.templates.manage', description: 'Manage OTP communication templates', resource: 'communication.templates', action: 'manage' },
   { name: 'communication.logs.read', description: 'Read communication delivery and provider audit logs', resource: 'communication.logs', action: 'read' },
+  { name: 'communication.logs.manage', description: 'Retry, cancel, and manually resend communication deliveries', resource: 'communication.logs', action: 'manage' },
   { name: 'communication.health.read', description: 'Read communication provider health', resource: 'communication.health', action: 'read' },
   { name: 'email_branding.read', description: 'Read email branding settings', resource: 'email_branding', action: 'read' },
   { name: 'email_branding.update', description: 'Update email branding settings', resource: 'email_branding', action: 'update' },
@@ -244,7 +252,8 @@ async function main() {
   }
 
   const seededAdmin = adminEmail ? await prisma.user.findUnique({ where: { email: adminEmail } }) : null;
-  if (seededAdmin) {
+  const runDemoSeeds = process.env.SEED_DEMO_NOTIFICATIONS === 'true' || process.argv.includes('--demo-notifications');
+  if (seededAdmin && runDemoSeeds) {
     const existingWelcomeCount = await prisma.adminNotification.count({
       where: {
         userId: seededAdmin.id,
@@ -270,7 +279,7 @@ async function main() {
             title: 'Profile settings are ready',
             message: 'Review your account profile, security preferences, and avatar settings.',
             severity: 'INFO',
-            category: 'SETTINGS',
+            category: 'SYSTEM',
             actionUrl: '/account',
           },
           {
@@ -278,7 +287,7 @@ async function main() {
             type: 'SECURITY_MONITORING',
             title: 'Security monitoring enabled',
             message: 'Audit logs, sessions, and security events are being tracked for your admin account.',
-            severity: 'SECURITY',
+            severity: 'INFO',
             category: 'SECURITY',
             actionUrl: '/security-events',
           },

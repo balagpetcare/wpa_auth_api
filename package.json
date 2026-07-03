@@ -10,6 +10,7 @@
     "worker:presence": "tsx src/workers/presence.worker.ts",
     "retention:prune": "tsx src/scripts/retentionPrune.ts",
     "credentials:reencrypt": "tsx src/scripts/reencryptProviderCredentials.ts",
+    "smoke:communication-events": "tsx src/scripts/smokeExternalCommunicationEvents.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
