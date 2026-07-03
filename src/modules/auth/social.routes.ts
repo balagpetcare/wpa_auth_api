@@ -1,86 +1,66 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../../middleware/validate.js';
+import { socialStartRateLimit, socialCallbackRateLimit } from '../../middleware/rateLimit.js';
 import * as socialService from './social.service.js';
-import { prisma } from '../../lib/db.js';
-import { socialStartRateLimit, socialCallbackRateLimit, socialMobileRateLimit } from '../../middleware/rateLimit.js';
 
 const router = Router();
 
-// GET /auth/social/providers
-router.get('/providers', async (req, res, next) => {
+router.get('/providers', async (_req, res, next) => {
   try {
-    const settings = await prisma.socialProviderSetting.findMany({
-      where: { enabled: true },
-      orderBy: { displayOrder: 'asc' },
-      select: { provider: true, displayName: true, icon: true },
-    });
-    res.json({ success: true, providers: settings });
+    const providers = await socialService.listPublicProviders();
+    res.json({ success: true, main: providers.main, more: providers.more });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /auth/social/:provider/start
 router.get('/:provider/start', socialStartRateLimit, async (req, res, next) => {
   try {
-    const { provider } = req.params;
-    const clientId = req.query.client_id as string;
-    const redirectUri = req.query.redirect_uri as string;
-
-    if (!clientId || !redirectUri) {
-      res.status(400).json({ success: false, message: 'client_id and redirect_uri are required' });
-      return;
-    }
-
-    const origin = req.headers.origin as string | undefined;
-    const url = await socialService.getSocialStartUrl(provider, clientId, redirectUri, origin);
-    res.json({ success: true, url });
+    const url = await socialService.getStartRedirect(req.params.provider, req);
+    res.redirect(url);
   } catch (err) {
     next(err);
   }
 });
 
-// GET /auth/social/:provider/callback
 router.get('/:provider/callback', socialCallbackRateLimit, async (req, res, next) => {
   try {
-    const { provider } = req.params;
-    const code = req.query.code as string;
-    const state = req.query.state as string;
-    const error = req.query.error as string;
-
-    if (error) {
-      res.status(400).json({ success: false, message: `Provider returned error: ${error}` });
+    const parsed = z.object({ code: z.string().min(1), state: z.string().min(1) }).safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, message: 'Missing code or state.' });
       return;
     }
-
-    if (!code || !state) {
-      res.status(400).json({ success: false, message: 'code and state are required' });
+    const result = await socialService.handleCallback(req.params.provider, parsed.data.code, parsed.data.state, req);
+    if (result.kind === 'EMAIL_REQUIRED') {
+      const completionUrl = new URL(`${req.protocol}://${req.get('host')}/auth/social/complete-email`);
+      completionUrl.searchParams.set('token', result.completionToken);
+      if (req.accepts(['html', 'json']) === 'html') {
+        res.redirect(completionUrl.toString());
+        return;
+      }
+      res.status(409).json({ code: 'SOCIAL_EMAIL_REQUIRED', message: result.message, provider: result.provider, completionToken: result.completionToken });
       return;
     }
-
-    const result = await socialService.handleSocialCallback(provider, code, state, req);
-    if ('url' in result) {
-      res.redirect(result.url as string);
-    } else {
-      res.json(result);
-    }
+    res.json({ success: true, accessToken: result.accessToken, refreshToken: result.refreshToken, expiresIn: result.expiresIn, user: result.user });
   } catch (err) {
     next(err);
   }
 });
 
-// POST /auth/social/:provider/mobile
-router.post('/:provider/mobile', socialMobileRateLimit, validateBody(z.object({
-  token: z.string().min(1),
-  client_id: z.string().min(1),
-})), async (req, res, next) => {
+router.post('/complete-email/request', validateBody(z.object({ completionToken: z.string().min(1), email: z.string().email() })), async (req, res, next) => {
   try {
-    const { provider } = req.params;
-    const { token, client_id } = req.body;
-    
-    const result = await socialService.mobileSocialLogin(provider, token, client_id, req);
-    res.json({ success: true, ...result });
+    const data = await socialService.requestSocialEmailCompletion(req.body.completionToken, req.body.email, req);
+    res.json({ success: true, completionToken: data.completionToken });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/complete-email/confirm', validateBody(z.object({ completionToken: z.string().min(1), email: z.string().email(), code: z.string().min(1) })), async (req, res, next) => {
+  try {
+    const data = await socialService.confirmSocialEmailCompletion(req.body.completionToken, req.body.email, req.body.code, req);
+    res.json({ success: true, message: data.message });
   } catch (err) {
     next(err);
   }

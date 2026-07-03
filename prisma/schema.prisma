@@ -59,6 +59,8 @@ model User {
   securityEvents                 SecurityEvent[]
   clientAccess                   UserClientAccess[]
   roles                          UserRole[]
+  socialProviderConfigsCreated   SocialIdentityProviderConfig[] @relation("SocialIdentityProviderConfigCreatedBy")
+  socialProviderConfigsUpdated   SocialIdentityProviderConfig[] @relation("SocialIdentityProviderConfigUpdatedBy")
 
   @@index([email])
   @@index([phone])
@@ -115,17 +117,32 @@ model AuthClient {
   @@map("auth_clients")
 }
 
-model SocialProviderSetting {
-  id           String        @id @default(cuid())
-  provider     OAuthProvider @unique
-  displayName  String        @map("display_name")
-  icon         String?
-  enabled      Boolean       @default(false)
-  displayOrder Int           @default(0) @map("display_order")
-  createdAt    DateTime      @default(now()) @map("created_at")
-  updatedAt    DateTime      @updatedAt @map("updated_at")
+model SocialIdentityProviderConfig {
+  id                    String                     @id @default(cuid())
+  provider              OAuthProvider              @unique
+  displayName           String                     @map("display_name")
+  clientId              String?                    @map("client_id")
+  clientSecretEncrypted String?                    @map("client_secret_encrypted")
+  authorizationUrl      String                     @map("authorization_url")
+  tokenUrl              String                     @map("token_url")
+  userInfoUrl           String?                    @map("user_info_url")
+  scopes                String[]
+  redirectUri           String                     @map("redirect_uri")
+  status                SocialIdentityProviderStatus @default(INACTIVE)
+  environment           SocialIdentityProviderEnvironment @default(LIVE)
+  placement             SocialIdentityProviderPlacement @default(MAIN)
+  sortOrder             Int                        @default(0) @map("sort_order")
+  showOnLogin           Boolean                    @default(true) @map("show_on_login")
+  createdAt             DateTime                   @default(now()) @map("created_at")
+  updatedAt             DateTime                   @updatedAt @map("updated_at")
+  createdByAdminId      String?                    @map("created_by_admin_id")
+  updatedByAdminId      String?                    @map("updated_by_admin_id")
+  createdByAdmin        User?                      @relation("SocialIdentityProviderConfigCreatedBy", fields: [createdByAdminId], references: [id], onDelete: SetNull)
+  updatedByAdmin        User?                      @relation("SocialIdentityProviderConfigUpdatedBy", fields: [updatedByAdminId], references: [id], onDelete: SetNull)
 
-  @@map("social_provider_settings")
+  @@index([provider])
+  @@index([status, showOnLogin, placement, sortOrder])
+  @@map("social_identity_provider_configs")
 }
 
 model UserClientAccess {
@@ -879,8 +896,28 @@ enum OAuthProvider {
   GOOGLE
   FACEBOOK
   APPLE
-  TWITTER
+  MICROSOFT
+  LINKEDIN
+  TIKTOK
+  X
+  GITHUB
   INSTAGRAM
+}
+
+enum SocialIdentityProviderStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum SocialIdentityProviderEnvironment {
+  SANDBOX
+  LIVE
+}
+
+enum SocialIdentityProviderPlacement {
+  MAIN
+  MORE
+  HIDDEN
 }
 
 enum AuditAction {
@@ -918,6 +955,14 @@ enum AuditAction {
   USER_UPDATED
   PROFILE_AVATAR_UPDATED
   PROFILE_AVATAR_REMOVED
+  SOCIAL_PROVIDER_CREATED
+  SOCIAL_PROVIDER_UPDATED
+  SOCIAL_PROVIDER_DISABLED
+  SOCIAL_PROVIDER_DELETED
+  SOCIAL_PROVIDER_TESTED
+  SOCIAL_LOGIN_EMAIL_REQUIRED
+  SOCIAL_EMAIL_COMPLETION_REQUESTED
+  SOCIAL_EMAIL_COMPLETION_CONFIRMED
   ADMIN_INVITATION_CREATED
   ADMIN_INVITATION_RESENT
   ADMIN_INVITATION_REVOKED

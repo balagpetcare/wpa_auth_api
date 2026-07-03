@@ -1,4 +1,4 @@
-import { PrismaClient, AuthClientType, AuthClientStatus, UserStatus } from '@prisma/client';
+import { PrismaClient, AuthClientType, AuthClientStatus, UserStatus, OAuthProvider, SocialIdentityProviderEnvironment, SocialIdentityProviderPlacement, SocialIdentityProviderStatus } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
@@ -192,6 +192,38 @@ async function main() {
     }
   }
   console.log('Clients seeded.');
+
+  const providerSeed = [
+    { provider: OAuthProvider.GOOGLE, displayName: 'Google', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 1 },
+    { provider: OAuthProvider.FACEBOOK, displayName: 'Facebook', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 2 },
+    { provider: OAuthProvider.APPLE, displayName: 'Apple', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 3 },
+    { provider: OAuthProvider.MICROSOFT, displayName: 'Microsoft', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 4 },
+    { provider: OAuthProvider.LINKEDIN, displayName: 'LinkedIn', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 5 },
+    { provider: OAuthProvider.TIKTOK, displayName: 'TikTok', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 6 },
+    { provider: OAuthProvider.X, displayName: 'X', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 7 },
+    { provider: OAuthProvider.GITHUB, displayName: 'GitHub', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 8 },
+    { provider: OAuthProvider.INSTAGRAM, displayName: 'Instagram', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 9 },
+  ];
+  for (const p of providerSeed) {
+    await prisma.socialIdentityProviderConfig.upsert({
+      where: { provider: p.provider },
+      update: { displayName: p.displayName, placement: p.placement, sortOrder: p.sortOrder, status: SocialIdentityProviderStatus.INACTIVE, environment: SocialIdentityProviderEnvironment.LIVE, showOnLogin: true },
+      create: {
+        provider: p.provider,
+        displayName: p.displayName,
+        authorizationUrl: '',
+        tokenUrl: '',
+        scopes: [],
+        redirectUri: '',
+        status: SocialIdentityProviderStatus.INACTIVE,
+        environment: SocialIdentityProviderEnvironment.LIVE,
+        placement: p.placement,
+        sortOrder: p.sortOrder,
+        showOnLogin: true,
+      },
+    });
+  }
+  console.log('Social provider configs seeded.');
 
   // 4. Initial Super Admin
   const adminEmail = process.env.SEED_ADMIN_EMAIL;

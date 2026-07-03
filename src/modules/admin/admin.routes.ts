@@ -8,6 +8,7 @@ import { validateBody } from '../../middleware/validate.js';
 import { parsePagination, paginatedResponse } from '../../lib/pagination.js';
 import * as adminService from './admin.service.js';
 import * as authService from '../auth/auth.service.js';
+import * as socialService from '../auth/social.service.js';
 import { avatarUpload } from '../../middleware/upload.js';
 import { AppError } from '../../lib/errors.js';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
@@ -722,14 +723,71 @@ router.get('/social-providers', async (_req, res, next) => {
   }
 });
 
-// PATCH /admin/social-providers/:provider
-router.patch('/social-providers/:provider', validateBody(z.object({
-  enabled: z.boolean().optional(),
-  displayOrder: z.number().int().optional(),
-  displayName: z.string().optional(),
-})), async (req, res, next) => {
+router.get('/social-providers/:id', async (req, res, next) => {
   try {
-    const provider = await adminService.updateSocialProvider((req.params.provider as string), req.body);
+    const provider = await adminService.getSocialProviderById(req.params.id);
+    res.json({ success: true, provider });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const socialProviderSchema = z.object({
+  provider: z.nativeEnum(OAuthProvider),
+  displayName: z.string().min(1),
+  clientId: z.string().nullable().optional(),
+  clientSecret: z.string().nullable().optional(),
+  authorizationUrl: z.string().url(),
+  tokenUrl: z.string().url(),
+  userInfoUrl: z.string().url().nullable().optional(),
+  scopes: z.array(z.string()).default([]),
+  redirectUri: z.string().url(),
+  status: z.enum(['ACTIVE', 'INACTIVE']),
+  environment: z.enum(['SANDBOX', 'LIVE']),
+  placement: z.enum(['MAIN', 'MORE', 'HIDDEN']),
+  sortOrder: z.coerce.number().int().default(0),
+  showOnLogin: z.boolean().default(true),
+});
+
+router.post('/social-providers', validateBody(socialProviderSchema), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const provider = await adminService.createSocialProvider(req.body, req.user!.id, req);
+    res.status(201).json({ success: true, provider });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/social-providers/:id', validateBody(socialProviderSchema.partial()), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const provider = await adminService.updateSocialProvider(req.params.id, req.body, req.user!.id, req);
+    res.json({ success: true, provider });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/social-providers/:id/status', validateBody(z.object({ status: z.enum(['ACTIVE', 'INACTIVE']) })), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const provider = await adminService.updateSocialProviderStatus(req.params.id, req.body.status, req.user!.id, req);
+    res.json({ success: true, provider });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/social-providers/:id/test', async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const data = await socialService.testProvider(req.params.id, req.user!.id, req);
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete('/social-providers/:id', async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const provider = await adminService.deleteSocialProvider(req.params.id, req.user!.id, req);
     res.json({ success: true, provider });
   } catch (err) {
     next(err);

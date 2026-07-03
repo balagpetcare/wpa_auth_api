@@ -1,363 +1,161 @@
-import { config } from '../../config/index.js';
+import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import { OAuthProvider, SocialIdentityProviderEnvironment, SocialIdentityProviderPlacement, SocialIdentityProviderStatus, UserStatus } from '@prisma/client';
 import { prisma } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
-import { writeAuditLog, writeSecurityEvent } from '../../lib/audit.js';
-import { Request } from 'express';
-import jwt from 'jsonwebtoken';
-import { OAuthProvider, UserStatus } from '@prisma/client';
-import { signAccessToken, signRefreshToken, hashToken, parseTtlToSeconds, generateOpaqueToken } from '../../lib/tokens.js';
-import crypto from 'crypto';
+import { config } from '../../config/index.js';
+import { decryptCredentialPayload, encryptCredentialPayload } from '../../lib/credentialEncryption.js';
+import { writeAuditLog } from '../../lib/audit.js';
+import { hashToken, parseTtlToSeconds, generateOpaqueToken, signAccessToken, signRefreshToken } from '../../lib/tokens.js';
+import type { Request } from 'express';
+import { appCallbackUrl, buildStateNonce, githubAdapter, instagramAdapter, linkedInAdapter, tiktokAdapter, xAdapter, type NormalizedSocialProfile, type SocialProviderAdapter } from './social-providers/index.js';
 
-interface SocialProfile {
-  id: string;
-  email?: string;
-  emailVerified?: boolean;
-  displayName?: string;
-  avatarUrl?: string;
-}
+type ProviderProfile = NormalizedSocialProfile;
+type SocialCallbackResult =
+  | { kind: 'LOGIN'; accessToken: string; refreshToken: string; expiresIn: number; user: { id: string; email: string | null; displayName: string | null; avatarUrl: string | null; roles: string[] } }
+  | { kind: 'EMAIL_REQUIRED'; provider: OAuthProvider; completionToken: string; message: string };
 
-export function getProviderConfig(provider: string) {
-  const p = provider.toUpperCase();
-  switch (p) {
-    case 'GOOGLE':
-      return {
-        clientId: config.GOOGLE_CLIENT_ID,
-        clientSecret: config.GOOGLE_CLIENT_SECRET,
-        callbackUrl: config.GOOGLE_CALLBACK_URL,
-        authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
-        tokenUrl: 'https://oauth2.googleapis.com/token',
-        profileUrl: 'https://www.googleapis.com/oauth2/v3/userinfo',
-        scopes: 'openid email profile',
-      };
-    case 'FACEBOOK':
-      return {
-        clientId: config.FACEBOOK_CLIENT_ID,
-        clientSecret: config.FACEBOOK_CLIENT_SECRET,
-        callbackUrl: config.FACEBOOK_CALLBACK_URL,
-        authUrl: 'https://www.facebook.com/v13.0/dialog/oauth',
-        tokenUrl: 'https://graph.facebook.com/v13.0/oauth/access_token',
-        profileUrl: 'https://graph.facebook.com/me?fields=id,name,email,picture',
-        scopes: 'email public_profile',
-      };
-    case 'APPLE':
-      return {
-        clientId: config.APPLE_CLIENT_ID,
-        clientSecret: null, // Generated dynamically
-        callbackUrl: config.APPLE_CALLBACK_URL,
-        authUrl: 'https://appleid.apple.com/auth/authorize',
-        tokenUrl: 'https://appleid.apple.com/auth/token',
-        profileUrl: null, // Included in id_token
-        scopes: 'name email',
-      };
-    case 'TWITTER':
-      return {
-        clientId: config.TWITTER_CLIENT_ID,
-        clientSecret: config.TWITTER_CLIENT_SECRET,
-        callbackUrl: config.TWITTER_CALLBACK_URL,
-        authUrl: 'https://twitter.com/i/oauth2/authorize',
-        tokenUrl: 'https://api.twitter.com/2/oauth2/token',
-        profileUrl: 'https://api.twitter.com/2/users/me?user.fields=profile_image_url',
-        scopes: 'tweet.read users.read offline.access',
-      };
-    case 'INSTAGRAM':
-      return {
-        clientId: config.INSTAGRAM_CLIENT_ID,
-        clientSecret: config.INSTAGRAM_CLIENT_SECRET,
-        callbackUrl: config.INSTAGRAM_CALLBACK_URL,
-        authUrl: 'https://api.instagram.com/oauth/authorize',
-        tokenUrl: 'https://api.instagram.com/oauth/access_token',
-        profileUrl: 'https://graph.instagram.com/me?fields=id,username',
-        scopes: 'user_profile user_media',
-      };
-    default:
-      return null;
-  }
-}
+const adapterMap: Record<OAuthProvider, SocialProviderAdapter | undefined> = {
+  GOOGLE: undefined,
+  FACEBOOK: undefined,
+  APPLE: undefined,
+  MICROSOFT: undefined,
+  LINKEDIN: linkedInAdapter,
+  TIKTOK: tiktokAdapter,
+  X: xAdapter,
+  GITHUB: githubAdapter,
+  INSTAGRAM: instagramAdapter,
+};
 
-export function isProviderConfigured(conf: any, provider: string) {
-  if (!conf) return false;
-  if (provider.toUpperCase() === 'APPLE') {
-    return !!(conf.clientId && config.APPLE_TEAM_ID && config.APPLE_KEY_ID && config.APPLE_PRIVATE_KEY && conf.callbackUrl);
-  }
-  return !!(conf.clientId && conf.clientSecret && conf.callbackUrl);
-}
+const DEFAULT_PROVIDER_META: Record<OAuthProvider, { displayName: string; placement: SocialIdentityProviderPlacement; sortOrder: number }> = {
+  GOOGLE: { displayName: 'Google', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 1 },
+  FACEBOOK: { displayName: 'Facebook', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 2 },
+  APPLE: { displayName: 'Apple', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 3 },
+  MICROSOFT: { displayName: 'Microsoft', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 4 },
+  LINKEDIN: { displayName: 'LinkedIn', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 5 },
+  TIKTOK: { displayName: 'TikTok', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 6 },
+  X: { displayName: 'X', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 7 },
+  GITHUB: { displayName: 'GitHub', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 8 },
+  INSTAGRAM: { displayName: 'Instagram', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 9 },
+};
 
-function generateAppleClientSecret() {
-  if (!config.APPLE_PRIVATE_KEY || !config.APPLE_TEAM_ID || !config.APPLE_CLIENT_ID || !config.APPLE_KEY_ID) {
-    throw new AppError('Apple provider misconfigured', 'PROVIDER_MISCONFIGURED', 500);
-  }
-  const privateKey = config.APPLE_PRIVATE_KEY.replace(/\\n/g, '\n');
-  return jwt.sign({}, privateKey, {
-    algorithm: 'ES256',
-    keyid: config.APPLE_KEY_ID,
-    issuer: config.APPLE_TEAM_ID,
-    audience: 'https://appleid.apple.com',
-    subject: config.APPLE_CLIENT_ID,
-    expiresIn: '180d', // max allowed by Apple
-  });
-}
-
-function normalizeProviderName(provider: string): OAuthProvider {
+function normalizeProvider(provider: string): OAuthProvider {
   const upper = provider.toUpperCase();
-  if (Object.values(OAuthProvider).includes(upper as OAuthProvider)) {
-    return upper as OAuthProvider;
-  }
-  throw new AppError('Unsupported provider', 'INVALID_PROVIDER', 400);
+  if (Object.values(OAuthProvider).includes(upper as OAuthProvider)) return upper as OAuthProvider;
+  throw new AppError('Unsupported provider.', 'INVALID_PROVIDER', 400);
 }
 
-export async function checkProviderEnabled(provider: string) {
-  const enumProvider = normalizeProviderName(provider);
-  const setting = await prisma.socialProviderSetting.findUnique({ where: { provider: enumProvider } });
-  if (!setting || !setting.enabled) {
-    throw new AppError(`Provider ${provider} is disabled.`, 'PROVIDER_DISABLED', 403);
-  }
-  return enumProvider;
+function buildDefaultConfig(provider: OAuthProvider) {
+  const meta = DEFAULT_PROVIDER_META[provider];
+  const callbackUrl = appCallbackUrl(provider);
+  const endpoints: Record<OAuthProvider, { authorizationUrl: string; tokenUrl: string; userInfoUrl?: string; scopes: string[] }> = {
+    GOOGLE: { authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth', tokenUrl: 'https://oauth2.googleapis.com/token', userInfoUrl: 'https://www.googleapis.com/oauth2/v3/userinfo', scopes: ['openid', 'email', 'profile'] },
+    FACEBOOK: { authorizationUrl: 'https://www.facebook.com/v19.0/dialog/oauth', tokenUrl: 'https://graph.facebook.com/v19.0/oauth/access_token', userInfoUrl: 'https://graph.facebook.com/me?fields=id,name,email,picture', scopes: ['email', 'public_profile'] },
+    APPLE: { authorizationUrl: 'https://appleid.apple.com/auth/authorize', tokenUrl: 'https://appleid.apple.com/auth/token', scopes: ['name', 'email'] },
+    MICROSOFT: { authorizationUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', tokenUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', userInfoUrl: 'https://graph.microsoft.com/oidc/userinfo', scopes: ['openid', 'email', 'profile', 'offline_access'] },
+    LINKEDIN: { authorizationUrl: 'https://www.linkedin.com/oauth/v2/authorization', tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken', userInfoUrl: 'https://api.linkedin.com/v2/userinfo', scopes: ['openid', 'profile', 'email'] },
+    TIKTOK: { authorizationUrl: 'https://www.tiktok.com/v2/auth/authorize/', tokenUrl: 'https://open.tiktokapis.com/v2/oauth/token/', userInfoUrl: 'https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name', scopes: ['user.info.basic'] },
+    X: { authorizationUrl: 'https://twitter.com/i/oauth2/authorize', tokenUrl: 'https://api.x.com/2/oauth2/token', userInfoUrl: 'https://api.x.com/2/users/me?user.fields=profile_image_url', scopes: ['tweet.read', 'users.read', 'offline.access'] },
+    GITHUB: { authorizationUrl: 'https://github.com/login/oauth/authorize', tokenUrl: 'https://github.com/login/oauth/access_token', userInfoUrl: 'https://api.github.com/user', scopes: ['read:user', 'user:email'] },
+    INSTAGRAM: { authorizationUrl: 'https://api.instagram.com/oauth/authorize', tokenUrl: 'https://api.instagram.com/oauth/access_token', userInfoUrl: 'https://graph.instagram.com/me?fields=id,username', scopes: ['user_profile'] },
+  };
+  return {
+    provider,
+    displayName: meta.displayName,
+    clientId: null,
+    clientSecretEncrypted: null,
+    redirectUri: callbackUrl,
+    environment: SocialIdentityProviderEnvironment.LIVE,
+    placement: meta.placement,
+    sortOrder: meta.sortOrder,
+    showOnLogin: true,
+    status: SocialIdentityProviderStatus.INACTIVE,
+    ...endpoints[provider],
+  };
 }
 
-export async function getSocialStartUrl(provider: string, clientId: string, redirectUri: string, origin?: string) {
-  await checkProviderEnabled(provider);
-  const conf = getProviderConfig(provider);
-  if (!conf || !isProviderConfigured(conf, provider)) {
-    throw new AppError('Provider is not configured properly.', 'PROVIDER_MISCONFIGURED', 500);
-  }
-
-  // Validate the client
-  const client = await prisma.authClient.findUnique({ where: { clientId } });
-  if (!client || client.status !== 'ACTIVE') {
-    throw new AppError('Invalid client.', 'INVALID_CLIENT', 400);
-  }
-  if (!client.redirectUris.includes(redirectUri)) {
-    throw new AppError('Invalid redirect URI.', 'INVALID_REDIRECT_URI', 400);
-  }
-  if (origin && !client.allowedOrigins.includes(origin) && !client.allowedOrigins.includes('*')) {
-    throw new AppError('Invalid origin.', 'INVALID_ORIGIN', 403);
-  }
-
-  // Generate secure state
-  // state holds: clientId, redirectUri, provider, nonce
-  const payload = { clientId, redirectUri, provider, nonce: crypto.randomBytes(16).toString('hex') };
-  const state = jwt.sign(payload, config.JWT_ACCESS_SECRET, { expiresIn: '10m' });
-
-  let url = `${conf.authUrl}?response_type=code&client_id=${conf.clientId}&redirect_uri=${conf.callbackUrl}&scope=${encodeURIComponent(conf.scopes)}&state=${state}`;
-
-  if (provider.toUpperCase() === 'APPLE') {
-    url += `&response_mode=form_post`;
-  }
-  if (provider.toUpperCase() === 'TWITTER') {
-    const codeVerifier = crypto.randomBytes(32).toString('base64url');
-    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-    // Store codeVerifier in the state or somewhere else? State is signed by us, so we can store it in the state!
-    const pkcePayload = { ...payload, codeVerifier };
-    const pkceState = jwt.sign(pkcePayload, config.JWT_ACCESS_SECRET, { expiresIn: '10m' });
-    url = `${conf.authUrl}?response_type=code&client_id=${conf.clientId}&redirect_uri=${conf.callbackUrl}&scope=${encodeURIComponent(conf.scopes)}&state=${pkceState}&code_challenge=${codeChallenge}&code_challenge_method=S256`;
-  }
-
-  return url;
+async function getConfig(provider: OAuthProvider) {
+  const existing = await prisma.socialIdentityProviderConfig.findUnique({ where: { provider } });
+  if (existing) return existing;
+  return prisma.socialIdentityProviderConfig.create({ data: buildDefaultConfig(provider) });
 }
 
-export async function handleSocialCallback(provider: string, code: string, state: string, req: Request) {
-  const enumProvider = await checkProviderEnabled(provider);
-  const conf = getProviderConfig(provider);
-  if (!conf || !isProviderConfigured(conf, provider)) {
-    throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 500);
-  }
-
-  let payload: any;
-  try {
-    payload = jwt.verify(state, config.JWT_ACCESS_SECRET);
-  } catch (err) {
-    await writeSecurityEvent({
-      type: 'SUSPICIOUS_OAUTH',
-      severity: 'HIGH',
-      metadata: { reason: 'invalid_social_state' },
-      req,
-    });
-    throw new AppError('Invalid or expired state.', 'INVALID_STATE', 400);
-  }
-
-  if (payload.provider !== provider) {
-    throw new AppError('State provider mismatch.', 'INVALID_STATE', 400);
-  }
-
-  const { clientId, redirectUri, codeVerifier } = payload;
-  const client = await prisma.authClient.findUnique({ where: { clientId } });
-  if (!client) throw new AppError('Invalid client in state.', 'INVALID_CLIENT', 400);
-
-  // Exchange code
-  const tokenParams = new URLSearchParams();
-  tokenParams.append('grant_type', 'authorization_code');
-  tokenParams.append('code', code);
-  tokenParams.append('redirect_uri', conf.callbackUrl!);
-  tokenParams.append('client_id', conf.clientId!);
-
-  if (provider.toUpperCase() === 'APPLE') {
-    tokenParams.append('client_secret', generateAppleClientSecret());
-  } else if (conf.clientSecret) {
-    tokenParams.append('client_secret', conf.clientSecret);
-  }
-
-  if (codeVerifier) {
-    tokenParams.append('code_verifier', codeVerifier);
-  }
-
-  let tokenRes: any;
-  try {
-    const res = await fetch(conf.tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-      body: tokenParams.toString(),
-    });
-    tokenRes = await res.json() as any;
-    if (!res.ok) {
-      console.error(`Provider token error [${provider}]:`, tokenRes);
-      throw new Error('Token exchange failed');
-    }
-  } catch (e: any) {
-    throw new AppError(`Failed to exchange code with provider: ${e.message}`, 'PROVIDER_ERROR', 502);
-  }
-
-  let profile: SocialProfile;
-
-  if (provider.toUpperCase() === 'APPLE') {
-    // Apple sends id_token containing profile info
-    const decoded = jwt.decode(tokenRes.id_token) as any;
-    profile = {
-      id: decoded.sub,
-      email: decoded.email,
-      emailVerified: decoded.email_verified === 'true' || decoded.email_verified === true,
-    };
-    // Note: Apple only sends 'user' JSON object containing name on the FIRST authorization.
-    // If it's missing, we don't have the name.
-  } else {
-    // Fetch profile
-    try {
-      const res = await fetch(conf.profileUrl!, {
-        headers: { 'Authorization': `Bearer ${tokenRes.access_token}` },
-      });
-      const profileData = await res.json();
-      if (!res.ok) throw new Error('Profile fetch failed');
-      
-      profile = normalizeProfile(provider, profileData);
-    } catch (e: any) {
-      throw new AppError(`Failed to fetch profile: ${e.message}`, 'PROVIDER_ERROR', 502);
-    }
-  }
-
-  return loginOrCreateSocialUser({
-    provider: enumProvider,
-    profile,
-    clientId: client.id,
-    req,
-    rawProfile: tokenRes,
-    clientRedirectUri: redirectUri,
-  });
+function decryptSecret(secret: string) {
+  return decryptCredentialPayload(JSON.parse(secret)) as { clientSecret?: string };
 }
 
-export async function mobileSocialLogin(provider: string, token: string, clientId: string, req: Request) {
-  const enumProvider = await checkProviderEnabled(provider);
-  const client = await prisma.authClient.findUnique({ where: { clientId } });
-  if (!client) throw new AppError('Invalid client.', 'INVALID_CLIENT', 400);
-
-  // Verification differs by provider. For brevity, simulating provider token verification.
-  // In production, you would call tokeninfo or use provider SDK to verify `token`.
-  // For Google: fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`)
-  // For Apple: verify JWT signature against Apple JWKS
-  
-  let profile: SocialProfile;
-  if (enumProvider === 'GOOGLE') {
-    const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`);
-    const data = await res.json() as any;
-    if (!res.ok) throw new AppError('Invalid Google token', 'INVALID_TOKEN', 401);
-    profile = {
-      id: data.sub,
-      email: data.email,
-      emailVerified: data.email_verified === 'true',
-      displayName: data.name,
-      avatarUrl: data.picture,
-    };
-  } else if (enumProvider === 'APPLE') {
-    // Basic decode for demonstration. Should verify signature!
-    const data = jwt.decode(token) as any;
-    profile = {
-      id: data.sub,
-      email: data.email,
-      emailVerified: true,
-    };
-  } else {
-    throw new AppError(`Mobile login for ${provider} not fully implemented in this demo`, 'NOT_IMPLEMENTED', 501);
-  }
-
-  const result = await loginOrCreateSocialUser({
-    provider: enumProvider,
-    profile,
-    clientId: client.id,
-    req,
-    rawProfile: profile,
-    clientRedirectUri: null, // mobile doesn't need redirect
-  });
-
-  return result;
+function getAdapter(provider: OAuthProvider) {
+  return adapterMap[provider];
 }
 
-function normalizeProfile(provider: string, data: any): SocialProfile {
-  const p = provider.toUpperCase();
-  if (p === 'GOOGLE') {
-    return {
-      id: data.sub,
-      email: data.email,
-      emailVerified: data.email_verified,
-      displayName: data.name,
-      avatarUrl: data.picture,
-    };
-  } else if (p === 'FACEBOOK') {
-    return {
-      id: data.id,
-      email: data.email,
-      emailVerified: true, // Facebook verifies emails
-      displayName: data.name,
-      avatarUrl: data.picture?.data?.url,
-    };
-  } else if (p === 'TWITTER') {
-    return {
-      id: data.data.id,
-      displayName: data.data.name,
-      avatarUrl: data.data.profile_image_url,
-    };
-  } else if (p === 'INSTAGRAM') {
-    return {
-      id: data.id,
-      displayName: data.username,
-    };
-  }
-  return { id: data.id };
+function asString(value: unknown) {
+  return typeof value === 'string' ? value : undefined;
 }
 
-async function loginOrCreateSocialUser(opts: {
-  provider: OAuthProvider;
-  profile: SocialProfile;
-  clientId: string;
-  req: Request;
-  rawProfile: any;
-  clientRedirectUri: string | null;
-}) {
-  const { provider, profile, clientId, req } = opts;
+function asBool(value: unknown) {
+  return value === true || value === 'true';
+}
 
-  // 1. Check if OAuth account exists
-  let oauthAcc = await prisma.oAuthAccount.findUnique({
-    where: { provider_providerAccountId: { provider, providerAccountId: profile.id } },
-    include: { user: true },
-  });
+function asRecord(value: unknown) {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
 
-  let user = oauthAcc?.user;
+function sanitizeProfile(profile: ProviderProfile) {
+  return {
+    provider: profile.provider,
+    providerUserId: profile.providerUserId,
+    email: profile.email ? '[redacted]' : undefined,
+    emailVerified: profile.emailVerified,
+    displayName: profile.displayName,
+    username: profile.username,
+    hasAvatar: Boolean(profile.avatarUrl),
+  };
+}
 
-  // 2. If not, check if user with same verified email exists
+function signSocialEmailCompletionToken(data: { provider: OAuthProvider; providerUserId: string; redirectContext?: Record<string, string | undefined>; email?: string; code?: string }) {
+  return jwt.sign(
+    { ...data, purpose: 'SOCIAL_EMAIL_COMPLETION' },
+    config.JWT_ACCESS_SECRET,
+    { expiresIn: '15m' },
+  );
+}
+
+async function resolveProfile(provider: OAuthProvider, accessToken: string, row: Awaited<ReturnType<typeof getConfig>>) {
+  const adapter = getAdapter(provider);
+  if (adapter) {
+    const raw = await adapter.fetchProfile(row, accessToken);
+    return adapter.normalizeProfile(raw);
+  }
+  if (!row.userInfoUrl) {
+    throw new AppError(`Provider ${provider} needs a userInfoUrl before sign-in can work.`, 'PROVIDER_MISCONFIGURED', 400);
+  }
+  const res = await fetch(row.userInfoUrl, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' } });
+  const data = asRecord(await res.json());
+  if (!res.ok) throw new AppError(`Failed to load ${provider} profile.`, 'PROVIDER_ERROR', 502);
+  if (provider === 'GOOGLE' || provider === 'MICROSOFT' || provider === 'APPLE') return { provider, providerUserId: String(data.sub ?? data.id ?? ''), email: asString(data.email), emailVerified: asBool(data.email_verified), displayName: asString(data.name), avatarUrl: asString(data.picture), rawProfile: data };
+  if (provider === 'FACEBOOK') return { provider, providerUserId: String(data.id ?? ''), email: asString(data.email), emailVerified: Boolean(data.email), displayName: asString(data.name), avatarUrl: asString((data.picture as Record<string, unknown> | undefined)?.['data']), rawProfile: data };
+  return { provider, providerUserId: String(data.id ?? data.sub ?? ''), email: asString(data.email), displayName: asString(data.name) ?? asString(data.username), avatarUrl: asString(data.avatar_url), rawProfile: data };
+}
+
+async function loginOrLink(provider: OAuthProvider, profile: ProviderProfile, clientId: string, req: Request, redirectContext?: Record<string, string | undefined>): Promise<SocialCallbackResult> {
+  if (!profile.providerUserId) throw new AppError('Provider returned an invalid profile.', 'PROVIDER_ERROR', 502);
+  const existingAccount = await prisma.oAuthAccount.findUnique({ where: { provider_providerAccountId: { provider, providerAccountId: profile.providerUserId } }, include: { user: true } });
+  let user = existingAccount?.user;
   if (!user && profile.email && profile.emailVerified) {
-    user = await prisma.user.findFirst({
-      where: { email: profile.email, emailVerifiedAt: { not: null } },
-    }) ?? undefined;
+    user = await prisma.user.findFirst({ where: { email: profile.email, emailVerifiedAt: { not: null } } }) ?? undefined;
   }
-
-  // 3. If no user, create one
+  if (!user && !profile.email) {
+    return {
+      kind: 'EMAIL_REQUIRED',
+      provider,
+      completionToken: signSocialEmailCompletionToken({
+        provider,
+        providerUserId: profile.providerUserId,
+        redirectContext,
+      }),
+      message: 'This provider did not return an email address. Please add an email to continue.',
+    };
+  }
   if (!user) {
     user = await prisma.user.create({
       data: {
@@ -366,88 +164,183 @@ async function loginOrCreateSocialUser(opts: {
         avatarUrl: profile.avatarUrl,
         emailVerifiedAt: profile.emailVerified ? new Date() : null,
         status: UserStatus.ACTIVE,
+        registrationSource: `social:${provider}`,
       },
     });
-    // Assign default role
-    const defaultRole = await prisma.role.findFirst({ where: { name: { in: ['user', 'USER'] } } });
-    if (defaultRole) {
-      await prisma.userRole.create({ data: { userId: user.id, roleId: defaultRole.id } });
-    }
+    const defaultRole = await prisma.role.findFirst({ where: { name: { in: ['USER', 'user'] } } });
+    if (defaultRole) await prisma.userRole.create({ data: { userId: user.id, roleId: defaultRole.id } });
   }
-
-  // 4. Create OAuth account if it didn't exist
-  if (!oauthAcc) {
-    await prisma.oAuthAccount.create({
-      data: {
-        userId: user.id,
-        provider,
-        providerAccountId: profile.id,
-        rawProfile: opts.rawProfile,
-      },
-    });
-    await writeAuditLog({ userId: user.id, action: 'OAUTH_LINKED', metadata: { provider }, req });
+  if (!existingAccount) {
+    await prisma.oAuthAccount.create({ data: { userId: user.id, provider, providerAccountId: profile.providerUserId, rawProfile: sanitizeProfile(profile) } });
   }
-
-  // 5. Generate tokens
   const rolesRows = await prisma.userRole.findMany({ where: { userId: user.id }, include: { role: true } });
   const roles = rolesRows.map((r) => r.role.name);
   const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
   const refreshToken = signRefreshToken(user.id);
-  const tokenHash = hashToken(refreshToken);
+  await prisma.loginSession.create({ data: { userId: user.id, clientId, sessionToken: generateOpaqueToken(), expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000), ipAddress: req.ip ?? req.socket.remoteAddress, userAgent: req.headers['user-agent'] } });
+  await prisma.refreshToken.create({ data: { userId: user.id, clientId, tokenHash: hashToken(refreshToken), scopes: ['openid', 'offline_access'], expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000), ipAddress: req.ip ?? req.socket.remoteAddress, userAgent: req.headers['user-agent'], familyId: user.id } });
+  await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+  await writeAuditLog({ userId: user.id, clientId, action: 'LOGIN', metadata: { method: 'social', provider }, req });
+  return { kind: 'LOGIN', accessToken, refreshToken, expiresIn: parseTtlToSeconds(config.ACCESS_TOKEN_TTL), user: { id: user.id, email: user.email, displayName: user.displayName, avatarUrl: user.avatarUrl, roles } };
+}
 
-  const session = await prisma.loginSession.create({
-    data: {
-      userId: user.id,
-      clientId,
-      sessionToken: generateOpaqueToken(),
-      expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
-      ipAddress: req.ip ?? req.socket.remoteAddress,
-      userAgent: req.headers['user-agent'],
-    },
-  });
-
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      clientId,
-      tokenHash,
-      scopes: ['openid', 'offline_access'],
-      expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
-      ipAddress: req.ip ?? req.socket.remoteAddress,
-      userAgent: req.headers['user-agent'],
-      familyId: session.id,
-    },
-  });
-
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { lastLoginAt: new Date() },
-  });
-
-  await writeAuditLog({ userId: user.id, clientId, action: 'LOGIN', metadata: { success: true, method: 'social', provider }, req });
-
-  // Safe user obj
-  const safeUser = {
-    id: user.id,
-    email: user.email,
-    displayName: user.displayName,
-    avatarUrl: user.avatarUrl,
-    roles,
-  };
-
-  if (opts.clientRedirectUri) {
-    const params = new URLSearchParams({
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      expires_in: parseTtlToSeconds(config.ACCESS_TOKEN_TTL).toString(),
-    });
-    return { url: `${opts.clientRedirectUri}?${params.toString()}` };
+export async function listPublicProviders() {
+  const rows = await prisma.socialIdentityProviderConfig.findMany({ where: { status: SocialIdentityProviderStatus.ACTIVE, showOnLogin: true }, orderBy: [{ placement: 'asc' }, { sortOrder: 'asc' }, { displayName: 'asc' }] });
+  const grouped = { main: [] as Array<Record<string, unknown>>, more: [] as Array<Record<string, unknown>> };
+  for (const row of rows) {
+    const item = { id: row.id, provider: row.provider, displayName: row.displayName, placement: row.placement, icon: row.provider.toLowerCase(), startUrl: `/api/v1/auth/social/${row.provider.toLowerCase()}/start` };
+    if (row.placement === 'MAIN') grouped.main.push(item);
+    if (row.placement === 'MORE') grouped.more.push(item);
   }
+  return grouped;
+}
 
-  return {
-    accessToken,
-    refreshToken,
-    expiresIn: parseTtlToSeconds(config.ACCESS_TOKEN_TTL),
-    user: safeUser,
+export async function getStartRedirect(providerStr: string, req: Request) {
+  const provider = normalizeProvider(providerStr);
+  const row = await getConfig(provider);
+  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', 'PROVIDER_DISABLED', 403);
+  if (!row.clientId) throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 400);
+  const adapter = getAdapter(provider);
+  const nonce = buildStateNonce();
+  const codeVerifier = adapter?.requiresPkce ? crypto.randomBytes(32).toString('base64url') : undefined;
+  const codeChallenge = codeVerifier ? crypto.createHash('sha256').update(codeVerifier).digest('base64url') : undefined;
+  const redirectContext = {
+    next: typeof req.query.next === 'string' ? req.query.next : undefined,
+    client_id: typeof req.query.client_id === 'string' ? req.query.client_id : undefined,
+    redirect_uri: typeof req.query.redirect_uri === 'string' ? req.query.redirect_uri : undefined,
+    scope: typeof req.query.scope === 'string' ? req.query.scope : undefined,
+    state: typeof req.query.state === 'string' ? req.query.state : undefined,
+    response_type: typeof req.query.response_type === 'string' ? req.query.response_type : undefined,
+    code_challenge: typeof req.query.code_challenge === 'string' ? req.query.code_challenge : undefined,
+    code_challenge_method: typeof req.query.code_challenge_method === 'string' ? req.query.code_challenge_method : undefined,
   };
+  const state = jwt.sign({ provider, nonce, redirectContext, codeVerifier }, config.JWT_ACCESS_SECRET, { expiresIn: '10m' });
+  if (adapter) {
+    const authUrl = adapter.buildAuthorizationUrl(row, state, redirectContext);
+    if (codeChallenge) {
+      const u = new URL(authUrl);
+      u.searchParams.set('code_challenge', codeChallenge);
+      u.searchParams.set('code_challenge_method', 'S256');
+      return u.toString();
+    }
+    return authUrl;
+  }
+  return row.provider === 'APPLE'
+    ? `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state, response_mode: 'form_post' }).toString()}`
+    : row.provider === 'GITHUB'
+      ? `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state, allow_signup: 'true' }).toString()}`
+      : `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state }).toString()}`;
+}
+
+export async function handleCallback(providerStr: string, code: string, state: string, req: Request): Promise<SocialCallbackResult> {
+  const provider = normalizeProvider(providerStr);
+  let payload: { provider?: OAuthProvider; codeVerifier?: string; redirectContext?: Record<string, string | undefined> };
+  try { payload = jwt.verify(state, config.JWT_ACCESS_SECRET) as { provider?: OAuthProvider; codeVerifier?: string; redirectContext?: Record<string, string | undefined> }; } catch { throw new AppError('Invalid or expired state.', 'INVALID_STATE', 400); }
+  if (payload.provider !== provider) throw new AppError('State provider mismatch.', 'INVALID_STATE', 400);
+  const row = await getConfig(provider);
+  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', 'PROVIDER_DISABLED', 403);
+  if (!row.clientId || !row.clientSecretEncrypted) throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 400);
+  const secret = decryptSecret(row.clientSecretEncrypted as string).clientSecret;
+  if (!secret) throw new AppError('Provider is missing client secret configuration.', 'PROVIDER_MISCONFIGURED', 400);
+  const adapter = getAdapter(provider);
+  let accessToken = '';
+  if (adapter) {
+    accessToken = await adapter.exchangeCodeForToken(row, code, { redirectUri: row.redirectUri, clientId: row.clientId!, clientSecret: secret, codeVerifier: payload.codeVerifier });
+  } else {
+    const tokenParams = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: row.redirectUri, client_id: row.clientId! });
+    tokenParams.set('client_secret', secret);
+    const tokenRes = await fetch(row.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }, body: tokenParams.toString() });
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenRes.ok) throw new AppError('Token exchange failed.', 'PROVIDER_ERROR', 502);
+    accessToken = tokenData.access_token ?? '';
+  }
+  if (!accessToken) throw new AppError('Token exchange failed.', 'PROVIDER_ERROR', 502);
+  const profile = await resolveProfile(provider, accessToken, row);
+  return loginOrLink(provider, profile, 'social', req, payload.redirectContext);
+}
+
+export async function requestSocialEmailCompletion(completionToken: string, email: string, req: Request) {
+  let payload: any;
+  try {
+    payload = jwt.verify(completionToken, config.JWT_ACCESS_SECRET) as any;
+  } catch {
+    throw new AppError('Completion token is invalid or has expired.', 'SOCIAL_EMAIL_REQUIRED', 400);
+  }
+  if (payload.purpose !== 'SOCIAL_EMAIL_COMPLETION') throw new AppError('Completion token is invalid or has expired.', 'SOCIAL_EMAIL_REQUIRED', 400);
+  await writeAuditLog({ action: 'SOCIAL_EMAIL_COMPLETION_REQUESTED' as any, metadata: { provider: payload.provider, emailDomain: email.split('@')[1] ?? null }, req });
+  return { completionToken: signSocialEmailCompletionToken({ provider: payload.provider, providerUserId: payload.providerUserId, redirectContext: payload.redirectContext, email, code: crypto.randomBytes(3).toString('hex') }) };
+}
+
+export async function confirmSocialEmailCompletion(completionToken: string, email: string, code: string, req: Request) {
+  let payload: any;
+  try {
+    payload = jwt.verify(completionToken, config.JWT_ACCESS_SECRET) as any;
+  } catch {
+    throw new AppError('Completion token is invalid or has expired.', 'SOCIAL_EMAIL_REQUIRED', 400);
+  }
+  if (payload.purpose !== 'SOCIAL_EMAIL_COMPLETION') throw new AppError('Completion token is invalid or has expired.', 'SOCIAL_EMAIL_REQUIRED', 400);
+  if (payload.email !== email || payload.code !== code) throw new AppError('Verification code is invalid.', 'SOCIAL_EMAIL_REQUIRED', 400);
+  await writeAuditLog({ action: 'SOCIAL_EMAIL_COMPLETION_CONFIRMED' as any, metadata: { provider: payload.provider, emailDomain: email.split('@')[1] ?? null }, req });
+  return { success: true, message: 'Email completion verified.' };
+}
+
+export async function upsertProviderConfig(data: {
+  provider: OAuthProvider;
+  displayName: string;
+  clientId?: string | null;
+  clientSecret?: string | null;
+  authorizationUrl: string;
+  tokenUrl: string;
+  userInfoUrl?: string | null;
+  scopes: string[];
+  redirectUri: string;
+  status: SocialIdentityProviderStatus;
+  environment: SocialIdentityProviderEnvironment;
+  placement: SocialIdentityProviderPlacement;
+  sortOrder: number;
+  showOnLogin: boolean;
+  actorId?: string;
+}) {
+  const { actorId, clientSecret, ...rest } = data;
+  const encrypted = data.clientSecret ? JSON.stringify(encryptCredentialPayload({ clientSecret: data.clientSecret })) : undefined;
+  return prisma.socialIdentityProviderConfig.upsert({
+    where: { provider: data.provider },
+    create: { ...rest, clientSecretEncrypted: encrypted, createdByAdminId: actorId, updatedByAdminId: actorId },
+    update: { ...rest, clientSecretEncrypted: encrypted ?? undefined, updatedByAdminId: actorId },
+  });
+}
+
+export async function setProviderStatus(id: string, status: SocialIdentityProviderStatus, actorId?: string) {
+  return prisma.socialIdentityProviderConfig.update({ where: { id }, data: { status, updatedByAdminId: actorId } });
+}
+
+export async function deleteProvider(id: string) {
+  return prisma.socialIdentityProviderConfig.delete({ where: { id } });
+}
+
+export async function testProvider(id: string, actorId?: string, req?: Request) {
+  const row = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
+  if (!row) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  const adapter = getAdapter(row.provider);
+  const validations = {
+    hasClientId: Boolean(row.clientId),
+    hasSecret: Boolean(row.clientSecretEncrypted),
+    hasRedirectUri: Boolean(row.redirectUri),
+    hasScopes: Array.isArray(row.scopes) && row.scopes.length > 0,
+    hasAuthorizationUrl: Boolean(row.authorizationUrl),
+    hasTokenUrl: Boolean(row.tokenUrl),
+    hasUserInfoUrl: Boolean(row.userInfoUrl),
+    hasAdapter: Boolean(adapter || ['GOOGLE', 'FACEBOOK', 'APPLE', 'MICROSOFT'].includes(row.provider)),
+  };
+  if (!validations.hasClientId || !validations.hasRedirectUri || !validations.hasScopes || !validations.hasAuthorizationUrl || !validations.hasTokenUrl || !validations.hasAdapter) {
+    throw new AppError('Provider configuration is incomplete.', 'PROVIDER_MISCONFIGURED', 400);
+  }
+  if ((row.provider !== 'GOOGLE' && row.provider !== 'FACEBOOK' && row.provider !== 'APPLE' && row.provider !== 'MICROSOFT') && !validations.hasUserInfoUrl) {
+    throw new AppError('Provider user info URL is missing.', 'PROVIDER_MISCONFIGURED', 400);
+  }
+  if (!validations.hasSecret) {
+    throw new AppError('Provider secret is not configured.', 'PROVIDER_MISCONFIGURED', 400);
+  }
+  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_TESTED', resource: 'social_provider', resourceId: id, req, metadata: { provider: row.provider } });
+  return { configured: true, status: row.status, provider: row.provider, validations };
 }

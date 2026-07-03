@@ -1144,53 +1144,42 @@ async function guardLastSuperAdmin(targetUserId: string, message: string) {
 
 // ─── Social Providers ────────────────────────────────────────────────────────
 
-import { isProviderConfigured, getProviderConfig } from '../auth/social.service.js';
-
 export async function listSocialProviders() {
-  const providers = Object.values(OAuthProvider);
-  for (const provider of providers) {
-    const existing = await prisma.socialProviderSetting.findUnique({ where: { provider } });
-    if (!existing) {
-      let displayName = provider.charAt(0).toUpperCase() + provider.slice(1).toLowerCase();
-      if (provider === 'TWITTER') displayName = 'Twitter / X';
-      await prisma.socialProviderSetting.create({
-        data: { provider, displayName, enabled: false, displayOrder: providers.indexOf(provider) },
-      });
-    }
-  }
-
-  const settings = await prisma.socialProviderSetting.findMany({ orderBy: { displayOrder: 'asc' } });
-  
-  return settings.map(s => {
-    const conf = getProviderConfig(s.provider);
-    const configured = isProviderConfigured(conf, s.provider);
-    return {
-      ...s,
-      isConfigured: configured,
-    };
-  });
+  const providers = await prisma.socialIdentityProviderConfig.findMany({ orderBy: [{ placement: 'asc' }, { sortOrder: 'asc' }] });
+  return providers.map((provider) => ({
+    ...provider,
+    configured: Boolean(provider.clientId && provider.clientSecretEncrypted),
+  }));
 }
 
-export async function updateSocialProvider(
-  providerStr: string,
-  data: { enabled?: boolean; displayOrder?: number; displayName?: string }
-) {
-  const provider = providerStr.toUpperCase() as OAuthProvider;
-  if (!Object.values(OAuthProvider).includes(provider)) {
-    throw new AppError('Invalid provider', 'INVALID_PROVIDER', 400);
-  }
+export async function getSocialProviderById(id: string) {
+  const provider = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
+  if (!provider) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  return { ...provider, configured: Boolean(provider.clientId && provider.clientSecretEncrypted) };
+}
 
-  const setting = await prisma.socialProviderSetting.findUnique({ where: { provider } });
-  if (!setting) throw new AppError('Provider setting not found', 'NOT_FOUND', 404);
+export async function createSocialProvider(data: any, actorId?: string, req?: Request) {
+  const created = await prisma.socialIdentityProviderConfig.create({ data: { ...data, createdByAdminId: actorId, updatedByAdminId: actorId } });
+  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_CREATED', resource: 'social_provider', resourceId: created.id, req, metadata: { provider: created.provider } });
+  return created;
+}
 
-  if (data.enabled) {
-    const conf = getProviderConfig(provider);
-    if (!isProviderConfigured(conf, provider)) {
-      throw new AppError(`Cannot enable ${provider} because it is not fully configured in environment variables.`, 'PROVIDER_MISCONFIGURED', 400);
-    }
-  }
+export async function updateSocialProvider(id: string, data: any, actorId?: string, req?: Request) {
+  const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { ...data, updatedByAdminId: actorId } });
+  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_UPDATED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider } });
+  return updated;
+}
 
-  return prisma.socialProviderSetting.update({ where: { provider }, data });
+export async function updateSocialProviderStatus(id: string, status: any, actorId?: string, req?: Request) {
+  const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { status, updatedByAdminId: actorId } });
+  await writeAuditLog({ userId: actorId, action: status === 'ACTIVE' ? 'SOCIAL_PROVIDER_UPDATED' : 'SOCIAL_PROVIDER_DISABLED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider, status } });
+  return updated;
+}
+
+export async function deleteSocialProvider(id: string, actorId?: string, req?: Request) {
+  const provider = await prisma.socialIdentityProviderConfig.delete({ where: { id } });
+  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_DELETED', resource: 'social_provider', resourceId: id, req, metadata: { provider: provider.provider } });
+  return provider;
 }
 
 // ─── Global Sessions ────────────────────────────────────────────────────────

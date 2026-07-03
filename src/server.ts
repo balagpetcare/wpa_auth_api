@@ -10,6 +10,7 @@ import { errorHandler } from './middleware/error.js';
 import { ensureAvatarDirectory, getAvatarDirectory } from './lib/avatarStorage.js';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { incrementMetric, recordRequestLatency, updateHealthStatus } from './lib/metrics.js';
+import { AppError } from './lib/errors.js';
 
 // Initialise Redis before any middleware runs so rate limiting is ready.
 createRedisClient();
@@ -53,7 +54,12 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1 || origin === config.ADMIN_PANEL_ORIGIN) {
       return callback(null, true);
     }
-    return callback(new Error('CORS Policy: Origin not allowed'), false);
+    // A plain Error here previously fell through the global error handler's
+    // catch-all branch and was returned as an opaque 500 "Internal Server
+    // Error", which looks identical to an unrelated server bug from the
+    // client's perspective. Using AppError gives callers a clear, correctly
+    // classified 403 instead.
+    return callback(new AppError('This origin is not allowed to access the API.', 'CORS_ORIGIN_NOT_ALLOWED', 403), false);
   },
   credentials: true,
 }));
