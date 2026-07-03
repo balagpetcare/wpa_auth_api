@@ -156,7 +156,7 @@ async function main() {
           clientSecretHash: hash,
           status: AuthClientStatus.ACTIVE,
           allowedOrigins: process.env.ALLOWED_PUBLIC_ORIGINS ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map(s=>s.trim()) : ['*'],
-          redirectUris: process.env.ALLOWED_PUBLIC_ORIGINS ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map(s=>s.trim() + '/api/auth/callback') : ['http://localhost:3000/api/auth/callback'],
+          redirectUris: process.env.ALLOWED_PUBLIC_ORIGINS ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map(s=>s.trim() + '/api/auth/callback') : ['http://localhost:5011/api/auth/callback', 'http://localhost:5012/api/auth/callback'],
         },
       });
       console.log(`\n======================================================`);

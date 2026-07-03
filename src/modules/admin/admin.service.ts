@@ -1160,25 +1160,48 @@ export async function getSocialProviderById(id: string) {
 
 export async function createSocialProvider(data: any, actorId?: string, req?: Request) {
   const created = await prisma.socialIdentityProviderConfig.create({ data: { ...data, createdByAdminId: actorId, updatedByAdminId: actorId } });
-  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_CREATED', resource: 'social_provider', resourceId: created.id, req, metadata: { provider: created.provider } });
+  try {
+    await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_CREATED', resource: 'social_provider', resourceId: created.id, req, metadata: { provider: created.provider } });
+  } catch (err) {
+    console.error('Failed to write social provider creation audit log:', err);
+  }
   return created;
 }
 
 export async function updateSocialProvider(id: string, data: any, actorId?: string, req?: Request) {
   const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { ...data, updatedByAdminId: actorId } });
-  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_UPDATED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider } });
+  try {
+    await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_UPDATED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider } });
+  } catch (err) {
+    console.error('Failed to write social provider update audit log:', err);
+  }
   return updated;
 }
 
 export async function updateSocialProviderStatus(id: string, status: any, actorId?: string, req?: Request) {
   const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { status, updatedByAdminId: actorId } });
-  await writeAuditLog({ userId: actorId, action: status === 'ACTIVE' ? 'SOCIAL_PROVIDER_UPDATED' : 'SOCIAL_PROVIDER_DISABLED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider, status } });
+  try {
+    await writeAuditLog({
+      userId: actorId,
+      action: 'SOCIAL_PROVIDER_STATUS_CHANGED',
+      resource: 'social_provider',
+      resourceId: id,
+      req,
+      metadata: { provider: updated.provider, status },
+    });
+  } catch (err) {
+    console.error('Failed to write social provider status audit log:', err);
+  }
   return updated;
 }
 
 export async function deleteSocialProvider(id: string, actorId?: string, req?: Request) {
   const provider = await prisma.socialIdentityProviderConfig.delete({ where: { id } });
-  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_DELETED', resource: 'social_provider', resourceId: id, req, metadata: { provider: provider.provider } });
+  try {
+    await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_DELETED', resource: 'social_provider', resourceId: id, req, metadata: { provider: provider.provider } });
+  } catch (err) {
+    console.error('Failed to write social provider delete audit log:', err);
+  }
   return provider;
 }
 

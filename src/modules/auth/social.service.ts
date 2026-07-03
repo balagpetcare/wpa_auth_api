@@ -341,6 +341,10 @@ export async function testProvider(id: string, actorId?: string, req?: Request) 
   if (!validations.hasSecret) {
     throw new AppError('Provider secret is not configured.', 'PROVIDER_MISCONFIGURED', 400);
   }
-  await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_TESTED', resource: 'social_provider', resourceId: id, req, metadata: { provider: row.provider } });
+  try {
+    await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_TESTED', resource: 'social_provider', resourceId: id, req, metadata: { provider: row.provider } });
+  } catch (err) {
+    console.error('Failed to write social provider test audit log:', err);
+  }
   return { configured: true, status: row.status, provider: row.provider, validations };
 }

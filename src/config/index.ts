@@ -21,7 +21,7 @@ const envSchema = z.object({
   ACCESS_TOKEN_TTL: z.string().default('15m'),
   REFRESH_TOKEN_TTL: z.string().default('30d'),
   ADMIN_PANEL_ORIGIN: z.string().url().default('http://localhost:5012'),
-  ALLOWED_PUBLIC_ORIGINS: z.string().default('http://localhost:3000,http://localhost:5012,http://localhost:3002'),
+  ALLOWED_PUBLIC_ORIGINS: z.string().default('http://localhost:5011,http://localhost:5012'),
   // OAuth / OIDC
   OAUTH_ISSUER: z.string().default('http://localhost:5010'),
   // Optional RSA keys for JWKS (PEM, base64-encoded in env). Falls back to HS256 if absent.
