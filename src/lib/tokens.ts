@@ -12,22 +12,32 @@ export interface AccessTokenPayload {
 export function signAccessToken(payload: AccessTokenPayload): string {
   return jwt.sign(payload, config.JWT_ACCESS_SECRET, {
     expiresIn: config.ACCESS_TOKEN_TTL as any,
+    issuer: config.OAUTH_ISSUER,
+    audience: config.ACCESS_TOKEN_AUDIENCE,
   });
 }
 
 export function verifyAccessToken(token: string): AccessTokenPayload {
-  return jwt.verify(token, config.JWT_ACCESS_SECRET) as AccessTokenPayload;
+  return jwt.verify(token, config.JWT_ACCESS_SECRET, {
+    issuer: config.OAUTH_ISSUER,
+    audience: config.ACCESS_TOKEN_AUDIENCE,
+  }) as AccessTokenPayload;
 }
 
 export function signRefreshToken(userId: string): string {
   const jti = randomBytes(16).toString('hex');
   return jwt.sign({ sub: userId, jti }, config.JWT_REFRESH_SECRET, {
     expiresIn: config.REFRESH_TOKEN_TTL as any,
+    issuer: config.OAUTH_ISSUER,
+    audience: config.ACCESS_TOKEN_AUDIENCE,
   });
 }
 
 export function verifyRefreshToken(token: string): { sub: string } {
-  return jwt.verify(token, config.JWT_REFRESH_SECRET) as { sub: string };
+  return jwt.verify(token, config.JWT_REFRESH_SECRET, {
+    issuer: config.OAUTH_ISSUER,
+    audience: config.ACCESS_TOKEN_AUDIENCE,
+  }) as { sub: string };
 }
 
 // ─── OIDC id_token (RS256) ─────────────────────────────────────────────────

@@ -193,7 +193,9 @@ export async function loginUser(
   const isEmail = identifier.includes('@');
 
   const user = await prisma.user.findFirst({
-    where: isEmail ? { email: identifier } : { OR: [{ username: identifier }, { email: identifier }] },
+    where: isEmail
+      ? { email: identifier }
+      : { OR: [{ username: identifier }, { email: identifier }, { phone: identifier }] },
   });
 
   if (!user || !user.passwordHash) {

@@ -20,6 +20,7 @@ const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(8),
   ACCESS_TOKEN_TTL: z.string().default('15m'),
   REFRESH_TOKEN_TTL: z.string().default('30d'),
+  ACCESS_TOKEN_AUDIENCE: z.string().default('bpa-mobile'),
   ADMIN_PANEL_ORIGIN: z.string().url().default('http://localhost:5012'),
   ALLOWED_PUBLIC_ORIGINS: z.string().default('http://localhost:5011,http://localhost:5012'),
   // OAuth / OIDC
