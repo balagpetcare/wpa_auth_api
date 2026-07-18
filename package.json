@@ -8,17 +8,20 @@
     "dev": "tsx watch src/server.ts",
     "worker:communication": "tsx src/workers/communication.worker.ts",
     "worker:presence": "tsx src/workers/presence.worker.ts",
+    "worker:deletion": "tsx src/workers/deletion.worker.ts",
     "retention:prune": "tsx src/scripts/retentionPrune.ts",
     "credentials:reencrypt": "tsx src/scripts/reencryptProviderCredentials.ts",
     "smoke:communication-events": "tsx src/scripts/smokeExternalCommunicationEvents.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
+    "prisma:validate": "prisma validate",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
     "prisma:seed": "tsx prisma/seed.ts",
-    "seed": "tsx prisma/seed.ts"
+    "seed": "tsx prisma/seed.ts",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
@@ -36,6 +39,7 @@
     "express": "^4.19.2",
     "helmet": "^8.2.0",
     "ioredis": "^5.11.1",
+    "jose": "^6.2.3",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
     "nodemailer": "^9.0.3",

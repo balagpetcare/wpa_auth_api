@@ -5,6 +5,7 @@ import { AppError } from '../../lib/errors.js';
 import { writeAuditLog } from '../../lib/audit.js';
 import { createAdminNotification, sanitizeAdminActionUrl } from '../../lib/adminNotifications.js';
 import { getPublicAvatarUrl, removeAvatarByUrl } from '../../lib/avatarStorage.js';
+import { encryptCredentialPayload } from '../../lib/credentialEncryption.js';
 import { sendEmail } from '../../lib/mailer.js';
 import { sendTemplatedEmailWithFallback } from '../../lib/sendTemplatedEmail.js';
 import { checkCommunicationAbuseLimits } from '../../lib/antiAbuse.js';
@@ -12,6 +13,7 @@ import { PaginationParams } from '../../lib/pagination.js';
 import { CursorPaginationInput, decodeCursor, encodeCursor, parseCursorLimit } from '../../lib/pagination.js';
 import { Request } from 'express';
 import { getPresenceSummary } from '../../lib/presence.js';
+import { computeProviderReadiness } from '../auth/social-readiness.js';
 
 // ─── Shared selects ──────────────────────────────────────────────────────────
 
@@ -1148,37 +1150,116 @@ export async function listSocialProviders() {
   const providers = await prisma.socialIdentityProviderConfig.findMany({ orderBy: [{ placement: 'asc' }, { sortOrder: 'asc' }] });
   return providers.map((provider) => ({
     ...provider,
-    configured: Boolean(provider.clientId && provider.clientSecretEncrypted),
+    clientSecretEncrypted: undefined,
+    secretConfigured: Boolean(provider.clientId && provider.clientSecretEncrypted),
+    readiness: computeProviderReadiness(provider as any),
   }));
 }
 
 export async function getSocialProviderById(id: string) {
   const provider = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
   if (!provider) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
-  return { ...provider, configured: Boolean(provider.clientId && provider.clientSecretEncrypted) };
+  return {
+    ...provider,
+    clientSecretEncrypted: undefined,
+    secretConfigured: Boolean(provider.clientId && provider.clientSecretEncrypted),
+    readiness: computeProviderReadiness(provider as any),
+  };
 }
 
 export async function createSocialProvider(data: any, actorId?: string, req?: Request) {
-  const created = await prisma.socialIdentityProviderConfig.create({ data: { ...data, createdByAdminId: actorId, updatedByAdminId: actorId } });
+  const clientSecret = typeof data.clientSecret === 'string' ? data.clientSecret.trim() : '';
+  const clientSecretEncrypted = clientSecret ? JSON.stringify(encryptCredentialPayload({ clientSecret })) : undefined;
+  const candidate = {
+    provider: data.provider,
+    displayName: data.displayName,
+    clientId: data.clientId ?? null,
+    clientSecretEncrypted,
+    authorizationUrl: data.authorizationUrl,
+    tokenUrl: data.tokenUrl,
+    userInfoUrl: data.userInfoUrl ?? null,
+    scopes: Array.isArray(data.scopes) ? data.scopes : [],
+    redirectUri: data.redirectUri,
+    providerMetadata: data.providerMetadata ?? null,
+    status: data.status,
+    environment: data.environment,
+    placement: data.placement,
+    sortOrder: data.sortOrder ?? 0,
+    showOnLogin: data.showOnLogin ?? true,
+    createdByAdminId: actorId,
+    updatedByAdminId: actorId,
+  };
+  if (candidate.status === 'ACTIVE') {
+    const readiness = computeProviderReadiness(candidate as any);
+    if (!readiness.readyForProduction) {
+      throw new AppError(`Provider cannot be activated until blockers are resolved: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+    }
+  }
+  const created = await prisma.socialIdentityProviderConfig.create({ data: candidate as any });
   try {
     await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_CREATED', resource: 'social_provider', resourceId: created.id, req, metadata: { provider: created.provider } });
   } catch (err) {
     console.error('Failed to write social provider creation audit log:', err);
   }
-  return created;
+  return {
+    ...created,
+    clientSecretEncrypted: undefined,
+    secretConfigured: Boolean(created.clientId && created.clientSecretEncrypted),
+    readiness: computeProviderReadiness(created as any),
+  };
 }
 
 export async function updateSocialProvider(id: string, data: any, actorId?: string, req?: Request) {
-  const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { ...data, updatedByAdminId: actorId } });
+  const existing = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
+  if (!existing) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  const clientSecret = typeof data.clientSecret === 'string' ? data.clientSecret.trim() : '';
+  const candidate = {
+    displayName: data.displayName ?? existing.displayName,
+    clientId: data.clientId !== undefined ? data.clientId : existing.clientId,
+    clientSecretEncrypted: clientSecret ? JSON.stringify(encryptCredentialPayload({ clientSecret })) : existing.clientSecretEncrypted,
+    authorizationUrl: data.authorizationUrl ?? existing.authorizationUrl,
+    tokenUrl: data.tokenUrl ?? existing.tokenUrl,
+    userInfoUrl: data.userInfoUrl !== undefined ? data.userInfoUrl : existing.userInfoUrl,
+    scopes: Array.isArray(data.scopes) ? data.scopes : existing.scopes,
+    redirectUri: data.redirectUri ?? existing.redirectUri,
+    providerMetadata: data.providerMetadata !== undefined ? data.providerMetadata : existing.providerMetadata,
+    status: data.status ?? existing.status,
+    environment: data.environment ?? existing.environment,
+    placement: data.placement ?? existing.placement,
+    sortOrder: data.sortOrder ?? existing.sortOrder,
+    showOnLogin: data.showOnLogin ?? existing.showOnLogin,
+    updatedByAdminId: actorId,
+  };
+  if (candidate.status === 'ACTIVE') {
+    const readiness = computeProviderReadiness(candidate as any);
+    if (!readiness.readyForProduction) {
+      throw new AppError(`Provider cannot be activated until blockers are resolved: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+    }
+  }
+  const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: candidate as any });
   try {
     await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_UPDATED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider } });
   } catch (err) {
     console.error('Failed to write social provider update audit log:', err);
   }
-  return updated;
+  return {
+    ...updated,
+    clientSecretEncrypted: undefined,
+    secretConfigured: Boolean(updated.clientId && updated.clientSecretEncrypted),
+    readiness: computeProviderReadiness(updated as any),
+  };
 }
 
 export async function updateSocialProviderStatus(id: string, status: any, actorId?: string, req?: Request) {
+  const existing = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
+  if (!existing) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  const candidate = { ...existing, status, updatedByAdminId: actorId };
+  if (status === 'ACTIVE') {
+    const readiness = computeProviderReadiness(candidate as any);
+    if (!readiness.readyForProduction) {
+      throw new AppError(`Provider cannot be activated until blockers are resolved: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+    }
+  }
   const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { status, updatedByAdminId: actorId } });
   try {
     await writeAuditLog({
@@ -1192,7 +1273,12 @@ export async function updateSocialProviderStatus(id: string, status: any, actorI
   } catch (err) {
     console.error('Failed to write social provider status audit log:', err);
   }
-  return updated;
+  return {
+    ...updated,
+    clientSecretEncrypted: undefined,
+    secretConfigured: Boolean(updated.clientId && updated.clientSecretEncrypted),
+    readiness: computeProviderReadiness(updated as any),
+  };
 }
 
 export async function deleteSocialProvider(id: string, actorId?: string, req?: Request) {
@@ -1202,7 +1288,12 @@ export async function deleteSocialProvider(id: string, actorId?: string, req?: R
   } catch (err) {
     console.error('Failed to write social provider delete audit log:', err);
   }
-  return provider;
+  return {
+    ...provider,
+    clientSecretEncrypted: undefined,
+    secretConfigured: Boolean(provider.clientId && provider.clientSecretEncrypted),
+    readiness: computeProviderReadiness(provider as any),
+  };
 }
 
 // ─── Global Sessions ────────────────────────────────────────────────────────

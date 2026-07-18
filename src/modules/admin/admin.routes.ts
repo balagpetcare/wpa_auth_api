@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { UserStatus, AuthClientStatus, AuthClientType, OAuthProvider, AdminNotificationCategory, AdminNotificationSeverity } from '@prisma/client';
+import { DeletionRequestSource, DeletionRequestStatus, DeletionRequestType } from '@prisma/client';
 import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
 import { requireAdmin } from '../../middleware/requireRole.js';
 import { requirePermission } from '../../middleware/requirePermission.js';
@@ -8,6 +9,7 @@ import { validateBody } from '../../middleware/validate.js';
 import { parsePagination, paginatedResponse } from '../../lib/pagination.js';
 import * as adminService from './admin.service.js';
 import * as authService from '../auth/auth.service.js';
+import * as deletionService from '../deletion/deletion.service.js';
 import * as socialService from '../auth/social.service.js';
 import { avatarUpload } from '../../middleware/upload.js';
 import { AppError } from '../../lib/errors.js';
@@ -686,6 +688,64 @@ router.get('/security-events', async (req, res, next) => {
   }
 });
 
+// â”€â”€â”€ Deletion Requests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+router.get('/deletion-requests', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
+  try {
+    const query = deletionRequestsQuerySchema.parse(req.query);
+    const data = await deletionService.listDeletionRequests({
+      status: query.status,
+      requestType: query.requestType,
+      provider: query.provider,
+      requestSource: query.requestSource,
+      search: query.search,
+      page: query.page,
+      limit: query.limit,
+    });
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/deletion-requests/:id', requirePermission('users:read', 'admin:read'), async (req, res, next) => {
+  try {
+    const data = await deletionService.getDeletionRequestDetail(req.params.id);
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/deletion-requests/:id', requirePermission('users:manage', 'admin:manage'), validateBody(z.object({
+  action: z.enum(['approve', 'reject', 'retry', 'cancel']),
+  reason: z.string().max(300).optional(),
+})), async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const { action, reason } = req.body;
+    let data;
+    switch (action) {
+      case 'approve':
+        data = await deletionService.approveDeletionRequest(req.params.id, req.user!.id, req);
+        break;
+      case 'reject':
+        data = await deletionService.rejectDeletionRequest(req.params.id, req.user!.id, reason ?? null, req);
+        break;
+      case 'retry':
+        data = await deletionService.retryDeletionRequest(req.params.id, req.user!.id, req);
+        break;
+      case 'cancel':
+        data = await deletionService.cancelDeletionRequestById(req.params.id, req);
+        break;
+      default:
+        throw new AppError('Unsupported deletion action.', 'VALIDATION_ERROR', 400);
+    }
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /admin/dashboard/stats
 router.get('/dashboard/stats', async (_req, res, next) => {
   try {
@@ -742,6 +802,7 @@ const socialProviderSchema = z.object({
   userInfoUrl: z.string().url().nullable().optional(),
   scopes: z.array(z.string()).default([]),
   redirectUri: z.string().url(),
+  providerMetadata: z.record(z.string(), z.unknown()).optional(),
   status: z.enum(['ACTIVE', 'INACTIVE']),
   environment: z.enum(['SANDBOX', 'LIVE']),
   placement: z.enum(['MAIN', 'MORE', 'HIDDEN']),
@@ -943,6 +1004,21 @@ const notificationsQuerySchema = z.object({
   createdTo: z.string().datetime().optional(),
   limit: z.coerce.number().min(1).max(50).optional().default(20),
   cursor: z.string().optional(),
+});
+
+const deletionRequestsQuerySchema = z.object({
+  status: z.union([z.nativeEnum(DeletionRequestStatus), z.literal('ALL')]).optional().default('ALL'),
+  requestType: z.union([z.nativeEnum(DeletionRequestType), z.literal('ALL')]).optional().default('ALL'),
+  provider: z.union([z.nativeEnum(OAuthProvider), z.literal('ALL')]).optional().default('ALL'),
+  requestSource: z.union([z.nativeEnum(DeletionRequestSource), z.literal('ALL')]).optional().default('ALL'),
+  search: z.string().optional(),
+  page: z.coerce.number().min(1).optional().default(1),
+  limit: z.coerce.number().min(1).max(100).optional().default(20),
+});
+
+const deletionRequestActionSchema = z.object({
+  action: z.enum(['approve', 'reject', 'retry', 'cancel']),
+  reason: z.string().max(300).optional(),
 });
 
 router.get('/notifications', async (req: AuthenticatedRequest, res, next) => {

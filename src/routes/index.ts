@@ -5,6 +5,7 @@ import adminRoutes, { adminAuthRouter } from '../modules/admin/admin.routes.js';
 import communicationRoutes from '../modules/communication/communication.routes.js';
 import emailRoutes from '../modules/email/email.routes.js';
 import oauthRoutes from '../modules/oauth/oauth.routes.js';
+import deletionRoutes from '../modules/deletion/deletion.routes.js';
 import { config } from '../config/index.js';
 // NOTE (Phase 1 audit fix, see docs/wpa-central-auth-api-complete-audit.md):
 // src/modules/clients/clients.routes.ts, src/modules/roles/roles.routes.ts, and
@@ -21,10 +22,20 @@ import { config } from '../config/index.js';
 
 const router = Router();
 
+export function resolveExternalCommunicationRoutesModulePath(
+  currentModuleUrl: string = import.meta.url,
+  nodeEnv: string | undefined = process.env.NODE_ENV,
+) {
+  const normalizedUrl = currentModuleUrl.replace(/\\/g, '/');
+  const isDistRuntime = normalizedUrl.includes('/dist/');
+  if (isDistRuntime || nodeEnv === 'production') {
+    return '../modules/communication/events.routes.js';
+  }
+  return '../modules/communication/events.routes.ts';
+}
+
 const externalCommunicationRoutes = (
-  await import(process.env.NODE_ENV === 'production'
-    ? '../modules/communication/events.routes.js'
-    : '../modules/communication/events.routes.ts')
+  await import(resolveExternalCommunicationRoutesModulePath())
 ).default;
 
 function buildOpenIdConfiguration(baseUrl: string) {
@@ -62,6 +73,7 @@ router.use('/users', usersRoutes);
 router.use('/admin/auth', adminAuthRouter);
 router.use('/communication', externalCommunicationRoutes);
 router.use('/admin/communication', communicationRoutes);
+router.use('/deletion', deletionRoutes);
 router.use('/admin', emailRoutes);
 // All other /admin/* routes require authGuard + admin role (enforced inside adminRoutes)
 router.use('/admin', adminRoutes);

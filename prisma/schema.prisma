@@ -57,10 +57,11 @@ model User {
   passwordResetTokens            PasswordResetToken[]
   refreshTokens                  RefreshToken[]
   securityEvents                 SecurityEvent[]
+  deletionRequests               DeletionRequest[]
   clientAccess                   UserClientAccess[]
   roles                          UserRole[]
-  socialProviderConfigsCreated   SocialIdentityProviderConfig[] @relation("SocialIdentityProviderConfigCreatedBy")
-  socialProviderConfigsUpdated   SocialIdentityProviderConfig[] @relation("SocialIdentityProviderConfigUpdatedBy")
+  socialProviderConfigsCreated   SocialIdentityProviderConfig[]  @relation("SocialIdentityProviderConfigCreatedBy")
+  socialProviderConfigsUpdated   SocialIdentityProviderConfig[]  @relation("SocialIdentityProviderConfigUpdatedBy")
 
   @@index([email])
   @@index([phone])
@@ -87,29 +88,51 @@ model User {
 }
 
 model AuthClient {
-  id                 String                     @id @default(cuid())
-  name               String
-  slug               String                     @unique
-  type               AuthClientType
-  clientId           String                     @unique @map("client_id")
-  clientSecretHash   String?                    @map("client_secret_hash")
-  allowedOrigins     String[]                   @map("allowed_origins")
-  redirectUris       String[]                   @map("redirect_uris")
-  allowedScopes      String[]                   @map("allowed_scopes")
-  status             AuthClientStatus           @default(ACTIVE)
-  createdAt          DateTime                   @default(now()) @map("created_at")
-  updatedAt          DateTime                   @updatedAt @map("updated_at")
-  apiKeys            ApiKey[]
-  auditLogs          AuditLog[]
-  authorizationCodes AuthorizationCode[]
-  emailBranding      ClientBranding?
-  emailTemplates     EmailTemplate[]
-  externalEvents     ExternalCommunicationEvent[]
-  loginSessions      LoginSession[]
-  refreshTokens      RefreshToken[]
-  serviceTokens      ServiceAccessToken[]
-  userAccess         UserClientAccess[]
-  routingRules       CommunicationRoutingRule[]
+  id                     String                       @id @default(cuid())
+  name                   String
+  slug                   String                       @unique
+  type                   AuthClientType
+  clientId               String                       @unique @map("client_id")
+  clientSecretHash       String?                      @map("client_secret_hash")
+  allowedOrigins         String[]                     @map("allowed_origins")
+  redirectUris           String[]                     @map("redirect_uris")
+  allowedScopes          String[]                     @map("allowed_scopes")
+  status                 AuthClientStatus             @default(ACTIVE)
+  // Additive: per-client identity foundation (Furtail centralized-auth onboarding).
+  // Nullable/defaulted so existing clients (e.g. BPA) are completely unaffected:
+  // null audience means "fall back to the global ACCESS_TOKEN_AUDIENCE", an
+  // empty allowedAuthMethods array means "all methods allowed" (current
+  // behavior for every pre-existing client), and null TTL overrides mean
+  // "use the global ACCESS_TOKEN_TTL/REFRESH_TOKEN_TTL".
+  audience               String?                      @unique @map("audience")
+  allowedAuthMethods     String[]                     @default([]) @map("allowed_auth_methods")
+  accessTokenTtlSeconds  Int?                         @map("access_token_ttl_seconds")
+  refreshTokenTtlSeconds Int?                         @map("refresh_token_ttl_seconds")
+  // Additive: per-client "required for a usable profile" fields (e.g.
+  // ["phone","displayName"]). Used by the bootstrap endpoint and by the
+  // social/OIDC login "needs profile completion" response shape — a
+  // first-time social/OIDC login missing any of these fields gets a
+  // NEEDS_PROFILE_COMPLETION response instead of a full session. Empty
+  // array (the default for every existing client, incl. BPA) means no
+  // extra requirement beyond what already existed.
+  requiredProfileFields  String[]                     @default([]) @map("required_profile_fields")
+  // Additive: whether self-registration (password/email/phone/social
+  // first-time signup) is open for this client. Defaults to true so
+  // existing clients (BPA) keep working unchanged.
+  registrationOpen       Boolean                      @default(true) @map("registration_open")
+  createdAt              DateTime                     @default(now()) @map("created_at")
+  updatedAt              DateTime                     @updatedAt @map("updated_at")
+  apiKeys                ApiKey[]
+  auditLogs              AuditLog[]
+  authorizationCodes     AuthorizationCode[]
+  emailBranding          ClientBranding?
+  emailTemplates         EmailTemplate[]
+  externalEvents         ExternalCommunicationEvent[]
+  loginSessions          LoginSession[]
+  refreshTokens          RefreshToken[]
+  serviceTokens          ServiceAccessToken[]
+  userAccess             UserClientAccess[]
+  routingRules           CommunicationRoutingRule[]
 
   @@index([clientId])
   @@index([slug])
@@ -118,27 +141,32 @@ model AuthClient {
 }
 
 model SocialIdentityProviderConfig {
-  id                    String                     @id @default(cuid())
-  provider              OAuthProvider              @unique
-  displayName           String                     @map("display_name")
-  clientId              String?                    @map("client_id")
-  clientSecretEncrypted String?                    @map("client_secret_encrypted")
-  authorizationUrl      String                     @map("authorization_url")
-  tokenUrl              String                     @map("token_url")
-  userInfoUrl           String?                    @map("user_info_url")
+  id                    String                            @id @default(cuid())
+  provider              OAuthProvider                     @unique
+  displayName           String                            @map("display_name")
+  clientId              String?                           @map("client_id")
+  clientSecretEncrypted String?                           @map("client_secret_encrypted")
+  authorizationUrl      String                            @map("authorization_url")
+  tokenUrl              String                            @map("token_url")
+  userInfoUrl           String?                           @map("user_info_url")
   scopes                String[]
-  redirectUri           String                     @map("redirect_uri")
-  status                SocialIdentityProviderStatus @default(INACTIVE)
+  redirectUri           String                            @map("redirect_uri")
+  providerMetadata      Json?                             @map("provider_metadata")
+  status                SocialIdentityProviderStatus      @default(INACTIVE)
   environment           SocialIdentityProviderEnvironment @default(LIVE)
-  placement             SocialIdentityProviderPlacement @default(MAIN)
-  sortOrder             Int                        @default(0) @map("sort_order")
-  showOnLogin           Boolean                    @default(true) @map("show_on_login")
-  createdAt             DateTime                   @default(now()) @map("created_at")
-  updatedAt             DateTime                   @updatedAt @map("updated_at")
-  createdByAdminId      String?                    @map("created_by_admin_id")
-  updatedByAdminId      String?                    @map("updated_by_admin_id")
-  createdByAdmin        User?                      @relation("SocialIdentityProviderConfigCreatedBy", fields: [createdByAdminId], references: [id], onDelete: SetNull)
-  updatedByAdmin        User?                      @relation("SocialIdentityProviderConfigUpdatedBy", fields: [updatedByAdminId], references: [id], onDelete: SetNull)
+  placement             SocialIdentityProviderPlacement   @default(MAIN)
+  sortOrder             Int                               @default(0) @map("sort_order")
+  showOnLogin           Boolean                           @default(true) @map("show_on_login")
+  lastTestAt            DateTime?                         @map("last_test_at")
+  lastSuccessfulTestAt  DateTime?                         @map("last_successful_test_at")
+  lastTestStatus        String?                           @map("last_test_status")
+  lastTestError         String?                           @map("last_test_error")
+  createdAt             DateTime                          @default(now()) @map("created_at")
+  updatedAt             DateTime                          @updatedAt @map("updated_at")
+  createdByAdminId      String?                           @map("created_by_admin_id")
+  updatedByAdminId      String?                           @map("updated_by_admin_id")
+  createdByAdmin        User?                             @relation("SocialIdentityProviderConfigCreatedBy", fields: [createdByAdminId], references: [id], onDelete: SetNull)
+  updatedByAdmin        User?                             @relation("SocialIdentityProviderConfigUpdatedBy", fields: [updatedByAdminId], references: [id], onDelete: SetNull)
 
   @@index([provider])
   @@index([status, showOnLogin, placement, sortOrder])
@@ -234,11 +262,18 @@ model RefreshToken {
   reusedAt          DateTime? @map("reused_at")
   revocationReason  String?   @map("revocation_reason")
 
+  // Additive: Furtail centralized-auth identity foundation. Optional
+  // client-supplied device identifier/metadata (platform, model, app
+  // version, etc.) — nullable, so existing rows/clients are unaffected.
+  deviceId   String? @map("device_id")
+  deviceInfo Json?   @map("device_info")
+
   @@index([userId])
   @@index([clientId])
   @@index([tokenHash])
   @@index([expiresAt])
   @@index([familyId])
+  @@index([deviceId])
   @@map("refresh_tokens")
 }
 
@@ -260,15 +295,24 @@ model LoginSession {
   // Additive fields for Phase 3.2
   revocationReason String? @map("revocation_reason")
 
+  // Additive: Furtail centralized-auth identity foundation (see RefreshToken).
+  deviceId   String? @map("device_id")
+  deviceInfo Json?   @map("device_info")
+
   @@index([userId])
   @@index([clientId])
   @@index([sessionToken])
   @@index([expiresAt])
   @@index([userId, createdAt, id])
   @@index([clientId, createdAt, id])
+  @@index([deviceId])
   @@map("login_sessions")
 }
 
+// Normalized external identity: one row per (provider, providerAccountId)
+// linked to exactly one Central Auth User (userId). Multiple rows may point
+// at the same userId, which is how one Central Auth account accumulates
+// several linked social identities (Google + Facebook + Apple, etc.).
 model OAuthAccount {
   id                String        @id @default(cuid())
   userId            String        @map("user_id")
@@ -282,10 +326,28 @@ model OAuthAccount {
   updatedAt         DateTime      @updatedAt @map("updated_at")
   user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // Additive: normalized identity fields (Furtail centralized-auth
+  // identity foundation). All nullable — existing rows are unaffected.
+  // - email/emailVerifiedAt, phone/phoneVerifiedAt: the verified contact
+  //   info the provider vouched for at link time (used only to prevent
+  //   silent duplicate-account merges; never to merge on their own if
+  //   unverified — see social.service.ts loginOrLink()).
+  // - lastLoginAt: updated every time this specific linked identity is
+  //   used to sign in (distinct from User.lastLoginAt, which reflects the
+  //   most recent login via ANY method).
+  // createdAt above already serves as "linked date" for this identity.
+  email           String?   @map("email")
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  phone           String?   @map("phone")
+  phoneVerifiedAt DateTime? @map("phone_verified_at")
+  lastLoginAt     DateTime? @map("last_login_at")
+
   @@unique([provider, providerAccountId])
   @@index([userId])
   @@index([provider])
   @@index([provider, providerAccountId])
+  @@index([email])
+  @@index([phone])
   @@map("oauth_accounts")
 }
 
@@ -318,6 +380,58 @@ model EmailVerificationToken {
   @@index([tokenHash])
   @@index([expiresAt])
   @@map("email_verification_tokens")
+}
+
+model DeletionRequest {
+  id                    String                 @id @default(cuid())
+  confirmationCode      String                 @unique @map("confirmation_code")
+  requestType           DeletionRequestType    @map("request_type")
+  status                DeletionRequestStatus   @default(PENDING_REVIEW)
+  provider              OAuthProvider?
+  requestSource         DeletionRequestSource  @map("request_source")
+  userId                String?                @map("user_id")
+  emailHash             String?                @map("email_hash")
+  emailReference        String?                @map("email_reference")
+  requestedAt           DateTime               @default(now()) @map("requested_at")
+  gracePeriodDeadlineAt DateTime?              @map("grace_period_deadline_at")
+  processedAt           DateTime?              @map("processed_at")
+  cancelledAt           DateTime?              @map("cancelled_at")
+  cancelledByUserId     String?                @map("cancelled_by_user_id")
+  cancelledByAdminId    String?                @map("cancelled_by_admin_id")
+  reviewedAt            DateTime?              @map("reviewed_at")
+  reviewedByAdminId     String?                @map("reviewed_by_admin_id")
+  failureReason         String?                @map("failure_reason")
+  auditMetadata         Json?                  @map("audit_metadata")
+  sourceIp              String?                @map("source_ip")
+  sourceUserAgent       String?                @map("source_user_agent")
+  metaPayload           Json?                  @map("meta_payload")
+  createdAt             DateTime               @default(now()) @map("created_at")
+  updatedAt             DateTime               @updatedAt @map("updated_at")
+  user                  User?                  @relation(fields: [userId], references: [id], onDelete: SetNull)
+  events                DeletionRequestEvent[]
+
+  @@index([status, requestedAt])
+  @@index([requestType, status, requestedAt])
+  @@index([provider, requestedAt])
+  @@index([userId, requestedAt])
+  @@index([confirmationCode])
+  @@map("deletion_requests")
+}
+
+model DeletionRequestEvent {
+  id                 String                @id @default(cuid())
+  deletionRequestId   String               @map("deletion_request_id")
+  eventType           DeletionRequestEventType @map("event_type")
+  actorSource         String               @default("SYSTEM") @map("actor_source")
+  actorUserId         String?              @map("actor_user_id")
+  actorAdminId        String?              @map("actor_admin_id")
+  metadata            Json?
+  createdAt           DateTime             @default(now()) @map("created_at")
+  request             DeletionRequest      @relation(fields: [deletionRequestId], references: [id], onDelete: Cascade)
+
+  @@index([deletionRequestId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("deletion_request_events")
 }
 
 model ApiKey {
@@ -711,24 +825,24 @@ model CommunicationProviderAuditLog {
 }
 
 model ExternalCommunicationEvent {
-  id             String          @id @default(cuid())
-  clientId       String          @map("client_id")
+  id             String     @id @default(cuid())
+  clientId       String     @map("client_id")
   event          String
-  idempotencyKey String          @map("idempotency_key")
+  idempotencyKey String     @map("idempotency_key")
   channels       String[]
-  recipientPhone String?         @map("recipient_phone")
-  recipientEmail String?         @map("recipient_email")
-  recipientName  String?         @map("recipient_name")
+  recipientPhone String?    @map("recipient_phone")
+  recipientEmail String?    @map("recipient_email")
+  recipientName  String?    @map("recipient_name")
   locale         String?
-  payloadJson    Json            @map("payload_json")
-  status         String          @default("ACCEPTED")
-  resultJson     Json?           @map("result_json")
-  requestId      String?         @map("request_id")
-  sourceIp       String?         @map("source_ip")
-  processedAt    DateTime?       @map("processed_at")
-  createdAt      DateTime        @default(now()) @map("created_at")
-  updatedAt      DateTime        @updatedAt @map("updated_at")
-  client         AuthClient      @relation(fields: [clientId], references: [id])
+  payloadJson    Json       @map("payload_json")
+  status         String     @default("ACCEPTED")
+  resultJson     Json?      @map("result_json")
+  requestId      String?    @map("request_id")
+  sourceIp       String?    @map("source_ip")
+  processedAt    DateTime?  @map("processed_at")
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
+  client         AuthClient @relation(fields: [clientId], references: [id])
 
   @@unique([clientId, event, idempotencyKey], map: "external_comm_events_client_event_idempotency_key_idx")
   @@index([clientId, createdAt], map: "external_comm_events_client_created_idx")
@@ -902,6 +1016,72 @@ enum OAuthProvider {
   X
   GITHUB
   INSTAGRAM
+  // Additive: a per-organization Enterprise OIDC/SAML identity provider
+  // (see EnterpriseIdentityProvider). One OAuthAccount row per (ENTERPRISE,
+  // providerAccountId) still applies the exact same never-merge/never-steal
+  // invariants as every other provider — providerAccountId is namespaced as
+  // "<enterpriseIdentityProviderId>:<subjectFromIdp>" so two different
+  // orgs' IdPs can never collide on the same raw "sub".
+  ENTERPRISE
+}
+
+enum EnterpriseIdentityProtocol {
+  OIDC
+  SAML
+}
+
+// Additive: DB-driven per-organization enterprise identity provider config
+// (Furtail centralized-auth "enterprise organization login", see
+// docs/wpa-central-auth-api-complete-audit.md item #10). Lets an org be
+// onboarded without a code deploy. OIDC is implemented as an id_token
+// verification path (JWKS-based, mirroring google/apple/microsoft
+// adapters) plus authorization-code+PKCE initiation. SAML is modeled here
+// but NOT implemented in this pass — requests against a SAML-protocol row
+// get a PROVIDER_DISABLED/NOT_IMPLEMENTED response, never a faked login.
+// Short-lived, single-use authorization code handed back to a MOBILE app on
+// the social/enterprise system-browser callback, replacing the previous
+// tokens-in-URI-fragment redirect. The session tokens are stored encrypted
+// (AES-256-GCM via credentialEncryption) and released exactly once through
+// POST /auth/mobile/token after PKCE verification. Bound to the requesting
+// AuthClient, the exact redirect URI, and the S256 code challenge.
+model MobileAuthorizationCode {
+  id               String    @id @default(cuid())
+  codeHash         String    @unique @map("code_hash")
+  clientDbId       String    @map("client_db_id")
+  redirectUri      String    @map("redirect_uri")
+  codeChallenge    String    @map("code_challenge")
+  payloadEncrypted String    @map("payload_encrypted")
+  expiresAt        DateTime  @map("expires_at")
+  consumedAt       DateTime? @map("consumed_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  @@index([expiresAt])
+  @@map("mobile_authorization_codes")
+}
+
+model EnterpriseIdentityProvider {
+  id                    String                     @id @default(cuid())
+  orgSlug               String                     @unique @map("org_slug")
+  displayName           String                     @map("display_name")
+  protocol              EnterpriseIdentityProtocol @default(OIDC)
+  enabled               Boolean                    @default(false)
+  // OIDC fields
+  issuer                String?
+  clientId              String?                    @map("client_id")
+  clientSecretEncrypted String?                    @map("client_secret_encrypted")
+  jwksUri               String?                    @map("jwks_uri")
+  authorizationUrl      String?                    @map("authorization_url")
+  tokenUrl              String?                    @map("token_url")
+  redirectUri           String?                    @map("redirect_uri")
+  // SAML fields (modeled, not wired up — see module doc comment above)
+  metadataUrl           String?                    @map("metadata_url")
+  entityId              String?                    @map("entity_id")
+  createdAt             DateTime                   @default(now()) @map("created_at")
+  updatedAt             DateTime                   @updatedAt @map("updated_at")
+
+  @@index([orgSlug])
+  @@index([enabled, protocol])
+  @@map("enterprise_identity_providers")
 }
 
 enum SocialIdentityProviderStatus {
@@ -951,6 +1131,20 @@ enum AuditAction {
   USER_STATUS_CHANGED
   USER_PASSWORD_RESET_TRIGGERED
   USER_ACCOUNT_DELETED
+  ACCOUNT_DELETION_REQUESTED
+  ACCOUNT_DELETION_CANCELLED
+  ACCOUNT_DELETION_APPROVED
+  ACCOUNT_DELETION_REJECTED
+  ACCOUNT_DELETION_PROCESSING_STARTED
+  ACCOUNT_DELETION_PROCESSING_COMPLETED
+  ACCOUNT_DELETION_PROCESSING_FAILED
+  DATA_DELETION_REQUESTED
+  DATA_DELETION_CANCELLED
+  DATA_DELETION_APPROVED
+  DATA_DELETION_REJECTED
+  DATA_DELETION_PROCESSING_STARTED
+  DATA_DELETION_PROCESSING_COMPLETED
+  DATA_DELETION_PROCESSING_FAILED
   USER_SESSIONS_REVOKED
   USER_UPDATED
   PROFILE_AVATAR_UPDATED
@@ -1098,4 +1292,41 @@ enum InvitationStatus {
   ACCEPTED
   EXPIRED
   REVOKED
+}
+
+enum DeletionRequestType {
+  ACCOUNT
+  DATA
+}
+
+enum DeletionRequestStatus {
+  PENDING_REVIEW
+  SCHEDULED
+  PROCESSING
+  COMPLETED
+  CANCELLED
+  REJECTED
+  FAILED
+}
+
+enum DeletionRequestSource {
+  AUTHENTICATED_WEB
+  PUBLIC_WEB
+  EMAIL_REQUEST
+  META_CALLBACK
+  ADMIN
+}
+
+enum DeletionRequestEventType {
+  REQUEST_CREATED
+  STATUS_CHANGED
+  APPROVED
+  REJECTED
+  CANCELLED
+  PROCESSING_STARTED
+  PROCESSING_COMPLETED
+  PROCESSING_FAILED
+  ANONYMIZED
+  SOCIAL_IDENTITY_DISCONNECTED
+  SESSION_REVOKED
 }

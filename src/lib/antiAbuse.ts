@@ -57,6 +57,7 @@ export type CommunicationAbuseLimitInput = {
   providerId?: string | null;
   context?: CommunicationAbuseContext;
   bodyLength?: number;
+  templateKey?: string;
 };
 
 export type CommunicationAbuseDecision =
@@ -257,12 +258,17 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
   const ipHash = ip ? hashAbuseValue(ip) : null;
   const scopedIpRecipientKey = ipHash ? communicationBlockKey('recipient-ip', `${recipientHash}:${ipHash}`) : null;
 
+  const isSecurityAlert = input.templateKey === 'login_alert' || input.templateKey === 'security_alert';
+  const blockMessage = isSecurityAlert 
+    ? 'Communication blocked (security alert suppressed).' 
+    : 'Please wait before requesting another code.';
+
   try {
     if (await redis.exists(communicationBlockKey('recipient', recipientHash))) {
       return {
         allowed: false,
         code: 'COMMUNICATION_BLOCKED',
-        message: 'Please wait before requesting another code.',
+        message: blockMessage,
         limitName: 'recipient_block',
       };
     }
@@ -270,7 +276,7 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
       return {
         allowed: false,
         code: 'COMMUNICATION_BLOCKED',
-        message: 'Please wait before requesting another code.',
+        message: blockMessage,
         limitName: 'ip_recipient_block',
       };
     }
@@ -295,33 +301,45 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
     return { allowed: true };
   }
 
-  const windows: Array<{ key: string; ttlMs: number; limit: number; limitName: string; message: string }> = [
-    {
-      key: communicationCounterKey(`${input.channel}:${input.purpose}:recipient:${recipientHash}:15m`),
+  let windows: Array<{ key: string; ttlMs: number; limit: number; limitName: string; message: string }> = [];
+  
+  if (isSecurityAlert) {
+    windows.push({
+      key: communicationCounterKey(`${input.channel}:security_alert:recipient:${recipientHash}:15m`),
       ttlMs: 15 * 60 * 1000,
-      limit: COMMUNICATION_RECIPIENT_15M_LIMIT,
-      limitName: 'recipient_15m',
-      message: 'Please wait before requesting another code.',
-    },
-    {
-      key: communicationCounterKey(`${input.channel}:${input.purpose}:recipient:${recipientHash}:1h`),
-      ttlMs: 60 * 60 * 1000,
-      limit: input.channel === 'SMS'
-        ? config.COMMUNICATION_MAX_SMS_PER_PHONE_PER_HOUR
-        : config.COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_HOUR,
-      limitName: 'recipient_1h',
-      message: 'Please wait before requesting another code.',
-    },
-    {
-      key: communicationCounterKey(`${input.channel}:${input.purpose}:recipient:${recipientHash}:1d`),
-      ttlMs: 24 * 60 * 60 * 1000,
-      limit: input.channel === 'SMS'
-        ? config.COMMUNICATION_MAX_SMS_PER_PHONE_PER_DAY
-        : config.COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_DAY,
-      limitName: 'recipient_1d',
-      message: 'Please wait before requesting another code.',
-    },
-  ];
+      limit: 3,
+      limitName: 'security_alert_15m',
+      message: 'Security alert suppressed to prevent spam.',
+    });
+  } else {
+    windows = [
+      {
+        key: communicationCounterKey(`${input.channel}:${input.purpose}:recipient:${recipientHash}:15m`),
+        ttlMs: 15 * 60 * 1000,
+        limit: COMMUNICATION_RECIPIENT_15M_LIMIT,
+        limitName: 'recipient_15m',
+        message: 'Please wait before requesting another code.',
+      },
+      {
+        key: communicationCounterKey(`${input.channel}:${input.purpose}:recipient:${recipientHash}:1h`),
+        ttlMs: 60 * 60 * 1000,
+        limit: input.channel === 'SMS'
+          ? config.COMMUNICATION_MAX_SMS_PER_PHONE_PER_HOUR
+          : config.COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_HOUR,
+        limitName: 'recipient_1h',
+        message: 'Please wait before requesting another code.',
+      },
+      {
+        key: communicationCounterKey(`${input.channel}:${input.purpose}:recipient:${recipientHash}:1d`),
+        ttlMs: 24 * 60 * 60 * 1000,
+        limit: input.channel === 'SMS'
+          ? config.COMMUNICATION_MAX_SMS_PER_PHONE_PER_DAY
+          : config.COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_DAY,
+        limitName: 'recipient_1d',
+        message: 'Please wait before requesting another code.',
+      },
+    ];
+  }
 
   if (ipHash) {
     windows.push({
@@ -329,14 +347,14 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
       ttlMs: 60 * 60 * 1000,
       limit: COMMUNICATION_IP_HOURLY_LIMIT,
       limitName: 'ip_1h',
-      message: 'Please wait before requesting another code.',
+      message: blockMessage,
     });
     windows.push({
       key: communicationCounterKey(`${input.channel}:${input.purpose}:pair:${ipHash}:${recipientHash}:15m`),
       ttlMs: 15 * 60 * 1000,
       limit: COMMUNICATION_RECIPIENT_15M_LIMIT,
       limitName: 'ip_recipient_15m',
-      message: 'Please wait before requesting another code.',
+      message: blockMessage,
     });
   }
 
@@ -346,16 +364,20 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
       ttlMs: 60 * 60 * 1000,
       limit: COMMUNICATION_USER_HOURLY_LIMIT,
       limitName: 'user_1h',
-      message: 'Please wait before requesting another code.',
+      message: blockMessage,
     });
     windows.push({
       key: communicationCounterKey(`${input.channel}:user:${userHash}:1d`),
       ttlMs: 24 * 60 * 60 * 1000,
       limit: COMMUNICATION_USER_DAILY_LIMIT,
       limitName: 'user_1d',
-      message: 'Please wait before requesting another code.',
+      message: blockMessage,
     });
   }
+
+  const systemLimitMessage = input.templateKey === 'login_alert' 
+    ? 'System communication limit reached (alerts suppressed).' 
+    : 'Please wait before requesting another code.';
 
   windows.push({
     key: communicationCounterKey(`${input.channel}:system:1h`),
@@ -364,7 +386,7 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
       ? config.COMMUNICATION_SYSTEM_SMS_HOURLY_CAP
       : config.COMMUNICATION_SYSTEM_EMAIL_HOURLY_CAP,
     limitName: 'system_1h',
-    message: 'Please wait before requesting another code.',
+    message: systemLimitMessage,
   });
   windows.push({
     key: communicationCounterKey(`${input.channel}:system:1d`),
@@ -373,7 +395,7 @@ export async function checkCommunicationAbuseLimits(input: CommunicationAbuseLim
       ? config.COMMUNICATION_SYSTEM_SMS_DAILY_CAP
       : config.COMMUNICATION_SYSTEM_EMAIL_DAILY_CAP,
     limitName: 'system_1d',
-    message: 'Please wait before requesting another code.',
+    message: systemLimitMessage,
   });
 
   if (input.context === 'provider_test') {

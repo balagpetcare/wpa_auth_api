@@ -2,18 +2,21 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { OAuthProvider, SocialIdentityProviderEnvironment, SocialIdentityProviderPlacement, SocialIdentityProviderStatus, UserStatus } from '@prisma/client';
 import { prisma } from '../../lib/db.js';
-import { AppError } from '../../lib/errors.js';
+import { AppError, ErrorCodes } from '../../lib/errors.js';
 import { config } from '../../config/index.js';
 import { decryptCredentialPayload, encryptCredentialPayload } from '../../lib/credentialEncryption.js';
 import { writeAuditLog } from '../../lib/audit.js';
 import { hashToken, parseTtlToSeconds, generateOpaqueToken, signAccessToken, signRefreshToken } from '../../lib/tokens.js';
+import { resolveClient, getOrCreateInternalClientId } from './auth.service.js';
 import type { Request } from 'express';
 import { appCallbackUrl, buildStateNonce, githubAdapter, instagramAdapter, linkedInAdapter, tiktokAdapter, xAdapter, type NormalizedSocialProfile, type SocialProviderAdapter } from './social-providers/index.js';
+import { computeProviderReadiness } from './social-readiness.js';
 
 type ProviderProfile = NormalizedSocialProfile;
 type SocialCallbackResult =
   | { kind: 'LOGIN'; accessToken: string; refreshToken: string; expiresIn: number; user: { id: string; email: string | null; displayName: string | null; avatarUrl: string | null; roles: string[] } }
-  | { kind: 'EMAIL_REQUIRED'; provider: OAuthProvider; completionToken: string; message: string };
+  | { kind: 'EMAIL_REQUIRED'; provider: OAuthProvider; completionToken: string; message: string }
+  | { kind: 'LINKED'; provider: OAuthProvider; userId: string };
 
 const adapterMap: Record<OAuthProvider, SocialProviderAdapter | undefined> = {
   GOOGLE: undefined,
@@ -25,6 +28,11 @@ const adapterMap: Record<OAuthProvider, SocialProviderAdapter | undefined> = {
   X: xAdapter,
   GITHUB: githubAdapter,
   INSTAGRAM: instagramAdapter,
+  // ENTERPRISE is handled entirely by identity-providers/enterprise.ts (a
+  // DB-driven per-org id_token verification path, not this OAuth-code-flow
+  // adapter map) — never routed through the legacy /social/:provider/start
+  // + callback flow.
+  ENTERPRISE: undefined,
 };
 
 const DEFAULT_PROVIDER_META: Record<OAuthProvider, { displayName: string; placement: SocialIdentityProviderPlacement; sortOrder: number }> = {
@@ -37,6 +45,7 @@ const DEFAULT_PROVIDER_META: Record<OAuthProvider, { displayName: string; placem
   X: { displayName: 'X', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 7 },
   GITHUB: { displayName: 'GitHub', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 8 },
   INSTAGRAM: { displayName: 'Instagram', placement: SocialIdentityProviderPlacement.MORE, sortOrder: 9 },
+  ENTERPRISE: { displayName: 'Enterprise SSO', placement: SocialIdentityProviderPlacement.HIDDEN, sortOrder: 10 },
 };
 
 function normalizeProvider(provider: string): OAuthProvider {
@@ -58,6 +67,10 @@ function buildDefaultConfig(provider: OAuthProvider) {
     X: { authorizationUrl: 'https://twitter.com/i/oauth2/authorize', tokenUrl: 'https://api.x.com/2/oauth2/token', userInfoUrl: 'https://api.x.com/2/users/me?user.fields=profile_image_url', scopes: ['tweet.read', 'users.read', 'offline.access'] },
     GITHUB: { authorizationUrl: 'https://github.com/login/oauth/authorize', tokenUrl: 'https://github.com/login/oauth/access_token', userInfoUrl: 'https://api.github.com/user', scopes: ['read:user', 'user:email'] },
     INSTAGRAM: { authorizationUrl: 'https://api.instagram.com/oauth/authorize', tokenUrl: 'https://api.instagram.com/oauth/access_token', userInfoUrl: 'https://graph.instagram.com/me?fields=id,username', scopes: ['user_profile'] },
+    // Never actually used by this legacy OAuth-code-flow map (see
+    // adapterMap above) — present only so this lookup object stays a total
+    // function over OAuthProvider.
+    ENTERPRISE: { authorizationUrl: '', tokenUrl: '', scopes: [] },
   };
   return {
     provider,
@@ -137,12 +150,76 @@ async function resolveProfile(provider: OAuthProvider, accessToken: string, row:
   return { provider, providerUserId: String(data.id ?? data.sub ?? ''), email: asString(data.email), displayName: asString(data.name) ?? asString(data.username), avatarUrl: asString(data.avatar_url), rawProfile: data };
 }
 
-async function loginOrLink(provider: OAuthProvider, profile: ProviderProfile, clientId: string, req: Request, redirectContext?: Record<string, string | undefined>): Promise<SocialCallbackResult> {
-  if (!profile.providerUserId) throw new AppError('Provider returned an invalid profile.', 'PROVIDER_ERROR', 502);
+// Explicit account linking: attach a social identity to an already
+// logged-in user. Never merges silently — an identity already linked to a
+// DIFFERENT user throws IDENTITY_ALREADY_LINKED rather than moving it.
+async function linkIdentityToUser(provider: OAuthProvider, profile: ProviderProfile, userId: string, req: Request): Promise<SocialCallbackResult> {
+  if (!profile.providerUserId) throw new AppError('Provider returned an invalid profile.', ErrorCodes.INVALID_PROVIDER_TOKEN, 502);
+  const existingAccount = await prisma.oAuthAccount.findUnique({ where: { provider_providerAccountId: { provider, providerAccountId: profile.providerUserId } } });
+  if (existingAccount) {
+    if (existingAccount.userId !== userId) {
+      throw new AppError('This account is already linked to a different user.', ErrorCodes.IDENTITY_ALREADY_LINKED, 409);
+    }
+    await prisma.oAuthAccount.update({
+      where: { id: existingAccount.id },
+      data: { lastLoginAt: new Date(), rawProfile: sanitizeProfile(profile) },
+    });
+    return { kind: 'LINKED', provider, userId };
+  }
+  try {
+    await prisma.oAuthAccount.create({
+      data: {
+        userId,
+        provider,
+        providerAccountId: profile.providerUserId,
+        rawProfile: sanitizeProfile(profile),
+        email: profile.email ?? null,
+        emailVerifiedAt: profile.emailVerified ? new Date() : null,
+        lastLoginAt: new Date(),
+      },
+    });
+  } catch (err: any) {
+    // Unique constraint race: the identity got linked to someone else
+    // between the findUnique above and this create.
+    if (err?.code === 'P2002') {
+      throw new AppError('This account is already linked to a different user.', ErrorCodes.IDENTITY_ALREADY_LINKED, 409);
+    }
+    throw err;
+  }
+  await writeAuditLog({ userId, action: 'OAUTH_LINKED', metadata: { provider }, req });
+  return { kind: 'LINKED', provider, userId };
+}
+
+async function loginOrLink(
+  provider: OAuthProvider,
+  profile: ProviderProfile,
+  clientId: string,
+  req: Request,
+  redirectContext?: Record<string, string | undefined>,
+  audience?: string,
+): Promise<SocialCallbackResult> {
+  if (!profile.providerUserId) throw new AppError('Provider returned an invalid profile.', ErrorCodes.INVALID_PROVIDER_TOKEN, 502);
   const existingAccount = await prisma.oAuthAccount.findUnique({ where: { provider_providerAccountId: { provider, providerAccountId: profile.providerUserId } }, include: { user: true } });
   let user = existingAccount?.user;
+
   if (!user && profile.email && profile.emailVerified) {
-    user = await prisma.user.findFirst({ where: { email: profile.email, emailVerifiedAt: { not: null } } }) ?? undefined;
+    const emailMatch = await prisma.user.findFirst({ where: { email: profile.email, emailVerifiedAt: { not: null } } });
+    if (emailMatch) {
+      // Never merge if that account already has a DIFFERENT identity for
+      // this same provider linked (would silently orphan the old one) —
+      // surface as a typed conflict instead of guessing which is correct.
+      const conflictingAccount = await prisma.oAuthAccount.findFirst({
+        where: { userId: emailMatch.id, provider, NOT: { providerAccountId: profile.providerUserId } },
+      });
+      if (conflictingAccount) {
+        throw new AppError(
+          'This email is already associated with a different social account for this provider.',
+          ErrorCodes.ACCOUNT_CONFLICT,
+          409,
+        );
+      }
+      user = emailMatch;
+    }
   }
   if (!user && !profile.email) {
     return {
@@ -171,14 +248,62 @@ async function loginOrLink(provider: OAuthProvider, profile: ProviderProfile, cl
     if (defaultRole) await prisma.userRole.create({ data: { userId: user.id, roleId: defaultRole.id } });
   }
   if (!existingAccount) {
-    await prisma.oAuthAccount.create({ data: { userId: user.id, provider, providerAccountId: profile.providerUserId, rawProfile: sanitizeProfile(profile) } });
+    try {
+      await prisma.oAuthAccount.create({
+        data: {
+          userId: user.id,
+          provider,
+          providerAccountId: profile.providerUserId,
+          rawProfile: sanitizeProfile(profile),
+          email: profile.email ?? null,
+          emailVerifiedAt: profile.emailVerified ? new Date() : null,
+          lastLoginAt: new Date(),
+        },
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        throw new AppError('This social identity is already linked to a different user.', ErrorCodes.IDENTITY_ALREADY_LINKED, 409);
+      }
+      throw err;
+    }
+  } else {
+    await prisma.oAuthAccount.update({
+      where: { id: existingAccount.id },
+      data: { lastLoginAt: new Date(), rawProfile: sanitizeProfile(profile) },
+    });
   }
   const rolesRows = await prisma.userRole.findMany({ where: { userId: user.id }, include: { role: true } });
   const roles = rolesRows.map((r) => r.role.name);
-  const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
-  const refreshToken = signRefreshToken(user.id);
-  await prisma.loginSession.create({ data: { userId: user.id, clientId, sessionToken: generateOpaqueToken(), expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000), ipAddress: req.ip ?? req.socket.remoteAddress, userAgent: req.headers['user-agent'] } });
-  await prisma.refreshToken.create({ data: { userId: user.id, clientId, tokenHash: hashToken(refreshToken), scopes: ['openid', 'offline_access'], expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000), ipAddress: req.ip ?? req.socket.remoteAddress, userAgent: req.headers['user-agent'], familyId: user.id } });
+  const refreshToken = signRefreshToken(user.id, audience);
+  const session = await prisma.loginSession.create({
+    data: {
+      userId: user.id,
+      clientId,
+      sessionToken: generateOpaqueToken(),
+      expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
+      ipAddress: req.ip ?? req.socket.remoteAddress,
+      userAgent: req.headers['user-agent'],
+    },
+  });
+  const accessToken = signAccessToken({
+    sub: user.id,
+    email: user.email,
+    username: user.username,
+    roles,
+    sid: session.id,
+  }, audience);
+  await prisma.refreshToken.create({
+    data: {
+      userId: user.id,
+      clientId,
+      tokenHash: hashToken(refreshToken),
+      scopes: ['openid', 'offline_access'],
+      expiresAt: new Date(Date.now() + parseTtlToSeconds(config.REFRESH_TOKEN_TTL) * 1000),
+      ipAddress: req.ip ?? req.socket.remoteAddress,
+      userAgent: req.headers['user-agent'],
+      familyId: session.id,
+    },
+  });
   await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
   await writeAuditLog({ userId: user.id, clientId, action: 'LOGIN', metadata: { method: 'social', provider }, req });
   return { kind: 'LOGIN', accessToken, refreshToken, expiresIn: parseTtlToSeconds(config.ACCESS_TOKEN_TTL), user: { id: user.id, email: user.email, displayName: user.displayName, avatarUrl: user.avatarUrl, roles } };
@@ -188,17 +313,67 @@ export async function listPublicProviders() {
   const rows = await prisma.socialIdentityProviderConfig.findMany({ where: { status: SocialIdentityProviderStatus.ACTIVE, showOnLogin: true }, orderBy: [{ placement: 'asc' }, { sortOrder: 'asc' }, { displayName: 'asc' }] });
   const grouped = { main: [] as Array<Record<string, unknown>>, more: [] as Array<Record<string, unknown>> };
   for (const row of rows) {
-    const item = { id: row.id, provider: row.provider, displayName: row.displayName, placement: row.placement, icon: row.provider.toLowerCase(), startUrl: `/api/v1/auth/social/${row.provider.toLowerCase()}/start` };
+    const readiness = computeProviderReadiness(row as any);
+    if (!readiness.visibleOnLogin) continue;
+    const item = { id: row.id, provider: row.provider, displayName: row.displayName, placement: row.placement, icon: row.provider.toLowerCase(), startUrl: `/api/v1/auth/social/${row.provider.toLowerCase()}/start`, readiness };
     if (row.placement === 'MAIN') grouped.main.push(item);
     if (row.placement === 'MORE') grouped.more.push(item);
   }
   return grouped;
 }
 
-export async function getStartRedirect(providerStr: string, req: Request) {
+/**
+ * Resolves the mobile-app custom-scheme redirect target for a social
+ * callback, if — and only if — the signed `state` carries a
+ * `redirectContext.redirect_uri` that is (a) a non-http custom scheme and
+ * (b) registered in the requesting AuthClient's `redirectUris` allow-list
+ * (e.g. `furtailapp://oauth-callback`). Returns null in every other case,
+ * in which the callback keeps its existing JSON response behavior (used by
+ * BPA and web callers) unchanged. Never throws.
+ */
+export type MobileRedirectContext = {
+  redirectUri: string;
+  clientDbId: string;
+  /// S256 code challenge the app supplied on /start — required to hand back
+  /// an authorization code; a mobile redirect without one gets a typed
+  /// PKCE_REQUIRED error instead of any credential material.
+  codeChallenge: string | null;
+  /// The app's own opaque state value (echoed back so it can bind the
+  /// callback to the flow it started). Distinct from the server's signed
+  /// state JWT.
+  appState: string | null;
+};
+
+export async function resolveMobileRedirect(state: string): Promise<MobileRedirectContext | null> {
+  try {
+    const payload = jwt.verify(state, config.JWT_ACCESS_SECRET) as {
+      redirectContext?: Record<string, string | undefined>;
+      clientDbId?: string | null;
+    };
+    const target = payload.redirectContext?.redirect_uri;
+    if (!target || !payload.clientDbId) return null;
+    const scheme = target.split(':')[0]?.toLowerCase();
+    if (!scheme || scheme === 'http' || scheme === 'https') return null;
+    const client = await prisma.authClient.findUnique({ where: { id: payload.clientDbId } });
+    if (!client || client.status !== 'ACTIVE') return null;
+    if (!client.redirectUris.includes(target)) return null;
+    return {
+      redirectUri: target,
+      clientDbId: client.id,
+      codeChallenge: payload.redirectContext?.code_challenge || null,
+      appState: payload.redirectContext?.state || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function getStartRedirect(providerStr: string, req: Request, opts?: { linkUserId?: string }) {
   const provider = normalizeProvider(providerStr);
   const row = await getConfig(provider);
-  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', 'PROVIDER_DISABLED', 403);
+  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', ErrorCodes.PROVIDER_DISABLED, 403);
+  const readiness = computeProviderReadiness(row as any);
+  if (!readiness.readyForProduction) throw new AppError(`Provider is not ready for production login: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
   if (!row.clientId) throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 400);
   const adapter = getAdapter(provider);
   const nonce = buildStateNonce();
@@ -214,7 +389,29 @@ export async function getStartRedirect(providerStr: string, req: Request) {
     code_challenge: typeof req.query.code_challenge === 'string' ? req.query.code_challenge : undefined,
     code_challenge_method: typeof req.query.code_challenge_method === 'string' ? req.query.code_challenge_method : undefined,
   };
-  const state = jwt.sign({ provider, nonce, redirectContext, codeVerifier }, config.JWT_ACCESS_SECRET, { expiresIn: '10m' });
+  // App-aware client attribution (Furtail centralized-auth onboarding):
+  // `app_client_id` is this app's own AuthClient.clientId (e.g.
+  // "furtail-mobile"), distinct from the OAuth-relying-party `client_id`
+  // passthrough already used above for the /oauth/authorize bridge. When
+  // omitted (e.g. existing BPA calls), clientDbId/audience stay null and
+  // handleCallback falls back to the internal default client — the same
+  // effective behavior as before, minus the previous hardcoded-'social'
+  // foreign-key bug.
+  const appClientIdParam = typeof req.query.app_client_id === 'string' ? req.query.app_client_id : undefined;
+  const requestingClient = appClientIdParam ? await resolveClient(appClientIdParam, req) : null;
+  const state = jwt.sign(
+    {
+      provider,
+      nonce,
+      redirectContext,
+      codeVerifier,
+      clientDbId: requestingClient?.id ?? null,
+      audience: requestingClient?.audience ?? null,
+      linkUserId: opts?.linkUserId ?? null,
+    },
+    config.JWT_ACCESS_SECRET,
+    { expiresIn: '10m' },
+  );
   if (adapter) {
     const authUrl = adapter.buildAuthorizationUrl(row, state, redirectContext);
     if (codeChallenge) {
@@ -234,11 +431,24 @@ export async function getStartRedirect(providerStr: string, req: Request) {
 
 export async function handleCallback(providerStr: string, code: string, state: string, req: Request): Promise<SocialCallbackResult> {
   const provider = normalizeProvider(providerStr);
-  let payload: { provider?: OAuthProvider; codeVerifier?: string; redirectContext?: Record<string, string | undefined> };
-  try { payload = jwt.verify(state, config.JWT_ACCESS_SECRET) as { provider?: OAuthProvider; codeVerifier?: string; redirectContext?: Record<string, string | undefined> }; } catch { throw new AppError('Invalid or expired state.', 'INVALID_STATE', 400); }
+  let payload: {
+    provider?: OAuthProvider;
+    codeVerifier?: string;
+    redirectContext?: Record<string, string | undefined>;
+    clientDbId?: string | null;
+    audience?: string | null;
+    linkUserId?: string | null;
+  };
+  try {
+    payload = jwt.verify(state, config.JWT_ACCESS_SECRET) as typeof payload;
+  } catch {
+    throw new AppError('Invalid or expired state.', 'INVALID_STATE', 400);
+  }
   if (payload.provider !== provider) throw new AppError('State provider mismatch.', 'INVALID_STATE', 400);
   const row = await getConfig(provider);
-  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', 'PROVIDER_DISABLED', 403);
+  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', ErrorCodes.PROVIDER_DISABLED, 403);
+  const readiness = computeProviderReadiness(row as any);
+  if (!readiness.readyForProduction) throw new AppError(`Provider is not ready for production login: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
   if (!row.clientId || !row.clientSecretEncrypted) throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 400);
   const secret = decryptSecret(row.clientSecretEncrypted as string).clientSecret;
   if (!secret) throw new AppError('Provider is missing client secret configuration.', 'PROVIDER_MISCONFIGURED', 400);
@@ -251,12 +461,24 @@ export async function handleCallback(providerStr: string, code: string, state: s
     tokenParams.set('client_secret', secret);
     const tokenRes = await fetch(row.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }, body: tokenParams.toString() });
     const tokenData = (await tokenRes.json()) as { access_token?: string };
-    if (!tokenRes.ok) throw new AppError('Token exchange failed.', 'PROVIDER_ERROR', 502);
+    if (!tokenRes.ok) throw new AppError('Token exchange failed.', ErrorCodes.INVALID_PROVIDER_TOKEN, 502);
     accessToken = tokenData.access_token ?? '';
   }
-  if (!accessToken) throw new AppError('Token exchange failed.', 'PROVIDER_ERROR', 502);
+  if (!accessToken) throw new AppError('Token exchange failed.', ErrorCodes.INVALID_PROVIDER_TOKEN, 502);
   const profile = await resolveProfile(provider, accessToken, row);
-  return loginOrLink(provider, profile, 'social', req, payload.redirectContext);
+
+  if (payload.linkUserId) {
+    return linkIdentityToUser(provider, profile, payload.linkUserId, req);
+  }
+
+  // Fixes the previous hardcoded `clientId: 'social'` bug: that string was
+  // not a real AuthClient.id, so every social-login LoginSession/RefreshToken
+  // row violated the clientId foreign key. Now we use the real requesting
+  // AuthClient (threaded through /start via app_client_id) or fall back to
+  // the internal default client — the same fallback already used by
+  // password login when no clientId is supplied.
+  const clientId = payload.clientDbId ?? (await getOrCreateInternalClientId());
+  return loginOrLink(provider, profile, clientId, req, payload.redirectContext, payload.audience ?? undefined);
 }
 
 export async function requestSocialEmailCompletion(completionToken: string, email: string, req: Request) {
@@ -321,30 +543,32 @@ export async function deleteProvider(id: string) {
 export async function testProvider(id: string, actorId?: string, req?: Request) {
   const row = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
   if (!row) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
-  const adapter = getAdapter(row.provider);
-  const validations = {
-    hasClientId: Boolean(row.clientId),
-    hasSecret: Boolean(row.clientSecretEncrypted),
-    hasRedirectUri: Boolean(row.redirectUri),
-    hasScopes: Array.isArray(row.scopes) && row.scopes.length > 0,
-    hasAuthorizationUrl: Boolean(row.authorizationUrl),
-    hasTokenUrl: Boolean(row.tokenUrl),
-    hasUserInfoUrl: Boolean(row.userInfoUrl),
-    hasAdapter: Boolean(adapter || ['GOOGLE', 'FACEBOOK', 'APPLE', 'MICROSOFT'].includes(row.provider)),
-  };
-  if (!validations.hasClientId || !validations.hasRedirectUri || !validations.hasScopes || !validations.hasAuthorizationUrl || !validations.hasTokenUrl || !validations.hasAdapter) {
-    throw new AppError('Provider configuration is incomplete.', 'PROVIDER_MISCONFIGURED', 400);
+  const readiness = computeProviderReadiness(row as any);
+  if (!readiness.readyForProduction) {
+    await prisma.socialIdentityProviderConfig.update({
+      where: { id },
+      data: {
+        lastTestAt: new Date(),
+        lastTestStatus: 'FAILED',
+        lastTestError: readiness.blockers.join(' | ').slice(0, 500),
+      },
+    });
+    throw new AppError(`Provider configuration is incomplete: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
   }
-  if ((row.provider !== 'GOOGLE' && row.provider !== 'FACEBOOK' && row.provider !== 'APPLE' && row.provider !== 'MICROSOFT') && !validations.hasUserInfoUrl) {
-    throw new AppError('Provider user info URL is missing.', 'PROVIDER_MISCONFIGURED', 400);
-  }
-  if (!validations.hasSecret) {
-    throw new AppError('Provider secret is not configured.', 'PROVIDER_MISCONFIGURED', 400);
-  }
+  const now = new Date();
+  await prisma.socialIdentityProviderConfig.update({
+    where: { id },
+    data: {
+      lastTestAt: now,
+      lastSuccessfulTestAt: now,
+      lastTestStatus: 'SUCCESS',
+      lastTestError: null,
+    },
+  });
   try {
     await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_TESTED', resource: 'social_provider', resourceId: id, req, metadata: { provider: row.provider } });
   } catch (err) {
     console.error('Failed to write social provider test audit log:', err);
   }
-  return { configured: true, status: row.status, provider: row.provider, validations };
+  return { configured: true, status: row.status, provider: row.provider, readiness, lastSuccessfulTestAt: now };
 }

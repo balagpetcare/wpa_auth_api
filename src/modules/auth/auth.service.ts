@@ -11,7 +11,7 @@ import {
   generateOpaqueToken,
   parseTtlToSeconds,
 } from '../../lib/tokens.js';
-import { AppError } from '../../lib/errors.js';
+import { AppError, ErrorCodes } from '../../lib/errors.js';
 import { writeAuditLog, writeSecurityEvent } from '../../lib/audit.js';
 import { createAdminNotification } from '../../lib/adminNotifications.js';
 import { sendEmail } from '../../lib/mailer.js';
@@ -21,8 +21,41 @@ import { Request } from 'express';
 import { logAbuseSignal, clearRisk, clearLoginAbuseState } from '../../lib/antiAbuse.js';
 import { recordPresenceHeartbeat } from '../../lib/presence.js';
 import { incrementMetric } from '../../lib/metrics.js';
+import { removeAvatarByUrl } from '../../lib/avatarStorage.js';
+import { buildActionLink } from './resetLinkRouting.js';
 
 const BCRYPT_ROUNDS = 12;
+
+/**
+ * Builds an auth-email action link (password reset / email verification),
+ * routing per requesting client when configured.
+ *
+ * Historically these links hardcoded `${ADMIN_PANEL_ORIGIN}/auth/user/...`,
+ * which is right for the admin panel but wrong for mobile app users (their
+ * email link opened the admin web app instead of deep-linking into Furtail/
+ * BPA). This resolves a per-client base URL from a JSON env map
+ * (PASSWORD_RESET_URL_BY_CLIENT / EMAIL_VERIFICATION_URL_BY_CLIENT). When the
+ * request carries a clientId present in the map, that base wins and the token
+ * is appended as `?token=...`. Otherwise the admin-panel default is used
+ * unchanged, so the admin panel's own reset/verify flow is never broken.
+ */
+export function buildPasswordResetLink(token: string, clientId?: string | null): string {
+  return buildActionLink(
+    config.PASSWORD_RESET_URL_BY_CLIENT,
+    clientId,
+    token,
+    `${config.ADMIN_PANEL_ORIGIN}/auth/user/reset-password`,
+  );
+}
+
+export function buildEmailVerificationLink(token: string, clientId?: string | null): string {
+  return buildActionLink(
+    config.EMAIL_VERIFICATION_URL_BY_CLIENT,
+    clientId,
+    token,
+    `${config.ADMIN_PANEL_ORIGIN}/auth/user/verify-email`,
+  );
+}
 
 export type SafeUser = {
   id: string;
@@ -34,11 +67,43 @@ export type SafeUser = {
   status: UserStatus;
   emailVerifiedAt: Date | null;
   phoneVerifiedAt: Date | null;
+  notificationPreferences: {
+    securityAlerts: boolean;
+    loginAlerts: boolean;
+    emailAnnouncements: boolean;
+    smsAnnouncements: boolean;
+  };
   roles: string[];
   createdAt: Date;
   updatedAt: Date;
   lastLoginAt: Date | null;
+  lastPasswordChangedAt?: Date | null;
 };
+
+const DEFAULT_NOTIFICATION_PREFERENCES = {
+  securityAlerts: true,
+  loginAlerts: true,
+  emailAnnouncements: false,
+  smsAnnouncements: false,
+} as const;
+
+function normalizeNotificationPreferences(value: unknown): SafeUser['notificationPreferences'] {
+  const source = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  return {
+    securityAlerts: source['securityAlerts'] === undefined
+      ? DEFAULT_NOTIFICATION_PREFERENCES.securityAlerts
+      : Boolean(source['securityAlerts']),
+    loginAlerts: source['loginAlerts'] === undefined
+      ? DEFAULT_NOTIFICATION_PREFERENCES.loginAlerts
+      : Boolean(source['loginAlerts']),
+    emailAnnouncements: source['emailAnnouncements'] === undefined
+      ? DEFAULT_NOTIFICATION_PREFERENCES.emailAnnouncements
+      : Boolean(source['emailAnnouncements']),
+    smsAnnouncements: source['smsAnnouncements'] === undefined
+      ? DEFAULT_NOTIFICATION_PREFERENCES.smsAnnouncements
+      : Boolean(source['smsAnnouncements']),
+  };
+}
 
 function safeUser(user: any, roles: string[] = []): SafeUser {
   return {
@@ -51,10 +116,12 @@ function safeUser(user: any, roles: string[] = []): SafeUser {
     status: user.status,
     emailVerifiedAt: user.emailVerifiedAt,
     phoneVerifiedAt: user.phoneVerifiedAt,
+    notificationPreferences: normalizeNotificationPreferences(user.notificationPreferences),
     roles,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
     lastLoginAt: user.lastLoginAt,
+    lastPasswordChangedAt: user.lastPasswordChangedAt ?? null,
   };
 }
 
@@ -66,7 +133,7 @@ async function getUserRoles(userId: string): Promise<string[]> {
   return userRoles.map((ur) => ur.role.name);
 }
 
-async function resolveClient(clientId?: string, req?: Request) {
+export async function resolveClient(clientId?: string, req?: Request) {
   if (!clientId) return null;
   const client = await prisma.authClient.findUnique({ where: { clientId } });
   if (!client || client.status !== 'ACTIVE') return null;
@@ -261,11 +328,6 @@ export async function loginUser(
     });
   }
 
-  const roles = await getUserRoles(user.id);
-  const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
-  const refreshToken = signRefreshToken(user.id);
-  const tokenHash = hashToken(refreshToken);
-
   const session = await prisma.loginSession.create({
     data: {
       userId: user.id,
@@ -276,6 +338,18 @@ export async function loginUser(
       userAgent: req.headers['user-agent'],
     },
   });
+
+  const roles = await getUserRoles(user.id);
+  const audience = client?.audience ?? undefined;
+  const accessToken = signAccessToken({
+    sub: user.id,
+    email: user.email,
+    username: user.username,
+    roles,
+    sid: session.id,
+  }, audience);
+  const refreshToken = signRefreshToken(user.id, audience);
+  const tokenHash = hashToken(refreshToken);
 
   await prisma.refreshToken.create({
     data: {
@@ -397,7 +471,7 @@ export async function revokeSessionFamily(userId: string, familyId: string, reas
   });
 }
 
-export async function refreshTokens(rawRefreshToken: string, req: Request) {
+export async function refreshTokens(rawRefreshToken: string, req: Request, requestedClientId?: string) {
   let payload: { sub: string };
   try {
     payload = verifyRefreshToken(rawRefreshToken);
@@ -468,7 +542,7 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
         });
       }
 
-      throw new AppError('Refresh token reuse detected.', 'TOKEN_REVOKED', 401);
+      throw new AppError('Refresh token reuse detected.', ErrorCodes.REFRESH_TOKEN_REUSED, 401);
     }
 
     // Normal invalid/revoked/expired token
@@ -494,12 +568,42 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
         where: { id: stored.id },
         data: { revokedAt: new Date(), revocationReason: 'SESSION_REVOKED' },
       });
-      throw new AppError('Session is invalid or has been revoked.', 'TOKEN_REVOKED', 401);
+      throw new AppError('Session is invalid or has been revoked.', ErrorCodes.SESSION_REVOKED, 401);
+    }
+  }
+
+  const tokenClient = await prisma.authClient.findUnique({ where: { id: stored.clientId }, select: { audience: true } });
+  let audience = tokenClient?.audience ?? undefined;
+  let effectiveClientDbId = stored.clientId;
+
+  // Controlled audience migration: a session created before the app sent
+  // clientId is bound to the internal default client (audience null →
+  // global default, e.g. "bpa-mobile"). When the refresh request now names
+  // a real client, rebind the session to it so the rotated tokens carry the
+  // app's own audience (e.g. "furtail-mobile"). Only sessions on the
+  // internal/default client are eligible — a session already bound to a
+  // real client can NEVER be re-pointed at a different one (that would let
+  // one app steal another app's session).
+  if (requestedClientId) {
+    const requestedClient = await resolveClient(requestedClientId, req);
+    if (requestedClient?.audience && !tokenClient?.audience) {
+      const internalClientId = await getOrCreateInternalClientId();
+      if (stored.clientId === internalClientId) {
+        audience = requestedClient.audience;
+        effectiveClientDbId = requestedClient.id;
+        await writeAuditLog({
+          userId: user.id,
+          clientId: requestedClient.id,
+          action: 'TOKEN_REFRESHED',
+          metadata: { sessionClientMigrated: true, from: 'internal-default', to: requestedClientId },
+          req,
+        });
+      }
     }
   }
 
   // Rotate: create new, mark old as rotated
-  const newRefresh = signRefreshToken(user.id);
+  const newRefresh = signRefreshToken(user.id, audience);
   const newHash = hashToken(newRefresh);
   const familyId = stored.familyId; // keep family consistent
 
@@ -507,13 +611,15 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
   const newClientToken = await prisma.refreshToken.create({
     data: {
       userId: user.id,
-      clientId: stored.clientId,
+      clientId: effectiveClientDbId,
       tokenHash: newHash,
       scopes: stored.scopes,
       expiresAt: buildTokenExpiry(config.REFRESH_TOKEN_TTL),
       ipAddress: req.ip ?? req.socket.remoteAddress,
       userAgent: req.headers['user-agent'],
       familyId,
+      deviceId: stored.deviceId,
+      deviceInfo: stored.deviceInfo as any,
     },
   });
 
@@ -528,7 +634,13 @@ export async function refreshTokens(rawRefreshToken: string, req: Request) {
   });
 
   const roles = await getUserRoles(user.id);
-  const newAccess = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
+  const newAccess = signAccessToken({
+    sub: user.id,
+    email: user.email,
+    username: user.username,
+    roles,
+    sid: familyId ?? undefined,
+  }, audience);
 
   await writeAuditLog({ userId: user.id, action: 'TOKEN_REFRESHED', req });
 
@@ -589,9 +701,11 @@ export async function getCurrentUser(userId: string): Promise<SafeUser> {
       status: true,
       emailVerifiedAt: true,
       phoneVerifiedAt: true,
+      notificationPreferences: true,
       createdAt: true,
       updatedAt: true,
-      lastLoginAt: true
+      lastLoginAt: true,
+      lastPasswordChangedAt: true,
     }
   });
   if (!user) throw new AppError('User not found.', 'NOT_FOUND', 404);
@@ -599,9 +713,516 @@ export async function getCurrentUser(userId: string): Promise<SafeUser> {
   return safeUser(user, roles);
 }
 
+function normalizeIdentifier(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeEmail(value: string | null | undefined): string | null {
+  const normalized = normalizeIdentifier(value);
+  return normalized ? normalized.toLowerCase() : null;
+}
+
+function normalizePhone(value: string | null | undefined): string | null {
+  return normalizeIdentifier(value);
+}
+
+async function revokeSessionsByIds(userId: string, sessionIds: string[], reason: string) {
+  if (sessionIds.length === 0) {
+    return { revokedSessions: 0, revokedRefreshTokens: 0 };
+  }
+
+  const now = new Date();
+  const [sessionResult, refreshTokenResult] = await prisma.$transaction([
+    prisma.loginSession.updateMany({
+      where: { userId, id: { in: sessionIds }, revokedAt: null },
+      data: { revokedAt: now, revocationReason: reason },
+    }),
+    prisma.refreshToken.updateMany({
+      where: { userId, familyId: { in: sessionIds }, revokedAt: null },
+      data: { revokedAt: now, revocationReason: reason },
+    }),
+  ]);
+
+  return {
+    revokedSessions: sessionResult.count,
+    revokedRefreshTokens: refreshTokenResult.count,
+  };
+}
+
+async function revokeAllSessions(
+  userId: string,
+  reason: string,
+  excludeSessionId?: string | null,
+) {
+  const sessions = await prisma.loginSession.findMany({
+    where: {
+      userId,
+      revokedAt: null,
+      ...(excludeSessionId ? { id: { not: excludeSessionId } } : {}),
+    },
+    select: { id: true },
+  });
+
+  return revokeSessionsByIds(
+    userId,
+    sessions.map((session) => session.id),
+    reason,
+  );
+}
+
+async function verifyCurrentPassword(
+  userId: string,
+  currentPassword: string | undefined | null,
+  options?: { allowMissingPasswordOnAccount?: boolean },
+) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, passwordHash: true },
+  });
+
+  if (!user) {
+    throw new AppError('User not found.', 'NOT_FOUND', 404);
+  }
+
+  if (!user.passwordHash) {
+    if (options?.allowMissingPasswordOnAccount) {
+      return user;
+    }
+    throw new AppError(
+      'No password set on this account. Use "Forgot Password" to set one.',
+      'PASSWORD_NOT_SET',
+      400,
+    );
+  }
+
+  if (!currentPassword) {
+    throw new AppError(
+      'Current password is required.',
+      'CURRENT_PASSWORD_REQUIRED',
+      400,
+    );
+  }
+
+  const isValid = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!isValid) {
+    throw new AppError(
+      'Current password is incorrect.',
+      'CURRENT_PASSWORD_INCORRECT',
+      403,
+    );
+  }
+
+  return user;
+}
+
+export async function updateCurrentUserProfile(
+  userId: string,
+  input: {
+    displayName?: string | null;
+    username?: string | null;
+    email?: string | null;
+    phone?: string | null;
+    notificationPreferences?: Partial<SafeUser['notificationPreferences']>;
+  },
+  req: Request,
+): Promise<SafeUser> {
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      email: true,
+      phone: true,
+      username: true,
+      notificationPreferences: true,
+    },
+  });
+
+  if (!existing) {
+    throw new AppError('User not found.', 'NOT_FOUND', 404);
+  }
+
+  const nextEmail =
+    input.email === undefined ? existing.email : normalizeEmail(input.email);
+  const nextPhone =
+    input.phone === undefined ? existing.phone : normalizePhone(input.phone);
+  const nextUsername =
+    input.username === undefined
+      ? existing.username
+      : normalizeIdentifier(input.username);
+
+  if (!nextEmail && !nextPhone && !nextUsername) {
+    throw new AppError(
+      'At least one of email, phone, or username must remain on the account.',
+      'IDENTIFIER_REQUIRED',
+      400,
+    );
+  }
+
+  if (nextEmail && nextEmail !== existing.email) {
+    const emailConflict = await prisma.user.findFirst({
+      where: { email: nextEmail, id: { not: userId } },
+      select: { id: true },
+    });
+    if (emailConflict) {
+      throw new AppError(
+        'That email address is already in use.',
+        'EMAIL_IN_USE',
+        409,
+      );
+    }
+  }
+
+  if (nextPhone && nextPhone !== existing.phone) {
+    const phoneConflict = await prisma.user.findFirst({
+      where: { phone: nextPhone, id: { not: userId } },
+      select: { id: true },
+    });
+    if (phoneConflict) {
+      throw new AppError(
+        'That phone number is already in use.',
+        'PHONE_IN_USE',
+        409,
+      );
+    }
+  }
+
+  if (nextUsername && nextUsername !== existing.username) {
+    const usernameConflict = await prisma.user.findFirst({
+      where: { username: nextUsername, id: { not: userId } },
+      select: { id: true },
+    });
+    if (usernameConflict) {
+      throw new AppError(
+        'That username is already in use.',
+        'USERNAME_IN_USE',
+        409,
+      );
+    }
+  }
+
+  const data: Record<string, unknown> = {};
+
+  if (input.displayName !== undefined) {
+    data['displayName'] = normalizeIdentifier(input.displayName);
+  }
+  if (input.email !== undefined) {
+    data['email'] = nextEmail;
+    if (nextEmail !== existing.email) {
+      data['emailVerifiedAt'] = null;
+    }
+  }
+  if (input.phone !== undefined) {
+    data['phone'] = nextPhone;
+    if (nextPhone !== existing.phone) {
+      data['phoneVerifiedAt'] = null;
+    }
+  }
+  if (input.username !== undefined) {
+    data['username'] = nextUsername;
+  }
+  if (input.notificationPreferences !== undefined) {
+    data['notificationPreferences'] = normalizeNotificationPreferences({
+      ...normalizeNotificationPreferences(existing.notificationPreferences),
+      ...input.notificationPreferences,
+    });
+  }
+
+  await prisma.user.update({
+    where: { id: userId },
+    data,
+  });
+
+  await writeAuditLog({
+    userId,
+    action: 'PROFILE_UPDATED',
+    resource: 'user',
+    resourceId: userId,
+    req,
+  });
+
+  return getCurrentUser(userId);
+}
+
+export async function updateCurrentUserAvatar(
+  userId: string,
+  avatarUrl: string,
+  req: Request,
+) {
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { avatarUrl: true },
+  });
+  if (!existing) {
+    throw new AppError('User not found.', 'NOT_FOUND', 404);
+  }
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { avatarUrl },
+  });
+
+  await removeAvatarByUrl(existing.avatarUrl);
+  await writeAuditLog({
+    userId,
+    action: 'PROFILE_AVATAR_UPDATED',
+    resource: 'user',
+    resourceId: userId,
+    req,
+  });
+
+  return getCurrentUser(userId);
+}
+
+export async function removeCurrentUserAvatar(userId: string, req: Request) {
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { avatarUrl: true },
+  });
+  if (!existing) {
+    throw new AppError('User not found.', 'NOT_FOUND', 404);
+  }
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { avatarUrl: null },
+  });
+
+  await removeAvatarByUrl(existing.avatarUrl);
+  await writeAuditLog({
+    userId,
+    action: 'PROFILE_AVATAR_REMOVED',
+    resource: 'user',
+    resourceId: userId,
+    req,
+  });
+
+  return getCurrentUser(userId);
+}
+
+export async function listMyActiveSessions(
+  userId: string,
+  currentSessionId?: string,
+) {
+  const sessions = await prisma.loginSession.findMany({
+    where: {
+      userId,
+      revokedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    select: {
+      id: true,
+      userAgent: true,
+      ipAddress: true,
+      country: true,
+      expiresAt: true,
+      lastActiveAt: true,
+      createdAt: true,
+      client: {
+        select: {
+          id: true,
+          clientId: true,
+          slug: true,
+          name: true,
+        },
+      },
+    },
+    orderBy: [{ lastActiveAt: 'desc' }, { createdAt: 'desc' }],
+  });
+
+  return sessions.map((session) => ({
+    id: session.id,
+    isCurrent: currentSessionId === session.id,
+    client: {
+      id: session.client.id,
+      clientId: session.client.clientId,
+      slug: session.client.slug,
+      name: session.client.name,
+    },
+    userAgent: session.userAgent,
+    ipAddress: session.ipAddress,
+    country: session.country,
+    createdAt: session.createdAt,
+    lastActiveAt: session.lastActiveAt,
+    expiresAt: session.expiresAt,
+  }));
+}
+
+export async function revokeMySession(
+  userId: string,
+  sessionId: string,
+  req: Request,
+) {
+  const session = await prisma.loginSession.findFirst({
+    where: { id: sessionId, userId },
+    select: { id: true, revokedAt: true },
+  });
+
+  if (!session) {
+    throw new AppError('Session not found.', 'NOT_FOUND', 404);
+  }
+  if (session.revokedAt) {
+    return { revoked: false };
+  }
+
+  await revokeSessionsByIds(userId, [sessionId], 'USER_REVOKED');
+  await writeAuditLog({
+    userId,
+    action: 'TOKEN_REVOKED',
+    resource: 'login_session',
+    resourceId: sessionId,
+    req,
+  });
+
+  return { revoked: true };
+}
+
+export async function logoutAllOtherSessions(
+  userId: string,
+  currentSessionId: string | undefined,
+  req: Request,
+) {
+  if (!currentSessionId) {
+    throw new AppError(
+      'Current session could not be determined.',
+      'SESSION_CONTEXT_MISSING',
+      400,
+    );
+  }
+
+  const result = await revokeAllSessions(
+    userId,
+    'USER_LOGOUT_ALL_OTHERS',
+    currentSessionId,
+  );
+
+  await writeAuditLog({
+    userId,
+    action: 'TOKEN_REVOKED',
+    resource: 'login_session',
+    resourceId: currentSessionId,
+    req,
+    metadata: { revokedOtherSessions: result.revokedSessions },
+  });
+
+  return result;
+}
+
+export async function changeCurrentUserPassword(
+  userId: string,
+  currentSessionId: string | undefined,
+  data: {
+    currentPassword: string;
+    newPassword: string;
+    confirmPassword: string;
+  },
+  req: Request,
+) {
+  if (data.newPassword !== data.confirmPassword) {
+    throw new AppError('Passwords do not match.', 'PASSWORD_MISMATCH', 400);
+  }
+  if (data.currentPassword === data.newPassword) {
+    throw new AppError(
+      'New password must be different from the current password.',
+      'PASSWORD_UNCHANGED',
+      400,
+    );
+  }
+
+  await verifyCurrentPassword(userId, data.currentPassword);
+  const passwordHash = await bcrypt.hash(data.newPassword, BCRYPT_ROUNDS);
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      passwordHash,
+      lastPasswordChangedAt: new Date(),
+    },
+  });
+
+  await revokeAllSessions(userId, 'PASSWORD_CHANGED', currentSessionId ?? null);
+  await writeAuditLog({
+    userId,
+    action: 'PASSWORD_CHANGED',
+    resource: 'user',
+    resourceId: userId,
+    req,
+  });
+
+  return { success: true };
+}
+
+export async function deactivateCurrentUser(
+  userId: string,
+  currentSessionId: string | undefined,
+  password: string | undefined,
+  req: Request,
+) {
+  await verifyCurrentPassword(userId, password, {
+    allowMissingPasswordOnAccount: true,
+  });
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { status: UserStatus.SUSPENDED },
+  });
+
+  await revokeAllSessions(userId, 'ACCOUNT_DEACTIVATED');
+  await writeAuditLog({
+    userId,
+    action: 'ACCOUNT_SUSPENDED',
+    resource: 'user',
+    resourceId: userId,
+    req,
+    metadata: { currentSessionId: currentSessionId ?? null },
+  });
+
+  return { success: true };
+}
+
+export async function deleteCurrentUser(
+  userId: string,
+  password: string | undefined,
+  req: Request,
+) {
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { avatarUrl: true },
+  });
+
+  if (!existing) {
+    throw new AppError('User not found.', 'NOT_FOUND', 404);
+  }
+
+  await verifyCurrentPassword(userId, password, {
+    allowMissingPasswordOnAccount: true,
+  });
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      status: UserStatus.DELETED,
+      avatarUrl: null,
+    },
+  });
+
+  await revokeAllSessions(userId, 'ACCOUNT_DELETED');
+  await removeAvatarByUrl(existing.avatarUrl);
+  await writeAuditLog({
+    userId,
+    action: 'ACCOUNT_DELETED',
+    resource: 'user',
+    resourceId: userId,
+    req,
+  });
+
+  return { success: true };
+}
+
 // ─── Forgot Password ─────────────────────────────────────────────────────────
 
-export async function forgotPassword(email: string, req: Request) {
+export async function forgotPassword(email: string, req: Request, clientId?: string | null) {
   const user = await prisma.user.findUnique({ where: { email } });
   // Always return success to prevent user enumeration
   if (!user) return;
@@ -629,10 +1250,11 @@ export async function forgotPassword(email: string, req: Request) {
     actionUrl: '/account',
   });
 
-  // Phase 2.5 incidental fix (docs/phase-2-5-public-auth-rs256-oidc.md):
-  // same APP_URL-instead-of-frontend bug as the email-verification link
-  // above — this pointed at the API server itself, not a real page.
-  const resetLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/reset-password?token=${token}`;
+  // Per-client routing (final hardening pass): mobile app clients
+  // (furtail-mobile / bpa-mobile) get a deep link into their own app when
+  // configured via PASSWORD_RESET_URL_BY_CLIENT; the admin panel keeps its
+  // ADMIN_PANEL_ORIGIN default. See buildPasswordResetLink().
+  const resetLink = buildPasswordResetLink(token, clientId);
   const resetEmailResult = await sendTemplatedEmailWithFallback(
     {
       templateKey: 'password_reset',
@@ -810,7 +1432,7 @@ export async function heartbeatPresence(userId: string, appId: string | null | u
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
 let _internalClientId: string | null = null;
-async function getOrCreateInternalClientId(): Promise<string> {
+export async function getOrCreateInternalClientId(): Promise<string> {
   if (_internalClientId) return _internalClientId;
   const client = await prisma.authClient.findFirst({ where: { slug: 'world-pet-association' } });
   if (!client) {

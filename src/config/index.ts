@@ -21,7 +21,30 @@ const envSchema = z.object({
   ACCESS_TOKEN_TTL: z.string().default('15m'),
   REFRESH_TOKEN_TTL: z.string().default('30d'),
   ACCESS_TOKEN_AUDIENCE: z.string().default('bpa-mobile'),
+  // Additive: extra JWT audiences this server will accept at verification
+  // time, beyond ACCESS_TOKEN_AUDIENCE (comma-separated, e.g. "furtail-mobile").
+  // Per-client tokens are still SIGNED with that client's own
+  // AuthClient.audience (see tokens.ts/signAccessToken); this just widens
+  // what verifyAccessToken/verifyRefreshToken will accept so a second
+  // first-party app (Furtail) can be onboarded without breaking existing
+  // BPA tokens, which keep using ACCESS_TOKEN_AUDIENCE unchanged.
+  ADDITIONAL_JWT_AUDIENCES: z.string().default(''),
   ADMIN_PANEL_ORIGIN: z.string().url().default('http://localhost:5012'),
+  PUBLIC_WEBSITE_ORIGIN: z.string().url().default('http://localhost:5011'),
+  // Additive per-client routing for password-reset / email-verification links.
+  // The forgot-password + email-verification emails historically hardcoded
+  // `${ADMIN_PANEL_ORIGIN}/auth/user/...`, which is correct for the admin
+  // panel but wrong for mobile app users (Furtail/BPA) — they need a deep
+  // link into their own app. This is a JSON map of clientId -> a base URL (or
+  // custom-scheme deep link) that the reset/verify token is appended to as
+  // `?token=...`. When a forgot-password/verify request carries a known
+  // clientId present in this map, its URL wins; otherwise the ADMIN_PANEL_ORIGIN
+  // default is used unchanged (so the admin panel's own reset flow never breaks).
+  // Example:
+  //   PASSWORD_RESET_URL_BY_CLIENT={"furtail-mobile":"furtail://reset-password","bpa-mobile":"bpa://reset-password"}
+  //   EMAIL_VERIFICATION_URL_BY_CLIENT={"furtail-mobile":"furtail://verify-email"}
+  PASSWORD_RESET_URL_BY_CLIENT: z.string().default(''),
+  EMAIL_VERIFICATION_URL_BY_CLIENT: z.string().default(''),
   ALLOWED_PUBLIC_ORIGINS: z.string().default('http://localhost:5011,http://localhost:5012'),
   // OAuth / OIDC
   OAUTH_ISSUER: z.string().default('http://localhost:5010'),
@@ -53,6 +76,24 @@ const envSchema = z.object({
   INSTAGRAM_CLIENT_ID: z.string().optional(),
   INSTAGRAM_CLIENT_SECRET: z.string().optional(),
   INSTAGRAM_CALLBACK_URL: z.string().optional(),
+  // Furtail centralized-auth identity providers (see
+  // src/modules/auth/identity-providers). Each provider is independently
+  // togglable: it is only usable when its required env vars are present.
+  // A request against a provider missing config returns PROVIDER_DISABLED,
+  // never a silent no-op or fake success.
+  GOOGLE_LOGIN_AUDIENCE: z.string().optional(), // Google OAuth client ID(s), comma-separated (aud allow-list for ID tokens)
+  FACEBOOK_APP_ID: z.string().optional(),
+  FACEBOOK_APP_SECRET: z.string().optional(), // used server-side only, to call the debug_token endpoint; never sent to any client
+  APPLE_LOGIN_AUDIENCE: z.string().optional(), // Apple Services ID / app bundle id(s), comma-separated
+  MICROSOFT_TENANT_ID: z.string().optional().default('common'), // 'common', 'organizations', 'consumers', or a specific tenant GUID
+  MICROSOFT_CLIENT_ID: z.string().optional(),
+  // OTP (email/phone/whatsapp passwordless login) — reuses the existing
+  // CommunicationProvider/antiAbuse.ts infrastructure, not a parallel system.
+  OTP_LOGIN_CODE_LENGTH: z.coerce.number().int().min(4).max(10).default(6),
+  OTP_LOGIN_EXPIRY_MINUTES: z.coerce.number().int().positive().default(10),
+  OTP_LOGIN_MAX_VERIFY_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  OTP_LOGIN_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
+  WHATSAPP_OTP_ENABLED: z.coerce.boolean().default(false),
   // Set to 'true' or a hop count (e.g. '1') when running behind Nginx/load balancer
   // so Express reads X-Forwarded-For and sets req.ip correctly.
   TRUST_PROXY: z.string().optional(),
@@ -68,6 +109,8 @@ const envSchema = z.object({
   AUTH_LOGIN_RATE_LIMIT_WINDOW_MINUTES: z.coerce.number().int().positive().default(15),
   AUTH_LOGIN_LOCAL_BLOCK_MINUTES: z.coerce.number().int().positive().default(2),
   COMMUNICATION_RATE_LIMIT_ENABLED: z.coerce.boolean().default(true),
+  DELETION_GRACE_PERIOD_HOURS: z.coerce.number().int().positive().default(72),
+  DELETION_PROCESSOR_SCAN_SECONDS: z.coerce.number().int().positive().default(30),
   COMMUNICATION_MAX_SMS_PER_PHONE_PER_HOUR: z.coerce.number().int().positive().default(5),
   COMMUNICATION_MAX_SMS_PER_PHONE_PER_DAY: z.coerce.number().int().positive().default(10),
   COMMUNICATION_MAX_EMAIL_PER_ADDRESS_PER_HOUR: z.coerce.number().int().positive().default(5),

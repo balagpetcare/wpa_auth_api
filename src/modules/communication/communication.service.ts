@@ -850,6 +850,7 @@ export async function dispatchEmail(input: {
     req: input.req,
     userId: input.userId ?? null,
     context: 'send',
+    templateKey: input.templateKey ?? undefined,
   });
   if (!abuseDecision.allowed) {
     await finalizeDeliveryLog({

@@ -1,0 +1,270 @@
+openapi: 3.0.3
+info:
+  title: WPA Central Auth API — Furtail centralized-auth additions
+  version: "1.0.0"
+  description: >
+    Covers ONLY the endpoints added/changed for the Furtail centralized-auth
+    onboarding pass (bootstrap config, OTP passwordless login, phone+password
+    login, set-password, and provider-token login/linking for
+    Google/Facebook/Apple/Microsoft/Enterprise OIDC). Existing endpoints
+    (register/login/refresh/logout/me/social/*) are unchanged and not
+    re-documented here — see docs/api-auth.md and docs/oauth-flow.md.
+servers:
+  - url: /api/v1
+paths:
+  /auth/bootstrap:
+    get:
+      summary: Public per-client login-screen bootstrap config
+      description: >
+        No auth required. Returns only public info — enabled login methods,
+        enabled providers, password policy, OTP cadence, and branding. Never
+        returns secrets or internal DB ids beyond AuthClient.clientId (which
+        the caller already sent).
+      parameters:
+        - in: query
+          name: clientId
+          schema: { type: string }
+          description: The requesting AuthClient's public clientId (e.g. "furtail-mobile"). Omit for system defaults.
+      responses:
+        "200":
+          description: Bootstrap config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BootstrapResponse' }
+
+  /auth/otp/request:
+    post:
+      summary: Request an OTP code for passwordless login (email/phone/whatsapp)
+      description: >
+        Always responds 200 with a generic "if an account exists" message —
+        never reveals whether the recipient has an account (anti-enumeration).
+        channel=whatsapp always returns PROVIDER_DISABLED (no approved
+        WhatsApp-capable CommunicationProvider exists yet).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, recipient]
+              properties:
+                channel: { type: string, enum: [email, phone, whatsapp] }
+                recipient: { type: string }
+                clientId: { type: string }
+      responses:
+        "200": { description: OTP requested (or silently a no-op for a non-existent account) }
+        "429": { description: Rate-limited / resend cooldown active }
+        "503": { description: "PROVIDER_DISABLED (whatsapp) or OTP delivery unavailable" }
+
+  /auth/otp/verify:
+    post:
+      summary: Verify an OTP code and receive a session (access + refresh token)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, recipient, code]
+              properties:
+                channel: { type: string, enum: [email, phone] }
+                recipient: { type: string }
+                code: { type: string }
+                clientId: { type: string }
+      responses:
+        "200":
+          description: Session issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        "400": { description: OTP_INVALID }
+        "429": { description: OTP_TOO_MANY_ATTEMPTS }
+
+  /auth/login/phone:
+    post:
+      summary: Phone + password login (verified phone + password required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, password]
+              properties:
+                phone: { type: string }
+                password: { type: string }
+                clientId: { type: string }
+      responses:
+        "200":
+          description: Session issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        "401": { description: INVALID_CREDENTIALS }
+
+  /auth/password/set:
+    post:
+      summary: Set a password on the current (authenticated) social/OIDC-only account
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, minLength: 8 }
+      responses:
+        "200": { description: Password set }
+        "409": { description: PASSWORD_ALREADY_SET }
+
+  /auth/identity/{provider}:
+    post:
+      summary: Login via a verified identity-provider token (Google/Facebook/Apple/Microsoft/Enterprise)
+      description: >
+        The mobile/web client sends a PROVIDER-ISSUED token (id_token for
+        google/apple/microsoft/enterprise, access token for facebook) — this
+        API verifies it server-side against the provider's own JWKS/Graph API,
+        never trusting an unverified decoded payload. May respond with either
+        a full session (LOGIN) or NEEDS_PROFILE_COMPLETION when the
+        requesting AuthClient's requiredProfileFields aren't satisfied yet.
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema: { type: string, enum: [google, facebook, apple, microsoft, enterprise] }
+        - in: query
+          name: org
+          schema: { type: string }
+          description: Required when provider=enterprise — the EnterpriseIdentityProvider.orgSlug.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                idToken: { type: string, description: "Required for google/apple/microsoft/enterprise" }
+                accessToken: { type: string, description: "Required for facebook" }
+                nonce: { type: string }
+                clientId: { type: string }
+      responses:
+        "200":
+          description: LOGIN or NEEDS_PROFILE_COMPLETION
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SessionResponse'
+                  - $ref: '#/components/schemas/NeedsProfileCompletionResponse'
+        "401": { description: INVALID_PROVIDER_TOKEN }
+        "409": { description: IDENTITY_ALREADY_LINKED / ACCOUNT_CONFLICT }
+        "503": { description: PROVIDER_DISABLED }
+
+  /auth/identity/{provider}/link:
+    post:
+      summary: Link an additional identity provider to the current authenticated user
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema: { type: string, enum: [google, facebook, apple, microsoft, enterprise] }
+        - in: query
+          name: org
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                idToken: { type: string }
+                accessToken: { type: string }
+                nonce: { type: string }
+      responses:
+        "200": { description: Linked }
+        "409": { description: IDENTITY_ALREADY_LINKED }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    SessionResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        expiresIn: { type: integer }
+        user:
+          type: object
+          properties:
+            id: { type: string }
+            email: { type: string, nullable: true }
+            phone: { type: string, nullable: true }
+            displayName: { type: string, nullable: true }
+            roles: { type: array, items: { type: string } }
+    NeedsProfileCompletionResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        kind: { type: string, enum: [NEEDS_PROFILE_COMPLETION] }
+        provider: { type: string }
+        userId: { type: string }
+        missingFields: { type: array, items: { type: string } }
+        message: { type: string }
+    BootstrapResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            client: { type: object, nullable: true }
+            registrationOpen: { type: boolean }
+            requiredProfileFields: { type: array, items: { type: string } }
+            loginMethods:
+              type: object
+              properties:
+                emailPassword: { type: boolean }
+                phonePassword: { type: boolean }
+                emailOtp: { type: boolean }
+                phoneOtp: { type: boolean }
+                whatsappOtp: { type: boolean }
+                magicLink: { type: boolean }
+            providers:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  displayName: { type: string }
+                  enabled: { type: boolean }
+            enterpriseOrganizations:
+              type: array
+              items:
+                type: object
+                properties:
+                  orgSlug: { type: string }
+                  displayName: { type: string }
+                  protocol: { type: string, enum: [OIDC, SAML] }
+            passwordPolicy:
+              type: object
+              properties:
+                minLength: { type: integer }
+                requiresUppercase: { type: boolean }
+                requiresNumber: { type: boolean }
+                requiresSymbol: { type: boolean }
+            otp:
+              type: object
+              properties:
+                codeLength: { type: integer }
+                expiryMinutes: { type: integer }
+                resendCooldownSeconds: { type: integer }
+            branding: { type: object, nullable: true }

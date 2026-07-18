@@ -7,36 +7,53 @@ export interface AccessTokenPayload {
   email: string | null;
   username: string | null;
   roles: string[];
+  sid?: string;
+  aud?: string | string[];
 }
 
-export function signAccessToken(payload: AccessTokenPayload): string {
-  return jwt.sign(payload, config.JWT_ACCESS_SECRET, {
+// Additive multi-client audience support (Furtail centralized-auth
+// onboarding). Tokens are still SIGNED with a single audience — either the
+// requesting AuthClient's own `audience` column (e.g. "furtail-mobile") or,
+// when the client has none configured, the global default
+// config.ACCESS_TOKEN_AUDIENCE (e.g. "bpa-mobile", unchanged for BPA).
+// Verification accepts any audience in getAllowedAudiences() so a second
+// first-party app can be onboarded without invalidating existing tokens.
+export function getAllowedAudiences(): string[] {
+  const extra = config.ADDITIONAL_JWT_AUDIENCES.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return Array.from(new Set([config.ACCESS_TOKEN_AUDIENCE, ...extra]));
+}
+
+export function signAccessToken(payload: AccessTokenPayload, audience?: string): string {
+  const { aud: _ignored, ...claims } = payload;
+  return jwt.sign(claims, config.JWT_ACCESS_SECRET, {
     expiresIn: config.ACCESS_TOKEN_TTL as any,
     issuer: config.OAUTH_ISSUER,
-    audience: config.ACCESS_TOKEN_AUDIENCE,
+    audience: audience ?? config.ACCESS_TOKEN_AUDIENCE,
   });
 }
 
 export function verifyAccessToken(token: string): AccessTokenPayload {
   return jwt.verify(token, config.JWT_ACCESS_SECRET, {
     issuer: config.OAUTH_ISSUER,
-    audience: config.ACCESS_TOKEN_AUDIENCE,
-  }) as AccessTokenPayload;
+    audience: getAllowedAudiences() as any,
+  }) as unknown as AccessTokenPayload;
 }
 
-export function signRefreshToken(userId: string): string {
+export function signRefreshToken(userId: string, audience?: string): string {
   const jti = randomBytes(16).toString('hex');
   return jwt.sign({ sub: userId, jti }, config.JWT_REFRESH_SECRET, {
     expiresIn: config.REFRESH_TOKEN_TTL as any,
     issuer: config.OAUTH_ISSUER,
-    audience: config.ACCESS_TOKEN_AUDIENCE,
+    audience: audience ?? config.ACCESS_TOKEN_AUDIENCE,
   });
 }
 
 export function verifyRefreshToken(token: string): { sub: string } {
   return jwt.verify(token, config.JWT_REFRESH_SECRET, {
     issuer: config.OAUTH_ISSUER,
-    audience: config.ACCESS_TOKEN_AUDIENCE,
+    audience: getAllowedAudiences() as any,
   }) as { sub: string };
 }
 

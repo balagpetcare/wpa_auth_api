@@ -73,9 +73,43 @@ const rolesList = [
   { name: 'USER', description: 'Standard authenticated user' },
 ];
 
-const clientsList = [
+const clientsList: Array<{
+  name: string;
+  slug: string;
+  type: AuthClientType;
+  // Additive per-client overrides (Furtail centralized-auth identity
+  // foundation). All optional — omitting them preserves the exact
+  // generic behavior every other seeded client already had.
+  clientId?: string;
+  audience?: string;
+  redirectUris?: string[];
+  allowedAuthMethods?: string[];
+  accessTokenTtlSeconds?: number;
+  refreshTokenTtlSeconds?: number;
+}> = [
   { name: 'World Pet Association', slug: 'world-pet-association', type: AuthClientType.FIRST_PARTY_APP },
-  { name: 'Furtail', slug: 'furtail', type: AuthClientType.FIRST_PARTY_APP },
+  {
+    name: 'Furtail',
+    slug: 'furtail',
+    type: AuthClientType.FIRST_PARTY_APP,
+    // Dedicated Furtail mobile client identifier + JWT audience, so
+    // Furtail-issued tokens are distinguishable from BPA's ("bpa-mobile")
+    // at verification time (see ADDITIONAL_JWT_AUDIENCES in .env.example).
+    clientId: 'furtail-mobile',
+    audience: 'furtail-mobile',
+    // Android system-browser OAuth callback (flutter_web_auth_2 pattern,
+    // matching the BPA reference app) + local dev web origins.
+    redirectUris: [
+      'furtailapp://oauth-callback',
+      'http://localhost:5011/api/auth/callback',
+      'http://localhost:5012/api/auth/callback',
+    ],
+    // Empty array = all current auth methods allowed (password, social,
+    // etc.) — same default as every other client; listed explicitly here
+    // as the place to restrict this later (e.g. disable Microsoft/org SSO
+    // for Furtail specifically) once per-client provider scoping ships.
+    allowedAuthMethods: [],
+  },
   { name: 'Fortail Lab', slug: 'fortail-lab', type: AuthClientType.FIRST_PARTY_APP },
   { name: 'Bangladesh Pet Association', slug: 'bangladesh-pet-association', type: AuthClientType.FIRST_PARTY_APP },
   { name: 'WPA Payment Gateway', slug: 'wpa-payment-gateway', type: AuthClientType.SERVICE },
@@ -146,17 +180,24 @@ async function main() {
     if (!existing) {
       const generatedSecret = crypto.randomBytes(32).toString('base64url');
       const hash = crypto.createHash('sha256').update(generatedSecret).digest('hex');
-      
+      const defaultRedirectUris = process.env.ALLOWED_PUBLIC_ORIGINS
+        ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map((s) => s.trim() + '/api/auth/callback')
+        : ['http://localhost:5011/api/auth/callback', 'http://localhost:5012/api/auth/callback'];
+
       const newClient = await prisma.authClient.create({
         data: {
           name: c.name,
           slug: c.slug,
           type: c.type,
-          clientId: `${c.slug.replace(/-/g, '_')}_client_id`,
+          clientId: c.clientId ?? `${c.slug.replace(/-/g, '_')}_client_id`,
           clientSecretHash: hash,
           status: AuthClientStatus.ACTIVE,
           allowedOrigins: process.env.ALLOWED_PUBLIC_ORIGINS ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map(s=>s.trim()) : ['*'],
-          redirectUris: process.env.ALLOWED_PUBLIC_ORIGINS ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map(s=>s.trim() + '/api/auth/callback') : ['http://localhost:5011/api/auth/callback', 'http://localhost:5012/api/auth/callback'],
+          redirectUris: c.redirectUris ?? defaultRedirectUris,
+          audience: c.audience ?? null,
+          allowedAuthMethods: c.allowedAuthMethods ?? [],
+          accessTokenTtlSeconds: c.accessTokenTtlSeconds ?? null,
+          refreshTokenTtlSeconds: c.refreshTokenTtlSeconds ?? null,
         },
       });
       console.log(`\n======================================================`);
@@ -183,15 +224,41 @@ async function main() {
 
       await prisma.authClient.update({
         where: { id: existing.id },
-        data: { 
-          name: c.name, 
+        data: {
+          name: c.name,
           type: c.type,
-          ...(updatedHash ? { clientSecretHash: updatedHash } : {})
+          ...(updatedHash ? { clientSecretHash: updatedHash } : {}),
+          // Only touch these when this client explicitly declares them, so
+          // pre-existing clients (BPA, etc.) that don't list overrides are
+          // never modified by re-running the seed.
+          ...(c.clientId ? { clientId: c.clientId } : {}),
+          ...(c.audience ? { audience: c.audience } : {}),
+          ...(c.redirectUris ? { redirectUris: c.redirectUris } : {}),
+          ...(c.allowedAuthMethods ? { allowedAuthMethods: c.allowedAuthMethods } : {}),
+          ...(c.accessTokenTtlSeconds ? { accessTokenTtlSeconds: c.accessTokenTtlSeconds } : {}),
+          ...(c.refreshTokenTtlSeconds ? { refreshTokenTtlSeconds: c.refreshTokenTtlSeconds } : {}),
         }
       });
     }
   }
   console.log('Clients seeded.');
+
+  // 3b. Furtail application branding metadata (reuses the existing
+  // ClientBranding model — see EmailTemplate.clientId / CommunicationRoutingRule.appId
+  // for the same nullable-per-app-override pattern already used elsewhere).
+  const furtailClient = await prisma.authClient.findUnique({ where: { slug: 'furtail' } });
+  if (furtailClient) {
+    await prisma.clientBranding.upsert({
+      where: { clientId: furtailClient.id },
+      update: {},
+      create: {
+        clientId: furtailClient.id,
+        senderName: 'Furtail',
+        isActive: true,
+      },
+    });
+    console.log('Furtail client branding seeded.');
+  }
 
   const providerSeed = [
     { provider: OAuthProvider.GOOGLE, displayName: 'Google', placement: SocialIdentityProviderPlacement.MAIN, sortOrder: 1 },
