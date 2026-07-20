@@ -348,7 +348,7 @@ export async function loginUser(
   // extra audiences appended; every other login's token is byte-identical
   // to before this change.
   const accessAudience = adminAudiences.length > 0
-    ? [audience ?? config.ACCESS_TOKEN_AUDIENCE, ...adminAudiences]
+    ? Array.from(new Set([audience ?? config.ACCESS_TOKEN_AUDIENCE, ...adminAudiences]))
     : audience;
   const accessToken = signAccessToken({
     sub: user.id,
@@ -647,7 +647,7 @@ export async function refreshTokens(rawRefreshToken: string, req: Request, reque
   const servicePerms = await getServiceAdminPermissions(user.id);
   const adminAudiences = adminAudiencesForPermissions(servicePerms);
   const accessAudience = adminAudiences.length > 0
-    ? [audience ?? config.ACCESS_TOKEN_AUDIENCE, ...adminAudiences]
+    ? Array.from(new Set([audience ?? config.ACCESS_TOKEN_AUDIENCE, ...adminAudiences]))
     : audience;
   const newAccess = signAccessToken({
     sub: user.id,

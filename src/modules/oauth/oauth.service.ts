@@ -359,7 +359,7 @@ export async function exchangeAuthorizationCode(opts: {
   const servicePerms = await getServiceAdminPermissions(user.id);
   const adminAudiences = adminAudiencesForPermissions(servicePerms);
   const baseAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
-  const accessAudience = adminAudiences.length > 0 ? [baseAudience, ...adminAudiences] : baseAudience;
+  const accessAudience = adminAudiences.length > 0 ? Array.from(new Set([baseAudience, ...adminAudiences])) : baseAudience;
   const accessToken = signAccessToken(
     { sub: user.id, email: user.email, username: user.username, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
     accessAudience,
@@ -523,7 +523,7 @@ export async function exchangeRefreshToken(opts: {
   const servicePerms = await getServiceAdminPermissions(user.id);
   const adminAudiences = adminAudiencesForPermissions(servicePerms);
   const baseAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
-  const accessAudience = adminAudiences.length > 0 ? [baseAudience, ...adminAudiences] : baseAudience;
+  const accessAudience = adminAudiences.length > 0 ? Array.from(new Set([baseAudience, ...adminAudiences])) : baseAudience;
   const accessToken = signAccessToken(
     { sub: user.id, email: user.email, username: user.username, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
     accessAudience,
