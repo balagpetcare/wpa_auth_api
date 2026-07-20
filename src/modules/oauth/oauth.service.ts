@@ -17,6 +17,7 @@ import { getRedisClient } from '../../lib/redis.js';
 import { Request } from 'express';
 import { logAbuseSignal } from '../../lib/antiAbuse.js';
 import { exportJwks } from '../../lib/signingKeys.js';
+import { getServiceAdminPermissions, adminAudiencesForPermissions } from '../../lib/adminAccess.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -350,8 +351,20 @@ export async function exchangeAuthorizationCode(opts: {
   if (!user || user.status !== 'ACTIVE') throw new AppError('User account is not active.', 'ACCOUNT_INACTIVE', 403);
 
   const roles = await getUserRoleNames(user.id);
-  const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
-  const refreshToken = signRefreshToken(user.id);
+  // Pre-existing gap fixed here (Global Super Admin Stage 2): this call
+  // previously ignored client.audience entirely and always signed with the
+  // global default. Clients without a configured audience are unaffected
+  // (same fallback as before); clients that DO set one (e.g. Furtail,
+  // and now the admin-frontend OAuth clients) now correctly receive it.
+  const servicePerms = await getServiceAdminPermissions(user.id);
+  const adminAudiences = adminAudiencesForPermissions(servicePerms);
+  const baseAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
+  const accessAudience = adminAudiences.length > 0 ? [baseAudience, ...adminAudiences] : baseAudience;
+  const accessToken = signAccessToken(
+    { sub: user.id, email: user.email, username: user.username, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
+    accessAudience,
+  );
+  const refreshToken = signRefreshToken(user.id, client.audience ?? undefined);
 
   const familyId = generateOpaqueToken(16);
 
@@ -507,7 +520,14 @@ export async function exchangeRefreshToken(opts: {
   });
 
   const roles = await getUserRoleNames(user.id);
-  const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles });
+  const servicePerms = await getServiceAdminPermissions(user.id);
+  const adminAudiences = adminAudiencesForPermissions(servicePerms);
+  const baseAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
+  const accessAudience = adminAudiences.length > 0 ? [baseAudience, ...adminAudiences] : baseAudience;
+  const accessToken = signAccessToken(
+    { sub: user.id, email: user.email, username: user.username, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
+    accessAudience,
+  );
 
   await writeAuditLog({
     userId: user.id,
