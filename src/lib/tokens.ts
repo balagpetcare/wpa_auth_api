@@ -9,6 +9,11 @@ export interface AccessTokenPayload {
   roles: string[];
   sid?: string;
   aud?: string | string[];
+  // Small, bounded set of service-scoped wildcard permissions (e.g.
+  // "bpa:*") for Global Super Admin-style principals only. Deliberately
+  // NOT a general permission dump — see docs on the bpa-admin session
+  // cookie 4KB/Nginx-502 incident this is designed to avoid repeating.
+  perms?: string[];
 }
 
 // Additive multi-client audience support (Furtail centralized-auth
@@ -25,7 +30,7 @@ export function getAllowedAudiences(): string[] {
   return Array.from(new Set([config.ACCESS_TOKEN_AUDIENCE, ...extra]));
 }
 
-export function signAccessToken(payload: AccessTokenPayload, audience?: string): string {
+export function signAccessToken(payload: AccessTokenPayload, audience?: string | string[]): string {
   const { aud: _ignored, ...claims } = payload;
   return jwt.sign(claims, config.JWT_ACCESS_SECRET, {
     expiresIn: config.ACCESS_TOKEN_TTL as any,

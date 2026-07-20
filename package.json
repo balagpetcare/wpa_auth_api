@@ -12,6 +12,7 @@
     "retention:prune": "tsx src/scripts/retentionPrune.ts",
     "credentials:reencrypt": "tsx src/scripts/reencryptProviderCredentials.ts",
     "smoke:communication-events": "tsx src/scripts/smokeExternalCommunicationEvents.ts",
+    "bootstrap:global-super-admin": "tsx src/scripts/bootstrapGlobalSuperAdmin.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",

@@ -13,6 +13,7 @@ import {
 } from '../../lib/tokens.js';
 import { AppError, ErrorCodes } from '../../lib/errors.js';
 import { writeAuditLog, writeSecurityEvent } from '../../lib/audit.js';
+import { getServiceAdminPermissions, adminAudiencesForPermissions } from '../../lib/adminAccess.js';
 import { createAdminNotification } from '../../lib/adminNotifications.js';
 import { sendEmail } from '../../lib/mailer.js';
 import { sendTemplatedEmail, sendTemplatedEmailWithFallback } from '../../lib/sendTemplatedEmail.js';
@@ -24,7 +25,7 @@ import { incrementMetric } from '../../lib/metrics.js';
 import { removeAvatarByUrl } from '../../lib/avatarStorage.js';
 import { buildActionLink } from './resetLinkRouting.js';
 
-const BCRYPT_ROUNDS = 12;
+export const BCRYPT_ROUNDS = 12;
 
 /**
  * Builds an auth-email action link (password reset / email verification),
@@ -341,13 +342,22 @@ export async function loginUser(
 
   const roles = await getUserRoles(user.id);
   const audience = client?.audience ?? undefined;
+  const servicePerms = await getServiceAdminPermissions(user.id);
+  const adminAudiences = adminAudiencesForPermissions(servicePerms);
+  // Only Global Super Admin-style principals (non-empty servicePerms) get
+  // extra audiences appended; every other login's token is byte-identical
+  // to before this change.
+  const accessAudience = adminAudiences.length > 0
+    ? [audience ?? config.ACCESS_TOKEN_AUDIENCE, ...adminAudiences]
+    : audience;
   const accessToken = signAccessToken({
     sub: user.id,
     email: user.email,
     username: user.username,
     roles,
     sid: session.id,
-  }, audience);
+    ...(servicePerms.length > 0 ? { perms: servicePerms } : {}),
+  }, accessAudience);
   const refreshToken = signRefreshToken(user.id, audience);
   const tokenHash = hashToken(refreshToken);
 
@@ -634,13 +644,19 @@ export async function refreshTokens(rawRefreshToken: string, req: Request, reque
   });
 
   const roles = await getUserRoles(user.id);
+  const servicePerms = await getServiceAdminPermissions(user.id);
+  const adminAudiences = adminAudiencesForPermissions(servicePerms);
+  const accessAudience = adminAudiences.length > 0
+    ? [audience ?? config.ACCESS_TOKEN_AUDIENCE, ...adminAudiences]
+    : audience;
   const newAccess = signAccessToken({
     sub: user.id,
     email: user.email,
     username: user.username,
     roles,
     sid: familyId ?? undefined,
-  }, audience);
+    ...(servicePerms.length > 0 ? { perms: servicePerms } : {}),
+  }, accessAudience);
 
   await writeAuditLog({ userId: user.id, action: 'TOKEN_REFRESHED', req });
 
