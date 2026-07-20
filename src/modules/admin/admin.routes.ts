@@ -12,6 +12,7 @@ import * as authService from '../auth/auth.service.js';
 import * as deletionService from '../deletion/deletion.service.js';
 import * as socialService from '../auth/social.service.js';
 import { avatarUpload } from '../../middleware/upload.js';
+import { uploadAvatarBuffer } from '../../lib/avatarStorage.js';
 import { AppError } from '../../lib/errors.js';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
 import { getOperationalSnapshot, renderPrometheusMetrics } from '../../lib/metrics.js';
@@ -948,7 +949,8 @@ router.post('/account/avatar', (req, res, next) => {
     try {
       const file = (req as AuthenticatedRequest & { file?: Express.Multer.File }).file;
       if (!file) throw new AppError('Avatar file is required.', 'VALIDATION_ERROR', 400);
-      const avatarUrl = adminService.buildAvatarPublicUrl(file.filename);
+      const key = await uploadAvatarBuffer(file.buffer, file.mimetype);
+      const avatarUrl = adminService.buildAvatarPublicUrl(key);
       const data = await adminService.updateMyAvatar((req as AuthenticatedRequest).user!.id, avatarUrl, req);
       res.json({ success: true, data, message: 'Profile picture updated successfully.' });
     } catch (err) {

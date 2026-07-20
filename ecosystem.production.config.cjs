@@ -42,6 +42,13 @@ module.exports = {
       // env_file: '.env',
       env: {
         NODE_ENV: 'production',
+        // This VPS has no outbound IPv6 route. Node's Happy-Eyeballs dual-stack
+        // connection logic mishandles ENETUNREACH on IPv6 candidates for hosts
+        // with both A/AAAA records (e.g. Backblaze B2's S3 endpoint), causing
+        // spurious TimeoutErrors instead of falling back to IPv4. Confirmed fix
+        // (needed now that this app uploads avatars to B2): force IPv4-only
+        // resolution for all outbound connections.
+        NODE_OPTIONS: '--dns-result-order=ipv4first --no-network-family-autoselection',
         // Communication abuse protection (src/lib/antiAbuse.ts). Non-secret
         // tuning values — safe to keep here; real secrets stay in the
         // deployment-managed .env. See .env.production.example for details.

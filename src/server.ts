@@ -7,7 +7,6 @@ import { createRedisClient, closeRedisClient, getRedisClient } from './lib/redis
 import { prisma } from './lib/db.js';
 import apiRouter from './routes/index.js';
 import { errorHandler } from './middleware/error.js';
-import { ensureAvatarDirectory, getAvatarDirectory } from './lib/avatarStorage.js';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { incrementMetric, recordRequestLatency, updateHealthStatus } from './lib/metrics.js';
 import { AppError } from './lib/errors.js';
@@ -35,8 +34,9 @@ if (config.TRUST_PROXY) {
 
 // Security headers (Phase 1 audit fix — see docs/wpa-central-auth-api-complete-audit.md).
 // Mounted before CORS/routes. crossOriginResourcePolicy is relaxed to
-// 'cross-origin' so that avatar images served from /uploads/avatars can still
-// be loaded by other allowed origins (the admin panel, first-party apps).
+// 'cross-origin' for other allowed origins (admin panel, first-party apps)
+// consuming this JSON API. Avatars are served from Backblaze B2 directly,
+// not from this server.
 // contentSecurityPolicy is disabled: this is a JSON API (not serving HTML
 // pages), so a CSP designed for browser-rendered pages isn't applicable here
 // and defaults could unexpectedly interfere with API responses/tools.
@@ -65,12 +65,8 @@ app.use(cors({
 }));
 
 app.use(express.json());
-void ensureAvatarDirectory();
-app.use('/uploads/avatars', express.static(getAvatarDirectory(), {
-  fallthrough: false,
-  index: false,
-  maxAge: '1d',
-}));
+// Avatars are served directly from Backblaze B2 (STORAGE_PUBLIC_URL) —
+// no local /uploads/avatars static route needed.
 
 // Request correlation + request logger middleware
 app.use(requestIdMiddleware);

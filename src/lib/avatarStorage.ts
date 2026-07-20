@@ -1,13 +1,13 @@
-import fs from 'fs/promises';
-import path from 'path';
 import crypto from 'crypto';
-import { fileURLToPath } from 'url';
+import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const projectRoot = path.resolve(__dirname, '../../');
-const avatarDirectory = path.join(projectRoot, 'uploads', 'avatars');
-const publicAvatarBasePath = '/uploads/avatars';
+/**
+ * Avatar storage — Backblaze B2 (S3-compatible). Previously wrote files to
+ * local VPS disk (uploads/avatars/); migrated so no production uploads are
+ * stored on the VPS. Function names/signatures kept stable so callers
+ * (auth.routes.ts, auth.service.ts, admin.service.ts, deletion.service.ts)
+ * needed minimal changes.
+ */
 
 const allowedMimeToExt: Record<string, string> = {
   'image/jpeg': '.jpg',
@@ -15,27 +15,43 @@ const allowedMimeToExt: Record<string, string> = {
   'image/webp': '.webp',
 };
 
-export function getAvatarDirectory() {
-  return avatarDirectory;
+function requiredEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing required storage env var: ${name}`);
+  return v;
 }
 
-export function getPublicAvatarUrl(filename: string) {
-  const apiBase = process.env.API_BASE_URL || 'http://localhost:5010';
-  return `${apiBase}${publicAvatarBasePath}/${filename}`;
+function isConfigured(): boolean {
+  return Boolean(
+    process.env.S3_ENDPOINT &&
+      process.env.S3_REGION &&
+      process.env.S3_BUCKET &&
+      process.env.S3_ACCESS_KEY &&
+      process.env.S3_SECRET_KEY
+  );
 }
 
-export function getAvatarFilenameFromUrl(url?: string | null) {
-  if (!url) return null;
-  const pathPart = `${publicAvatarBasePath}/`;
-  const index = url.indexOf(pathPart);
-  if (index === -1) return null;
-  const filename = url.slice(index + pathPart.length);
-  if (!/^[a-zA-Z0-9._-]+$/.test(filename)) return null;
-  return filename;
+let client: S3Client | null = null;
+function getClient(): S3Client {
+  if (client) return client;
+  client = new S3Client({
+    region: requiredEnv('S3_REGION'),
+    endpoint: requiredEnv('S3_ENDPOINT'),
+    forcePathStyle: String(process.env.S3_FORCE_PATH_STYLE || 'false').toLowerCase() === 'true',
+    credentials: {
+      accessKeyId: requiredEnv('S3_ACCESS_KEY'),
+      secretAccessKey: requiredEnv('S3_SECRET_KEY'),
+    },
+  });
+  return client;
 }
 
-export async function ensureAvatarDirectory() {
-  await fs.mkdir(avatarDirectory, { recursive: true });
+function publicBase(): string {
+  return String(process.env.STORAGE_PUBLIC_URL || '').replace(/\/$/, '');
+}
+
+function bucketName(): string {
+  return requiredEnv('S3_BUCKET');
 }
 
 export function generateAvatarFilename(mimeType: string) {
@@ -46,13 +62,47 @@ export function generateAvatarFilename(mimeType: string) {
   return `${Date.now()}-${crypto.randomUUID()}${ext}`;
 }
 
+/** Uploads an avatar buffer to B2 under avatars/ and returns its object key. */
+export async function uploadAvatarBuffer(buffer: Buffer, mimeType: string): Promise<string> {
+  if (!isConfigured()) {
+    throw new Error('Avatar storage is not configured (S3_ENDPOINT/S3_REGION/S3_BUCKET/S3_ACCESS_KEY/S3_SECRET_KEY).');
+  }
+  const key = `avatars/${generateAvatarFilename(mimeType)}`;
+  await getClient().send(
+    new PutObjectCommand({
+      Bucket: bucketName(),
+      Key: key,
+      Body: buffer,
+      ContentType: mimeType,
+    })
+  );
+  return key;
+}
+
+/** Canonical public URL for a stored avatar object key. */
+export function getPublicAvatarUrl(key: string) {
+  return `${publicBase()}/${bucketName()}/${key}`;
+}
+
+function getAvatarKeyFromUrl(url?: string | null): string | null {
+  if (!url) return null;
+  const prefix = `${publicBase()}/${bucketName()}/`;
+  if (!url.startsWith(prefix)) return null;
+  const key = url.slice(prefix.length);
+  // avatars/<timestamp>-<uuid>.<ext> — reject anything else defensively.
+  if (!/^avatars\/[a-zA-Z0-9._-]+$/.test(key)) return null;
+  return key;
+}
+
 export async function removeAvatarByUrl(url?: string | null) {
-  const filename = getAvatarFilenameFromUrl(url);
-  if (!filename) return;
-  const filePath = path.join(avatarDirectory, filename);
+  const key = getAvatarKeyFromUrl(url);
+  if (!key) return;
+  if (!isConfigured()) return;
   try {
-    await fs.unlink(filePath);
+    await getClient().send(new DeleteObjectCommand({ Bucket: bucketName(), Key: key }));
   } catch (error: any) {
-    if (error?.code !== 'ENOENT') throw error;
+    // Object already gone (or never existed) — same "best effort" semantics
+    // the previous fs.unlink/ENOENT-tolerant implementation had.
+    if (error?.name !== 'NoSuchKey' && error?.$metadata?.httpStatusCode !== 404) throw error;
   }
 }

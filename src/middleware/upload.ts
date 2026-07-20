@@ -1,28 +1,13 @@
 import multer from 'multer';
 import path from 'path';
 import { AppError } from '../lib/errors.js';
-import { ensureAvatarDirectory, generateAvatarFilename, getAvatarDirectory } from '../lib/avatarStorage.js';
 
 const allowedMimeTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const allowedExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 
-const storage = multer.diskStorage({
-  destination: async (_req, _file, cb) => {
-    try {
-      await ensureAvatarDirectory();
-      cb(null, getAvatarDirectory());
-    } catch (error) {
-      cb(error as Error, '');
-    }
-  },
-  filename: (_req, file, cb) => {
-    try {
-      cb(null, generateAvatarFilename(file.mimetype));
-    } catch (error) {
-      cb(error as Error, '');
-    }
-  },
-});
+// Memory storage: the buffer is uploaded straight to B2 (see
+// avatarStorage.ts's uploadAvatarBuffer) — nothing is written to VPS disk.
+const storage = multer.memoryStorage();
 
 function fileFilter(_req: Express.Request, file: Express.Multer.File, cb: multer.FileFilterCallback) {
   const ext = path.extname(file.originalname).toLowerCase();

@@ -10,7 +10,7 @@ import identityAuthRoutes from './identityAuth.routes.js';
 import enterpriseAuthRoutes from './enterpriseAuth.routes.js';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
 import { avatarUpload } from '../../middleware/upload.js';
-import { getPublicAvatarUrl } from '../../lib/avatarStorage.js';
+import { getPublicAvatarUrl, uploadAvatarBuffer } from '../../lib/avatarStorage.js';
 
 const router = Router();
 
@@ -185,9 +185,10 @@ router.post('/me/avatar', authGuard, (req, res, next) => {
       if (!file) {
         throw new Error('Avatar file is required.');
       }
+      const key = await uploadAvatarBuffer(file.buffer, file.mimetype);
       const user = await authService.updateCurrentUserAvatar(
         (req as AuthenticatedRequest).user!.id,
-        getPublicAvatarUrl(file.filename),
+        getPublicAvatarUrl(key),
         req,
       );
       res.json({ success: true, user });
