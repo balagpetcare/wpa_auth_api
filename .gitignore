@@ -25,6 +25,18 @@ scratch/
 logs/
 *.log
 
+# Local-only token-minting / throwaway debug scripts — never publish (can mint
+# real admin JWTs). Underscore prefix is this repo's convention for scratch
+# scripts that must stay local; src/scripts/ also holds legitimate tracked
+# production scripts, so only this narrow pattern is ignored.
+src/scripts/_*.ts
+
+# Stage 2.2 auth validation fixtures/cleanup — throwaway test artifacts, not
+# production source.
+src/scripts/stage-2-2-*.ts
+src/scripts/stage22*.ts
+scripts/stage-2-2-test-matrix.sh
+
 # IDE
 .vscode/
 .idea/
