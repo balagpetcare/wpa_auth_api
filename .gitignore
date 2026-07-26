@@ -48,3 +48,5 @@ scripts/stage-2-2-test-matrix.sh
 # Prisma
 /generated/prisma
 prisma/client/
+
+.env-copy
