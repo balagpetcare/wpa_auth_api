@@ -13,6 +13,9 @@ model User {
   username                       String?                         @unique
   passwordHash                   String?                         @map("password_hash")
   displayName                    String?                         @map("display_name")
+  firstName                      String?                         @map("first_name")
+  lastName                       String?                         @map("last_name")
+  dateOfBirth                    DateTime?                       @map("date_of_birth") @db.Date
   avatarUrl                      String?                         @map("avatar_url")
   status                         UserStatus                      @default(PENDING_VERIFICATION)
   emailVerifiedAt                DateTime?                       @map("email_verified_at")
@@ -52,6 +55,7 @@ model User {
   emailTemplateAuditLogs         EmailTemplateAuditLog[]
   emailTemplatesUpdated          EmailTemplate[]                 @relation("EmailTemplateUpdatedBy")
   emailVerificationTokens        EmailVerificationToken[]
+  phoneChangeTokens              PhoneChangeToken[]
   loginSessions                  LoginSession[]
   oauthAccounts                  OAuthAccount[]
   passwordResetTokens            PasswordResetToken[]
@@ -382,11 +386,32 @@ model EmailVerificationToken {
   @@map("email_verification_tokens")
 }
 
+// Mirrors EmailVerificationToken for the phone-change OTP flow (see
+// requestPhoneChange/confirmPhoneChange in auth.service.ts): stores the
+// hashed OTP code (never the raw code) and the target phone number so an
+// authenticated user can change their verified phone only after proving
+// control of the new number.
+model PhoneChangeToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  phone     String
+  codeHash  String    @map("code_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  attempts  Int       @default(0)
+  createdAt DateTime  @default(now()) @map("created_at")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("phone_change_tokens")
+}
+
 model DeletionRequest {
   id                    String                 @id @default(cuid())
   confirmationCode      String                 @unique @map("confirmation_code")
   requestType           DeletionRequestType    @map("request_type")
-  status                DeletionRequestStatus   @default(PENDING_REVIEW)
+  status                DeletionRequestStatus  @default(PENDING_REVIEW)
   provider              OAuthProvider?
   requestSource         DeletionRequestSource  @map("request_source")
   userId                String?                @map("user_id")
@@ -419,15 +444,15 @@ model DeletionRequest {
 }
 
 model DeletionRequestEvent {
-  id                 String                @id @default(cuid())
-  deletionRequestId   String               @map("deletion_request_id")
-  eventType           DeletionRequestEventType @map("event_type")
-  actorSource         String               @default("SYSTEM") @map("actor_source")
-  actorUserId         String?              @map("actor_user_id")
-  actorAdminId        String?              @map("actor_admin_id")
-  metadata            Json?
-  createdAt           DateTime             @default(now()) @map("created_at")
-  request             DeletionRequest      @relation(fields: [deletionRequestId], references: [id], onDelete: Cascade)
+  id                String                   @id @default(cuid())
+  deletionRequestId String                   @map("deletion_request_id")
+  eventType         DeletionRequestEventType @map("event_type")
+  actorSource       String                   @default("SYSTEM") @map("actor_source")
+  actorUserId       String?                  @map("actor_user_id")
+  actorAdminId      String?                  @map("actor_admin_id")
+  metadata          Json?
+  createdAt         DateTime                 @default(now()) @map("created_at")
+  request           DeletionRequest          @relation(fields: [deletionRequestId], references: [id], onDelete: Cascade)
 
   @@index([deletionRequestId, createdAt])
   @@index([eventType, createdAt])
