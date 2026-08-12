@@ -1,12 +1,28 @@
-import { Router } from 'express';
+import { Router, urlencoded } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../../middleware/validate.js';
 import { socialStartRateLimit, socialCallbackRateLimit } from '../../middleware/rateLimit.js';
 import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
 import * as socialService from './social.service.js';
 import { issueMobileAuthCode, exchangeMobileAuthCode } from './mobileAuthCode.service.js';
+import { handleFacebookDeauthorizeCallback } from './facebookDeauthorize.service.js';
+import { config } from '../../config/index.js';
 
 const router = Router();
+const metaFormBody = urlencoded({ extended: false });
+
+export function parseSocialCallbackQuery(query: unknown) {
+  const parsed = z.object({
+    code: z.string().min(1).optional(),
+    state: z.string().min(1),
+    error: z.string().min(1).optional(),
+    error_description: z.string().min(1).optional(),
+    error_reason: z.string().min(1).optional(),
+  }).safeParse(query);
+  if (!parsed.success) return null;
+  if (!parsed.data.code && !parsed.data.error) return null;
+  return parsed.success ? parsed.data : null;
+}
 
 // ─── Mobile PKCE token exchange ──────────────────────────────────────────────
 // POST /auth/social/mobile/token — exchanges the single-use authorization
@@ -65,14 +81,56 @@ router.get('/:provider/link/start', authGuard, socialStartRateLimit, async (req:
   }
 });
 
+router.post(
+  '/facebook/deauthorize',
+  metaFormBody,
+  socialCallbackRateLimit,
+  validateBody(z.object({
+    signed_request: z.string().min(1).optional(),
+    signedRequest: z.string().min(1).optional(),
+  }).refine((value) => Boolean(value.signed_request || value.signedRequest), {
+    message: 'signed_request is required.',
+  })),
+  async (req, res, next) => {
+    try {
+      const signedRequest = req.body.signed_request ?? req.body.signedRequest;
+      await handleFacebookDeauthorizeCallback({ signedRequest, req });
+      res.status(200).send('OK');
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 router.get('/:provider/callback', socialCallbackRateLimit, async (req, res, next) => {
   try {
-    const parsed = z.object({ code: z.string().min(1), state: z.string().min(1) }).safeParse(req.query);
-    if (!parsed.success) {
+    const parsed = parseSocialCallbackQuery(req.query);
+    if (!parsed) {
       res.status(400).json({ success: false, message: 'Missing code or state.' });
       return;
     }
-    const result = await socialService.handleCallback(req.params.provider, parsed.data.code, parsed.data.state, req);
+    const statePayload = socialService.verifySocialState(parsed.state);
+    const isAdminTest = statePayload.purpose === 'ADMIN_PROVIDER_TEST';
+    if (parsed.error) {
+      if (isAdminTest && statePayload.providerConfigId) {
+        const message = parsed.error_description || parsed.error_reason || parsed.error || 'Facebook rejected the test login.';
+        await socialService.recordProviderTestFailure({
+          rowId: statePayload.providerConfigId,
+          errorMessage: message,
+          req,
+          actorId: statePayload.adminId ?? undefined,
+        });
+        const redirectTo = new URL(statePayload.returnTo ?? `${config.ADMIN_PANEL_ORIGIN.replace(/\/$/, '')}/authentication/social-providers`);
+        redirectTo.searchParams.set('provider', String(statePayload.provider ?? req.params.provider).toUpperCase());
+        redirectTo.searchParams.set('test', 'failure');
+        redirectTo.searchParams.set('message', message.slice(0, 160));
+        res.redirect(redirectTo.toString());
+        return;
+      }
+      res.status(400).json({ success: false, code: 'OAUTH_ERROR', message: parsed.error_description || parsed.error || 'OAuth provider rejected the request.' });
+      return;
+    }
+    const result = await socialService.handleCallback(req.params.provider, parsed.code!, parsed.state, req);
 
     // Mobile system-browser flow (flutter_web_auth_2): when the signed state
     // carries a registered custom-scheme redirect for the requesting
@@ -80,7 +138,7 @@ router.get('/:provider/callback', socialCallbackRateLimit, async (req, res, next
     // never the tokens themselves. The app exchanges it at
     // POST /auth/mobile/token with its PKCE code_verifier. Web/JSON callers
     // (BPA today) get the pre-existing responses unchanged.
-    const mobile = await socialService.resolveMobileRedirect(parsed.data.state);
+    const mobile = await socialService.resolveMobileRedirect(parsed.state);
     if (mobile) {
       const echoState = (extra: Record<string, string>) =>
         new URLSearchParams({ ...extra, ...(mobile.appState ? { state: mobile.appState } : {}) }).toString();
@@ -131,6 +189,10 @@ router.get('/:provider/callback', socialCallbackRateLimit, async (req, res, next
     }
     if (result.kind === 'LINKED') {
       res.json({ success: true, linked: true, provider: result.provider });
+      return;
+    }
+    if (result.kind === 'ADMIN_TEST_COMPLETE') {
+      res.redirect(result.redirectUrl);
       return;
     }
     res.json({ success: true, accessToken: result.accessToken, refreshToken: result.refreshToken, expiresIn: result.expiresIn, user: result.user });

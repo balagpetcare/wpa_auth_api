@@ -11,12 +11,37 @@ import { resolveClient, getOrCreateInternalClientId } from './auth.service.js';
 import type { Request } from 'express';
 import { appCallbackUrl, buildStateNonce, githubAdapter, instagramAdapter, linkedInAdapter, tiktokAdapter, xAdapter, type NormalizedSocialProfile, type SocialProviderAdapter } from './social-providers/index.js';
 import { computeProviderReadiness } from './social-readiness.js';
+import { getFacebookAuthorizationUrl, getFacebookTokenUrl, getFacebookUserInfoUrl } from './facebookMetaConfig.js';
 
 type ProviderProfile = NormalizedSocialProfile;
 type SocialCallbackResult =
   | { kind: 'LOGIN'; accessToken: string; refreshToken: string; expiresIn: number; user: { id: string; email: string | null; displayName: string | null; avatarUrl: string | null; roles: string[] } }
   | { kind: 'EMAIL_REQUIRED'; provider: OAuthProvider; completionToken: string; message: string }
-  | { kind: 'LINKED'; provider: OAuthProvider; userId: string };
+  | { kind: 'LINKED'; provider: OAuthProvider; userId: string }
+  | { kind: 'ADMIN_TEST_COMPLETE'; provider: OAuthProvider; redirectUrl: string; lastSuccessfulTestAt: string };
+
+type SocialFlowPurpose = 'SOCIAL_LOGIN' | 'SOCIAL_LINK' | 'ADMIN_PROVIDER_TEST';
+
+type SocialStatePayload = {
+  provider?: OAuthProvider;
+  purpose?: SocialFlowPurpose;
+  nonce?: string;
+  redirectContext?: Record<string, string | undefined>;
+  codeVerifier?: string;
+  clientDbId?: string | null;
+  audience?: string | null;
+  linkUserId?: string | null;
+  adminId?: string | null;
+  providerConfigId?: string | null;
+  returnTo?: string | null;
+  testRunId?: string | null;
+};
+
+type AdminProviderTestStart = {
+  providerConfigId: string;
+  adminId: string;
+  returnTo: string;
+};
 
 const adapterMap: Record<OAuthProvider, SocialProviderAdapter | undefined> = {
   GOOGLE: undefined,
@@ -59,7 +84,7 @@ function buildDefaultConfig(provider: OAuthProvider) {
   const callbackUrl = appCallbackUrl(provider);
   const endpoints: Record<OAuthProvider, { authorizationUrl: string; tokenUrl: string; userInfoUrl?: string; scopes: string[] }> = {
     GOOGLE: { authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth', tokenUrl: 'https://oauth2.googleapis.com/token', userInfoUrl: 'https://www.googleapis.com/oauth2/v3/userinfo', scopes: ['openid', 'email', 'profile'] },
-    FACEBOOK: { authorizationUrl: 'https://www.facebook.com/v19.0/dialog/oauth', tokenUrl: 'https://graph.facebook.com/v19.0/oauth/access_token', userInfoUrl: 'https://graph.facebook.com/me?fields=id,name,email,picture', scopes: ['email', 'public_profile'] },
+    FACEBOOK: { authorizationUrl: getFacebookAuthorizationUrl(), tokenUrl: getFacebookTokenUrl(), userInfoUrl: getFacebookUserInfoUrl(), scopes: ['email', 'public_profile'] },
     APPLE: { authorizationUrl: 'https://appleid.apple.com/auth/authorize', tokenUrl: 'https://appleid.apple.com/auth/token', scopes: ['name', 'email'] },
     MICROSOFT: { authorizationUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', tokenUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', userInfoUrl: 'https://graph.microsoft.com/oidc/userinfo', scopes: ['openid', 'email', 'profile', 'offline_access'] },
     LINKEDIN: { authorizationUrl: 'https://www.linkedin.com/oauth/v2/authorization', tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken', userInfoUrl: 'https://api.linkedin.com/v2/userinfo', scopes: ['openid', 'profile', 'email'] },
@@ -131,6 +156,83 @@ function signSocialEmailCompletionToken(data: { provider: OAuthProvider; provide
     config.JWT_ACCESS_SECRET,
     { expiresIn: '15m' },
   );
+}
+
+function buildAdminTestResultUrl(returnTo: string, result: 'success' | 'failure', provider: OAuthProvider, message?: string) {
+  const url = new URL(returnTo);
+  url.searchParams.set('provider', provider);
+  url.searchParams.set('test', result);
+  if (message) url.searchParams.set('message', message);
+  return url.toString();
+}
+
+function signSocialState(payload: SocialStatePayload) {
+  return jwt.sign(payload, config.JWT_ACCESS_SECRET, { expiresIn: '10m' });
+}
+
+export function verifySocialState(state: string): SocialStatePayload {
+  try {
+    return jwt.verify(state, config.JWT_ACCESS_SECRET) as SocialStatePayload;
+  } catch {
+    throw new AppError('Invalid or expired state.', 'INVALID_STATE', 400);
+  }
+}
+
+async function recordProviderTestOutcome(input: {
+  rowId: string;
+  success: boolean;
+  errorMessage?: string | null;
+  req?: Request;
+  actorId?: string | null;
+}) {
+  const now = new Date();
+  const data = input.success
+    ? {
+        lastTestAt: now,
+        lastSuccessfulTestAt: now,
+        lastTestStatus: 'SUCCESS',
+        lastTestError: null,
+      }
+    : {
+        lastTestAt: now,
+        lastTestStatus: 'FAILED',
+        lastTestError: (input.errorMessage ?? 'Provider test failed.').slice(0, 500),
+      };
+
+  await prisma.socialIdentityProviderConfig.update({
+    where: { id: input.rowId },
+    data,
+  });
+
+  try {
+    await writeAuditLog({
+      userId: input.actorId ?? undefined,
+      action: 'SOCIAL_PROVIDER_TESTED',
+      resource: 'social_provider',
+      resourceId: input.rowId,
+      req: input.req,
+      metadata: { success: input.success },
+    });
+  } catch (err) {
+    console.error('Failed to write social provider test audit log:', err);
+  }
+
+  return now;
+}
+
+export async function recordProviderTestFailure(input: {
+  rowId: string;
+  errorMessage?: string | null;
+  req?: Request;
+  actorId?: string | null;
+}) {
+  return recordProviderTestOutcome({
+    rowId: input.rowId,
+    success: false,
+    errorMessage: input.errorMessage,
+    req: input.req,
+    actorId: input.actorId,
+  });
 }
 
 async function resolveProfile(provider: OAuthProvider, accessToken: string, row: Awaited<ReturnType<typeof getConfig>>) {
@@ -368,26 +470,34 @@ export async function resolveMobileRedirect(state: string): Promise<MobileRedire
   }
 }
 
-export async function getStartRedirect(providerStr: string, req: Request, opts?: { linkUserId?: string }) {
+export async function getStartRedirect(providerStr: string, req: Request, opts?: { linkUserId?: string; adminTest?: AdminProviderTestStart }) {
   const provider = normalizeProvider(providerStr);
   const row = await getConfig(provider);
-  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', ErrorCodes.PROVIDER_DISABLED, 403);
   const readiness = computeProviderReadiness(row as any);
-  if (!readiness.readyForProduction) throw new AppError(`Provider is not ready for production login: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+  const isAdminTest = Boolean(opts?.adminTest);
+  if (!isAdminTest && row.status !== SocialIdentityProviderStatus.ACTIVE && !opts?.linkUserId) throw new AppError('Provider is disabled.', ErrorCodes.PROVIDER_DISABLED, 403);
+  if (!isAdminTest && !opts?.linkUserId && row.status === SocialIdentityProviderStatus.ACTIVE && !readiness.readyForProduction) throw new AppError(`Provider is not ready for production login: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+  if (isAdminTest && !readiness.canTest) {
+    throw new AppError(`${row.displayName} cannot be tested yet.`, 'PROVIDER_TEST_NOT_READY', 400, {
+      blockers: readiness.testBlockers,
+      lifecycleStage: readiness.lifecycleStage,
+    });
+  }
   if (!row.clientId) throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 400);
   const adapter = getAdapter(provider);
   const nonce = buildStateNonce();
   const codeVerifier = adapter?.requiresPkce ? crypto.randomBytes(32).toString('base64url') : undefined;
   const codeChallenge = codeVerifier ? crypto.createHash('sha256').update(codeVerifier).digest('base64url') : undefined;
+  const query = req?.query ?? {};
   const redirectContext = {
-    next: typeof req.query.next === 'string' ? req.query.next : undefined,
-    client_id: typeof req.query.client_id === 'string' ? req.query.client_id : undefined,
-    redirect_uri: typeof req.query.redirect_uri === 'string' ? req.query.redirect_uri : undefined,
-    scope: typeof req.query.scope === 'string' ? req.query.scope : undefined,
-    state: typeof req.query.state === 'string' ? req.query.state : undefined,
-    response_type: typeof req.query.response_type === 'string' ? req.query.response_type : undefined,
-    code_challenge: typeof req.query.code_challenge === 'string' ? req.query.code_challenge : undefined,
-    code_challenge_method: typeof req.query.code_challenge_method === 'string' ? req.query.code_challenge_method : undefined,
+    next: typeof query.next === 'string' ? query.next : undefined,
+    client_id: typeof query.client_id === 'string' ? query.client_id : undefined,
+    redirect_uri: typeof query.redirect_uri === 'string' ? query.redirect_uri : undefined,
+    scope: typeof query.scope === 'string' ? query.scope : undefined,
+    state: typeof query.state === 'string' ? query.state : undefined,
+    response_type: typeof query.response_type === 'string' ? query.response_type : undefined,
+    code_challenge: typeof query.code_challenge === 'string' ? query.code_challenge : undefined,
+    code_challenge_method: typeof query.code_challenge_method === 'string' ? query.code_challenge_method : undefined,
   };
   // App-aware client attribution (Furtail centralized-auth onboarding):
   // `app_client_id` is this app's own AuthClient.clientId (e.g.
@@ -397,21 +507,22 @@ export async function getStartRedirect(providerStr: string, req: Request, opts?:
   // handleCallback falls back to the internal default client — the same
   // effective behavior as before, minus the previous hardcoded-'social'
   // foreign-key bug.
-  const appClientIdParam = typeof req.query.app_client_id === 'string' ? req.query.app_client_id : undefined;
+  const appClientIdParam = typeof query.app_client_id === 'string' ? query.app_client_id : undefined;
   const requestingClient = appClientIdParam ? await resolveClient(appClientIdParam, req) : null;
-  const state = jwt.sign(
-    {
-      provider,
-      nonce,
-      redirectContext,
-      codeVerifier,
-      clientDbId: requestingClient?.id ?? null,
-      audience: requestingClient?.audience ?? null,
-      linkUserId: opts?.linkUserId ?? null,
-    },
-    config.JWT_ACCESS_SECRET,
-    { expiresIn: '10m' },
-  );
+  const state = signSocialState({
+    provider,
+    purpose: isAdminTest ? 'ADMIN_PROVIDER_TEST' : opts?.linkUserId ? 'SOCIAL_LINK' : 'SOCIAL_LOGIN',
+    nonce,
+    redirectContext,
+    codeVerifier,
+    clientDbId: requestingClient?.id ?? null,
+    audience: requestingClient?.audience ?? null,
+    linkUserId: opts?.linkUserId ?? null,
+    adminId: opts?.adminTest?.adminId ?? null,
+    providerConfigId: opts?.adminTest?.providerConfigId ?? null,
+    returnTo: opts?.adminTest?.returnTo ?? null,
+    testRunId: isAdminTest ? crypto.randomUUID() : null,
+  });
   if (adapter) {
     const authUrl = adapter.buildAuthorizationUrl(row, state, redirectContext);
     if (codeChallenge) {
@@ -426,29 +537,30 @@ export async function getStartRedirect(providerStr: string, req: Request, opts?:
     ? `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state, response_mode: 'form_post' }).toString()}`
     : row.provider === 'GITHUB'
       ? `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state, allow_signup: 'true' }).toString()}`
-      : `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state }).toString()}`;
+    : `${row.authorizationUrl}?${new URLSearchParams({ response_type: 'code', client_id: row.clientId, redirect_uri: row.redirectUri, scope: row.scopes.join(' '), state }).toString()}`;
+}
+
+export async function getAdminTestStartRedirect(input: AdminProviderTestStart, req: Request): Promise<string> {
+  const row = await prisma.socialIdentityProviderConfig.findUnique({ where: { id: input.providerConfigId } });
+  if (!row) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
+  return getStartRedirect(row.provider, req, { adminTest: input });
 }
 
 export async function handleCallback(providerStr: string, code: string, state: string, req: Request): Promise<SocialCallbackResult> {
   const provider = normalizeProvider(providerStr);
-  let payload: {
-    provider?: OAuthProvider;
-    codeVerifier?: string;
-    redirectContext?: Record<string, string | undefined>;
-    clientDbId?: string | null;
-    audience?: string | null;
-    linkUserId?: string | null;
-  };
-  try {
-    payload = jwt.verify(state, config.JWT_ACCESS_SECRET) as typeof payload;
-  } catch {
-    throw new AppError('Invalid or expired state.', 'INVALID_STATE', 400);
-  }
+  const payload = verifySocialState(state);
   if (payload.provider !== provider) throw new AppError('State provider mismatch.', 'INVALID_STATE', 400);
   const row = await getConfig(provider);
-  if (row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', ErrorCodes.PROVIDER_DISABLED, 403);
   const readiness = computeProviderReadiness(row as any);
-  if (!readiness.readyForProduction) throw new AppError(`Provider is not ready for production login: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+  const isAdminTest = payload.purpose === 'ADMIN_PROVIDER_TEST';
+  if (!isAdminTest && row.status !== SocialIdentityProviderStatus.ACTIVE) throw new AppError('Provider is disabled.', ErrorCodes.PROVIDER_DISABLED, 403);
+  if (!isAdminTest && !readiness.readyForProduction) throw new AppError(`Provider is not ready for production login: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+  if (isAdminTest && !readiness.canTest) {
+    throw new AppError(`${row.displayName} cannot be tested yet.`, 'PROVIDER_TEST_NOT_READY', 400, {
+      blockers: readiness.testBlockers,
+      lifecycleStage: readiness.lifecycleStage,
+    });
+  }
   if (!row.clientId || !row.clientSecretEncrypted) throw new AppError('Provider is not configured.', 'PROVIDER_MISCONFIGURED', 400);
   const secret = decryptSecret(row.clientSecretEncrypted as string).clientSecret;
   if (!secret) throw new AppError('Provider is missing client secret configuration.', 'PROVIDER_MISCONFIGURED', 400);
@@ -466,6 +578,29 @@ export async function handleCallback(providerStr: string, code: string, state: s
   }
   if (!accessToken) throw new AppError('Token exchange failed.', ErrorCodes.INVALID_PROVIDER_TOKEN, 502);
   const profile = await resolveProfile(provider, accessToken, row);
+
+  if (isAdminTest) {
+    if (!payload.providerConfigId || payload.providerConfigId !== row.id) {
+      throw new AppError('Provider test state did not match the configured provider.', 'INVALID_STATE', 400);
+    }
+    const redirectTo = buildAdminTestResultUrl(
+      payload.returnTo ?? `${config.ADMIN_PANEL_ORIGIN.replace(/\/$/, '')}/authentication/social-providers`,
+      'success',
+      provider,
+    );
+    const lastSuccessfulTestAt = await recordProviderTestOutcome({
+      rowId: row.id,
+      success: true,
+      req,
+      actorId: payload.adminId ?? undefined,
+    });
+    return {
+      kind: 'ADMIN_TEST_COMPLETE',
+      provider,
+      redirectUrl: redirectTo,
+      lastSuccessfulTestAt: lastSuccessfulTestAt.toISOString(),
+    };
+  }
 
   if (payload.linkUserId) {
     return linkIdentityToUser(provider, profile, payload.linkUserId, req);
@@ -544,31 +679,17 @@ export async function testProvider(id: string, actorId?: string, req?: Request) 
   const row = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
   if (!row) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
   const readiness = computeProviderReadiness(row as any);
-  if (!readiness.readyForProduction) {
-    await prisma.socialIdentityProviderConfig.update({
-      where: { id },
-      data: {
-        lastTestAt: new Date(),
-        lastTestStatus: 'FAILED',
-        lastTestError: readiness.blockers.join(' | ').slice(0, 500),
-      },
+  if (!readiness.canTest) {
+    throw new AppError(`${row.displayName} cannot be tested yet.`, 'PROVIDER_TEST_NOT_READY', 400, {
+      blockers: readiness.testBlockers,
+      lifecycleStage: readiness.lifecycleStage,
     });
-    throw new AppError(`Provider configuration is incomplete: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
   }
-  const now = new Date();
-  await prisma.socialIdentityProviderConfig.update({
-    where: { id },
-    data: {
-      lastTestAt: now,
-      lastSuccessfulTestAt: now,
-      lastTestStatus: 'SUCCESS',
-      lastTestError: null,
-    },
-  });
-  try {
-    await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_TESTED', resource: 'social_provider', resourceId: id, req, metadata: { provider: row.provider } });
-  } catch (err) {
-    console.error('Failed to write social provider test audit log:', err);
-  }
-  return { configured: true, status: row.status, provider: row.provider, readiness, lastSuccessfulTestAt: now };
+  const returnTo = `${config.ADMIN_PANEL_ORIGIN.replace(/\/$/, '')}/authentication/social-providers`;
+  const testUrl = await getAdminTestStartRedirect({
+    providerConfigId: row.id,
+    adminId: actorId ?? '',
+    returnTo,
+  }, req as Request);
+  return { success: true, provider: row.provider, readiness, testUrl };
 }

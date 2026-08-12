@@ -804,7 +804,7 @@ const socialProviderSchema = z.object({
   scopes: z.array(z.string()).default([]),
   redirectUri: z.string().url(),
   providerMetadata: z.record(z.string(), z.unknown()).optional(),
-  status: z.enum(['ACTIVE', 'INACTIVE']),
+  status: z.enum(['ACTIVE', 'INACTIVE']).optional(),
   environment: z.enum(['SANDBOX', 'LIVE']),
   placement: z.enum(['MAIN', 'MORE', 'HIDDEN']),
   sortOrder: z.coerce.number().int().default(0),
@@ -841,7 +841,7 @@ router.patch('/social-providers/:id/status', validateBody(z.object({ status: z.e
 router.post('/social-providers/:id/test', async (req: AuthenticatedRequest, res, next) => {
   try {
     const data = await socialService.testProvider(req.params.id, req.user!.id, req);
-    res.json({ success: true, data });
+    res.json(data);
   } catch (err) {
     next(err);
   }
@@ -1254,4 +1254,3 @@ router.post('/admin-invitations/:invitationId/revoke', requirePermission('users:
 });
 
 export default router;
-
