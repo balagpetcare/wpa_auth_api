@@ -58,6 +58,25 @@ function googleProvider(overrides: Partial<Prisma.SocialIdentityProviderConfigGe
   })
 }
 
+function instagramProvider(overrides: Partial<Prisma.SocialIdentityProviderConfigGetPayload<{}>> = {}) {
+  return baseProvider({
+    id: 'instagram-provider-1',
+    provider: 'INSTAGRAM',
+    displayName: 'Instagram',
+    clientId: 'instagram-client-id',
+    authorizationUrl: 'https://api.instagram.com/oauth/authorize',
+    tokenUrl: 'https://api.instagram.com/oauth/access_token',
+    userInfoUrl: 'https://graph.instagram.com/v26.0/me?fields=id,username',
+    scopes: ['instagram_business_basic'],
+    redirectUri: 'https://auth.worldpetsassociation.com/api/v1/auth/social/instagram/callback',
+    providerMetadata: {
+      integrationType: 'api_setup_with_instagram_login',
+      professionalAccountOnlyWarning: true,
+    },
+    ...overrides,
+  })
+}
+
 test('updateSocialProvider preserves the existing secret when Replace Secret is blank', async (t) => {
   const existing = baseProvider()
   const updateCalls: any[] = []
@@ -235,6 +254,41 @@ test('testProvider resolves Google using the Google provider row and signs GOOGL
     assert.ok(state)
     const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; providerConfigId?: string }
     assert.equal(payload.provider, 'GOOGLE')
+    assert.equal(payload.purpose, 'ADMIN_PROVIDER_TEST')
+    assert.equal(payload.providerConfigId, existing.id)
+  } finally {
+    ;(prisma.socialIdentityProviderConfig.findUnique as any) = originalFindUnique
+    ;(prisma.socialIdentityProviderConfig.update as any) = originalUpdate
+    ;(prisma.auditLog.create as any) = originalAuditCreate
+  }
+})
+
+test('testProvider resolves Instagram using the Instagram provider row and signs INSTAGRAM state', async () => {
+  const existing = instagramProvider({
+    status: 'INACTIVE',
+    providerMetadata: {
+      integrationType: 'api_setup_with_instagram_login',
+      professionalAccountOnlyWarning: true,
+    },
+  })
+  const originalFindUnique = prisma.socialIdentityProviderConfig.findUnique
+  const originalUpdate = prisma.socialIdentityProviderConfig.update
+  const originalAuditCreate = prisma.auditLog.create
+  ;(prisma.socialIdentityProviderConfig.findUnique as any) = async () => existing
+  ;(prisma.socialIdentityProviderConfig.update as any) = async () => {
+    throw new Error('testProvider should not persist test timestamps before the OAuth callback succeeds')
+  }
+  ;(prisma.auditLog.create as any) = async () => undefined
+  try {
+    const result = await testSocialProvider(existing.id, 'admin-1')
+    assert.equal(result.provider, 'INSTAGRAM')
+    assert.match(result.testUrl, /api\.instagram\.com\/oauth\/authorize/)
+    assert.match(result.testUrl, /redirect_uri=https%3A%2F%2Fauth\.worldpetsassociation\.com%2Fapi%2Fv1%2Fauth%2Fsocial%2Finstagram%2Fcallback/)
+    assert.match(result.testUrl, /scope=instagram_business_basic/)
+    const state = new URL(result.testUrl).searchParams.get('state')
+    assert.ok(state)
+    const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; providerConfigId?: string }
+    assert.equal(payload.provider, 'INSTAGRAM')
     assert.equal(payload.purpose, 'ADMIN_PROVIDER_TEST')
     assert.equal(payload.providerConfigId, existing.id)
   } finally {

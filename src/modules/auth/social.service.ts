@@ -91,7 +91,12 @@ function buildDefaultConfig(provider: OAuthProvider) {
     TIKTOK: { authorizationUrl: 'https://www.tiktok.com/v2/auth/authorize/', tokenUrl: 'https://open.tiktokapis.com/v2/oauth/token/', userInfoUrl: 'https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name', scopes: ['user.info.basic'] },
     X: { authorizationUrl: 'https://twitter.com/i/oauth2/authorize', tokenUrl: 'https://api.x.com/2/oauth2/token', userInfoUrl: 'https://api.x.com/2/users/me?user.fields=profile_image_url', scopes: ['tweet.read', 'users.read', 'offline.access'] },
     GITHUB: { authorizationUrl: 'https://github.com/login/oauth/authorize', tokenUrl: 'https://github.com/login/oauth/access_token', userInfoUrl: 'https://api.github.com/user', scopes: ['read:user', 'user:email'] },
-    INSTAGRAM: { authorizationUrl: 'https://api.instagram.com/oauth/authorize', tokenUrl: 'https://api.instagram.com/oauth/access_token', userInfoUrl: 'https://graph.instagram.com/me?fields=id,username', scopes: ['user_profile'] },
+    INSTAGRAM: {
+      authorizationUrl: 'https://api.instagram.com/oauth/authorize',
+      tokenUrl: 'https://api.instagram.com/oauth/access_token',
+      userInfoUrl: 'https://graph.instagram.com/v26.0/me?fields=id,username',
+      scopes: ['instagram_business_basic'],
+    },
     // Never actually used by this legacy OAuth-code-flow map (see
     // adapterMap above) — present only so this lookup object stays a total
     // function over OAuthProvider.

@@ -30,7 +30,9 @@ export const instagramAdapter: SocialProviderAdapter = {
     return String(data.access_token ?? '');
   },
   async fetchProfile(config, accessToken) {
-    const res = await fetch(config.userInfoUrl ?? '', { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' } });
+    const userInfoUrl = new URL(config.userInfoUrl ?? '');
+    userInfoUrl.searchParams.set('access_token', accessToken);
+    const res = await fetch(userInfoUrl.toString(), { headers: { Accept: 'application/json' } });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error('Instagram profile fetch failed.');
     return data as Record<string, unknown>;

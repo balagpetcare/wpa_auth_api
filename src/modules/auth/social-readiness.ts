@@ -13,10 +13,15 @@ export type ProviderReadinessCheck = {
 };
 
 export type ProviderReadiness = {
+  configurationReady: boolean;
+  canTest: boolean;
+  tested: boolean;
   readyForProduction: boolean;
   visibleOnLogin: boolean;
   canActivate: boolean;
+  lifecycleStage: 'INACTIVE' | 'CONFIGURED' | 'ADMIN_TESTABLE' | 'TESTED' | 'PRODUCTION_READY' | 'ACTIVE';
   blockers: string[];
+  testBlockers: string[];
   warnings: string[];
   checks: ProviderReadinessCheck[];
   publicUrls: {
@@ -66,12 +71,7 @@ const PROVIDER_SPECS: Record<OAuthProvider, ProviderSpec> = {
     requiredScopes: ['email', 'public_profile'],
     requiresUserInfoUrl: true,
     publicLoginSupported: true,
-    specificChecks: [
-      { key: 'appMode', label: 'App mode', guidance: 'Switch the Meta app to Live before enabling production login.' },
-      { key: 'appReview', label: 'App review', guidance: 'Ensure the login and data-access permissions have passed review.' },
-      { key: 'businessVerification', label: 'Business verification', guidance: 'Complete Business Manager verification when required by the requested permissions.' },
-      { key: 'dataDeletionCallbackStatus', label: 'Data-deletion callback/status URL', guidance: 'Register the public deletion callback and public status URL in the Meta app settings.' },
-    ],
+    specificChecks: [],
   },
   APPLE: {
     requiredScopes: ['name', 'email'],
@@ -131,9 +131,9 @@ const PROVIDER_SPECS: Record<OAuthProvider, ProviderSpec> = {
     ],
   },
   INSTAGRAM: {
-    requiredScopes: ['user_profile'],
+    requiredScopes: ['instagram_business_basic'],
     requiresUserInfoUrl: true,
-    publicLoginSupported: false,
+    publicLoginSupported: true,
     specificChecks: [
       { key: 'integrationType', label: 'Integration type', guidance: 'Set the integration type to the exact supported Instagram flow used by the deployment.' },
     ],
@@ -164,29 +164,53 @@ function isApproved(value: unknown) {
   return ['approved', 'verified', 'configured', 'live', 'enabled', 'active', 'complete', 'completed', 'passed', 'ok', 'success'].includes(normalized);
 }
 
-function pushCheck(checks: ProviderReadinessCheck[], blockers: string[], warnings: string[], check: ProviderReadinessCheck) {
+function isNotRequired(value: unknown) {
+  const normalized = normalizeString(value).toLowerCase();
+  return ['not_required', 'not required', 'not-required', 'n/a', 'na', 'none', 'not applicable'].includes(normalized);
+}
+
+function isApprovedOrNotRequired(value: unknown) {
+  return isApproved(value) || isNotRequired(value);
+}
+
+function isInstagramIntegrationTypeReady(value: unknown) {
+  const normalized = normalizeString(value).toLowerCase().replace(/\s+/g, '_');
+  return [
+    'api_setup_with_instagram_login',
+    'instagram_api_with_instagram_login',
+    'instagram_business_login',
+    'instagram_login',
+  ].includes(normalized);
+}
+
+function pushCheck(checks: ProviderReadinessCheck[], warnings: string[], check: ProviderReadinessCheck) {
   checks.push(check);
-  if (check.status === 'BLOCK') blockers.push(check.message);
   if (check.status === 'WARN') warnings.push(check.message);
 }
 
 function checkField(
   checks: ProviderReadinessCheck[],
   blockers: string[],
+  testBlockers: string[],
   warnings: string[],
   key: string,
   label: string,
   ok: boolean,
   guidance: string,
+  scope: 'both' | 'activation' | 'test' = 'both',
   warnOnly = false,
 ) {
-  pushCheck(checks, blockers, warnings, {
+  pushCheck(checks, warnings, {
     key,
     label,
     status: ok ? 'OK' : warnOnly ? 'WARN' : 'BLOCK',
     message: ok ? `${label} is configured.` : `${label} is not ready.`,
     guidance,
   });
+  if (!ok && !warnOnly) {
+    if (scope === 'both' || scope === 'activation') blockers.push(`${label} is not ready.`);
+    if (scope === 'both' || scope === 'test') testBlockers.push(`${label} is not ready.`);
+  }
 }
 
 export function computeProviderReadiness(row: SocialProviderWithExtras): ProviderReadiness {
@@ -194,59 +218,89 @@ export function computeProviderReadiness(row: SocialProviderWithExtras): Provide
   const metadata = asRecord(row.providerMetadata ?? null);
   const checks: ProviderReadinessCheck[] = [];
   const blockers: string[] = [];
+  const testBlockers: string[] = [];
   const warnings: string[] = [];
   const publicBase = config.PUBLIC_WEBSITE_ORIGIN.replace(/\/$/, '');
   const requiredRedirectUri = appCallbackUrl(row.provider);
+  const hasAnyCoreConfig = Boolean(
+    row.clientId?.trim()
+      || row.clientSecretEncrypted?.trim()
+      || row.authorizationUrl?.trim()
+      || row.tokenUrl?.trim()
+      || row.userInfoUrl?.trim()
+      || (Array.isArray(row.scopes) && row.scopes.length > 0)
+      || row.redirectUri?.trim(),
+  );
 
-  checkField(checks, blockers, warnings, 'status', 'Production environment status', row.environment === 'LIVE', 'Set the provider environment to LIVE before production activation.');
-  checkField(checks, blockers, warnings, 'clientId', 'Client ID configured', Boolean(row.clientId?.trim()), 'Enter the live client ID from the provider console.');
-  checkField(checks, blockers, warnings, 'clientSecret', 'Client secret/private key configured', Boolean(row.clientSecretEncrypted?.trim()), 'Store the live client secret or private key encrypted in the provider record.');
-  checkField(checks, blockers, warnings, 'authorizationUrl', 'Authorization URL', Boolean(row.authorizationUrl?.trim()), 'Enter the provider authorization endpoint exactly as published.');
-  checkField(checks, blockers, warnings, 'tokenUrl', 'Token URL', Boolean(row.tokenUrl?.trim()), 'Enter the provider token endpoint exactly as published.');
-  checkField(checks, blockers, warnings, 'userInfoUrl', 'User-info/OIDC configuration', !spec.requiresUserInfoUrl || Boolean(row.userInfoUrl?.trim()), 'Provide the OIDC/user-info endpoint required by this provider.');
-  checkField(checks, blockers, warnings, 'scopes', 'Required scopes', spec.requiredScopes.every((scope) => row.scopes.includes(scope)), `Include the required scopes: ${spec.requiredScopes.join(', ')}.`);
-  checkField(checks, blockers, warnings, 'redirectUri', 'Exact production redirect URI', row.redirectUri === requiredRedirectUri, `Register the exact callback URI: ${requiredRedirectUri}.`);
-  checkField(checks, blockers, warnings, 'homepageUrl', 'Homepage URL', Boolean(metadata.homepageUrl ?? publicBase), 'Register the production homepage URL in the provider console.');
-  checkField(checks, blockers, warnings, 'privacyPolicyUrl', 'Privacy Policy URL', Boolean(metadata.privacyPolicyUrl ?? `${publicBase}/privacy-policy`), 'Register the public privacy policy URL in the provider console.');
-  checkField(checks, blockers, warnings, 'termsUrl', 'Terms URL', Boolean(metadata.termsUrl ?? `${publicBase}/terms-of-service`), 'Register the public terms URL in the provider console.');
-  checkField(checks, blockers, warnings, 'contactUrl', 'Contact/Support URL', Boolean(metadata.contactUrl ?? `${publicBase}/support`), 'Register a public support or contact URL in the provider console.');
-  checkField(checks, blockers, warnings, 'dataDeletionUrl', 'Data Deletion URL', Boolean(metadata.dataDeletionUrl ?? `${publicBase}/data-deletion`), 'Register the public deletion instruction or callback URL.');
-  checkField(checks, blockers, warnings, 'accountDeletionUrl', 'Account Deletion URL', Boolean(metadata.accountDeletionUrl ?? `${publicBase}/account-deletion`), 'Register the public account deletion URL.');
-  checkField(checks, blockers, warnings, 'verifiedDomainStatus', 'Verified domain status', isApproved(metadata.verifiedDomainStatus), 'Verify the application domain in the provider console.', false);
-  checkField(checks, blockers, warnings, 'developerConsoleStatus', 'Developer-console setup status', isApproved(metadata.developerConsoleStatus), 'Complete the provider console configuration before production activation.');
-  checkField(checks, blockers, warnings, 'reviewStatus', 'Provider review status', isApproved(metadata.reviewStatus), 'Complete provider review and approval before production activation.');
-  checkField(checks, blockers, warnings, 'businessVerificationStatus', 'Business/publisher verification status', isApproved(metadata.businessVerificationStatus) || isApproved(metadata.publisherVerificationStatus), 'Complete the required business or publisher verification.', false);
-  checkField(checks, blockers, warnings, 'testLoginStatus', 'Test-login status', isApproved(metadata.testLoginStatus) || Boolean(row.lastSuccessfulTestAt), 'Run a successful test login before enabling production traffic.');
+  checkField(checks, blockers, testBlockers, warnings, 'clientId', 'Client ID configured', Boolean(row.clientId?.trim()), 'Enter the live client ID from the provider console.');
+  checkField(checks, blockers, testBlockers, warnings, 'clientSecret', 'Client secret/private key configured', Boolean(row.clientSecretEncrypted?.trim()), 'Store the live client secret or private key encrypted in the provider record.');
+  checkField(checks, blockers, testBlockers, warnings, 'authorizationUrl', 'Authorization URL', Boolean(row.authorizationUrl?.trim()), 'Enter the provider authorization endpoint exactly as published.');
+  checkField(checks, blockers, testBlockers, warnings, 'tokenUrl', 'Token URL', Boolean(row.tokenUrl?.trim()), 'Enter the provider token endpoint exactly as published.');
+  checkField(checks, blockers, testBlockers, warnings, 'userInfoUrl', 'User-info/OIDC configuration', !spec.requiresUserInfoUrl || Boolean(row.userInfoUrl?.trim()), 'Provide the OIDC/user-info endpoint required by this provider.');
+  checkField(checks, blockers, testBlockers, warnings, 'scopes', 'Required scopes', spec.requiredScopes.every((scope) => row.scopes.includes(scope)), `Include the required scopes: ${spec.requiredScopes.join(', ')}.`);
+  checkField(checks, blockers, testBlockers, warnings, 'redirectUri', 'Exact production redirect URI', row.redirectUri === requiredRedirectUri, `Register the exact callback URI: ${requiredRedirectUri}.`);
+  if (row.provider === 'FACEBOOK') {
+    checkField(checks, blockers, testBlockers, warnings, 'developerConsoleStatus', 'Developer-console setup status', isApprovedOrNotRequired(metadata.developerConsoleStatus), 'Complete the provider console configuration before production activation.', 'activation');
+    checkField(checks, blockers, testBlockers, warnings, 'appMode', 'App mode', normalizeString(metadata.appMode).toLowerCase() === 'live', 'Switch the Meta app to Live before enabling production login.', 'activation');
+    checkField(checks, blockers, testBlockers, warnings, 'appReviewStatus', 'App review status', isApprovedOrNotRequired(metadata.appReviewStatus ?? metadata.reviewStatus), 'Complete app review only when Meta requires it for the requested permissions.', 'activation');
+    checkField(checks, blockers, testBlockers, warnings, 'businessVerificationStatus', 'Business verification status', isApprovedOrNotRequired(metadata.businessVerificationStatus ?? metadata.businessVerification ?? metadata.publisherVerificationStatus), 'Complete business or publisher verification only when Meta requires it for the requested permissions.', 'activation');
+    checkField(checks, blockers, testBlockers, warnings, 'verifiedDomainStatus', 'Domain verification status', isApprovedOrNotRequired(metadata.verifiedDomainStatus), 'Verify the application domain in Meta if the deployment requires it.', 'activation');
+    checkField(checks, blockers, testBlockers, warnings, 'dataDeletionCallbackStatus', 'Data-deletion callback/status URL', isApprovedOrNotRequired(metadata.dataDeletionCallbackStatus), 'Register the public deletion callback and status URL in the Meta app settings.', 'activation');
+  } else {
+    checkField(checks, blockers, testBlockers, warnings, 'homepageUrl', 'Homepage URL', Boolean(metadata.homepageUrl ?? publicBase), 'Register the production homepage URL in the provider console.');
+    checkField(checks, blockers, testBlockers, warnings, 'privacyPolicyUrl', 'Privacy Policy URL', Boolean(metadata.privacyPolicyUrl ?? `${publicBase}/privacy-policy`), 'Register the public privacy policy URL in the provider console.');
+    checkField(checks, blockers, testBlockers, warnings, 'termsUrl', 'Terms URL', Boolean(metadata.termsUrl ?? `${publicBase}/terms-of-service`), 'Register the public terms URL in the provider console.');
+    checkField(checks, blockers, testBlockers, warnings, 'contactUrl', 'Contact/Support URL', Boolean(metadata.contactUrl ?? `${publicBase}/support`), 'Register a public support or contact URL in the provider console.');
+    checkField(checks, blockers, testBlockers, warnings, 'dataDeletionUrl', 'Data Deletion URL', Boolean(metadata.dataDeletionUrl ?? `${publicBase}/data-deletion`), 'Register the public deletion instruction or callback URL.');
+    checkField(checks, blockers, testBlockers, warnings, 'accountDeletionUrl', 'Account Deletion URL', Boolean(metadata.accountDeletionUrl ?? `${publicBase}/account-deletion`), 'Register the public account deletion URL.');
+  }
+  checkField(checks, blockers, testBlockers, warnings, 'testLoginStatus', 'Test-login status', Boolean(row.lastSuccessfulTestAt), 'Run a successful test login before enabling production traffic.', 'activation', true);
+  if (!row.lastSuccessfulTestAt) {
+    blockers.push('Test-login status is not ready.');
+  }
 
   for (const specCheck of spec.specificChecks) {
     const value = metadata[specCheck.key];
-    checkField(checks, blockers, warnings, specCheck.key, specCheck.label, isApproved(value), specCheck.guidance);
+    const ok = row.provider === 'INSTAGRAM' && specCheck.key === 'integrationType'
+      ? isInstagramIntegrationTypeReady(value)
+      : isApproved(value);
+    const scope = row.provider === 'INSTAGRAM' && specCheck.key === 'integrationType' ? 'both' : 'activation';
+    checkField(checks, blockers, testBlockers, warnings, specCheck.key, specCheck.label, ok, specCheck.guidance, scope);
   }
 
   for (const warningCheck of spec.warningChecks ?? []) {
     const value = metadata[warningCheck.key];
-    checkField(checks, blockers, warnings, warningCheck.key, warningCheck.label, Boolean(value) && !['false', '0', 'no'].includes(normalizeString(value).toLowerCase()), warningCheck.guidance, true);
+    checkField(checks, blockers, testBlockers, warnings, warningCheck.key, warningCheck.label, Boolean(value) && !['false', '0', 'no'].includes(normalizeString(value).toLowerCase()), warningCheck.guidance, 'activation', true);
   }
 
-  if (row.provider === 'INSTAGRAM' && !spec.publicLoginSupported) {
-    pushCheck(checks, blockers, warnings, {
-      key: 'instagramSupport',
-      label: 'Instagram public-login support',
-      status: 'WARN',
-      message: 'Instagram personal-account login is not universally supported.',
-      guidance: 'Keep Instagram hidden unless the deployment explicitly supports the configured flow.',
-    });
-  }
-
-  const readyForProduction = blockers.length === 0 && Boolean(row.lastSuccessfulTestAt);
-  const canActivate = readyForProduction && row.status === 'ACTIVE';
+  const configurationReady = testBlockers.length === 0;
+  const canTest = configurationReady;
+  const tested = Boolean(row.lastSuccessfulTestAt);
+  const readyForProduction = blockers.length === 0 && tested;
+  const canActivate = readyForProduction && row.status !== 'ACTIVE';
   const visibleOnLogin = readyForProduction && row.status === 'ACTIVE' && row.showOnLogin && (row.provider !== 'INSTAGRAM' || spec.publicLoginSupported);
+  const lifecycleStage: ProviderReadiness['lifecycleStage'] = row.status === 'ACTIVE' && readyForProduction
+    ? 'ACTIVE'
+    : readyForProduction
+      ? 'PRODUCTION_READY'
+      : tested
+        ? 'TESTED'
+        : configurationReady
+          ? 'ADMIN_TESTABLE'
+          : hasAnyCoreConfig
+            ? 'CONFIGURED'
+            : 'INACTIVE';
 
   return {
+    configurationReady,
+    canTest,
+    tested,
     readyForProduction,
     visibleOnLogin,
     canActivate,
+    lifecycleStage,
     blockers,
+    testBlockers,
     warnings,
     checks,
     publicUrls: {
