@@ -10,6 +10,7 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
       message: err.message,
       code: err.code,
       requestId: req.requestId,
+      ...(err.details ? { details: err.details } : {}),
     });
     return;
   }

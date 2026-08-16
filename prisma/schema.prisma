@@ -98,6 +98,7 @@ model AuthClient {
   type                   AuthClientType
   clientId               String                       @unique @map("client_id")
   clientSecretHash       String?                      @map("client_secret_hash")
+  oidcIdTokenSigningAlg  OidcIdTokenSigningAlg?       @map("oidc_id_token_signing_alg")
   allowedOrigins         String[]                     @map("allowed_origins")
   redirectUris           String[]                     @map("redirect_uris")
   allowedScopes          String[]                     @map("allowed_scopes")
@@ -576,11 +577,10 @@ model AdminNotification {
   message    String
   severity   AdminNotificationSeverity
   category   AdminNotificationCategory
-  status     AdminNotificationStatus   @default(UNREAD)
   actionUrl  String?                   @map("action_url")
   metadata   Json?
   readAt     DateTime?                 @map("read_at")
-  archivedAt DateTime?                 @map("archived_at")
+  dismissedAt DateTime?                @map("dismissed_at")
   createdAt  DateTime                  @default(now()) @map("created_at")
   updatedAt  DateTime                  @updatedAt @map("updated_at")
   user       User?                     @relation(fields: [userId], references: [id])
@@ -589,7 +589,7 @@ model AdminNotification {
   @@index([createdAt])
   @@index([severity])
   @@index([category])
-  @@index([archivedAt])
+  @@index([dismissedAt])
   @@index([userId, createdAt, id])
   @@map("admin_notifications")
 }
@@ -699,6 +699,7 @@ model OidcSigningKey {
   id        String    @id @default(cuid())
   kid       String    @unique
   publicKey String    @map("public_key")
+  privateKeyEncrypted Json?     @map("private_key_encrypted")
   algorithm String    @default("RS256")
   active    Boolean   @default(true)
   createdAt DateTime  @default(now()) @map("created_at")
@@ -1025,6 +1026,11 @@ enum AuthClientStatus {
   DISABLED
 }
 
+enum OidcIdTokenSigningAlg {
+  HS256
+  RS256
+}
+
 enum UserClientAccessStatus {
   ACTIVE
   REVOKED
@@ -1238,12 +1244,6 @@ enum AdminNotificationCategory {
   MAIL
   SMS
   GENERAL
-}
-
-enum AdminNotificationStatus {
-  UNREAD
-  READ
-  ARCHIVED
 }
 
 enum CommunicationChannel {

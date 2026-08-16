@@ -305,7 +305,7 @@ export async function registerUser(
       // the link in every verification email 404'd. ADMIN_PANEL_ORIGIN is
       // the Next.js frontend that now hosts the real public verify-email
       // page at /auth/user/verify-email.
-      const verificationLink = `${config.ADMIN_PANEL_ORIGIN}/auth/user/verify-email?token=${token}`;
+      const verificationLink = buildEmailVerificationLink(token, opts.clientId ?? null);
       await sendTemplatedEmailWithFallback(
         {
           templateKey: "email_verification",

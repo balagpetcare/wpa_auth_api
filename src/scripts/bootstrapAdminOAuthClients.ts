@@ -89,6 +89,9 @@ async function main() {
 
     // Write client id + secret directly into the target frontend's env
     // file. Never printed, logged, or returned from this script.
+    if (!clientSecret) {
+      throw new Error(`Expected a client secret for ${c.slug}.`);
+    }
     upsertEnvVar(c.envFile, c.clientIdVar, client.clientId);
     upsertEnvVar(c.envFile, c.clientSecretVar, clientSecret);
 

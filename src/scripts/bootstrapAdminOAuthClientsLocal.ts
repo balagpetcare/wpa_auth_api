@@ -99,6 +99,9 @@ async function main() {
     });
     await prisma.authClient.update({ where: { id: client.id }, data: { audience: c.audience } });
 
+    if (!clientSecret) {
+      throw new Error(`Expected a client secret for ${c.slug}.`);
+    }
     upsertEnvVar(c.envFile, c.clientIdVar, client.clientId);
     upsertEnvVar(c.envFile, c.clientSecretVar, clientSecret);
 

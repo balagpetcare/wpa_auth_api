@@ -8,10 +8,7 @@
 // (AuthClient.clientId, which BPA/Furtail already send on every request).
 import { prisma } from '../../lib/db.js';
 import { config } from '../../config/index.js';
-import { isGoogleLoginEnabled } from './identity-providers/google.js';
-import { isFacebookLoginEnabled } from './identity-providers/facebook.js';
-import { isAppleLoginEnabled } from './identity-providers/apple.js';
-import { isMicrosoftLoginEnabled } from './identity-providers/microsoft.js';
+import { computeProviderReadiness } from './social-readiness.js';
 
 // The real, enforced password policy: registerSchema/changePasswordSchema in
 // auth.routes.ts both use z.string().min(8) with no additional complexity
@@ -24,6 +21,16 @@ const PASSWORD_POLICY = {
   requiresSymbol: false,
 };
 
+export function publicBootstrapProviderFromConfig(row: any) {
+  const readiness = computeProviderReadiness(row);
+  if (!readiness.visibleOnLogin) return null;
+  return {
+    id: String(row.provider).toLowerCase(),
+    displayName: row.displayName,
+    enabled: true,
+  };
+}
+
 export async function getBootstrapConfig(clientId?: string) {
   const client = clientId
     ? await prisma.authClient.findUnique({ where: { clientId }, include: { emailBranding: true } })
@@ -32,23 +39,16 @@ export async function getBootstrapConfig(clientId?: string) {
   const allowedAuthMethods = client && client.allowedAuthMethods.length > 0 ? new Set(client.allowedAuthMethods) : null;
   const methodAllowed = (method: string) => !allowedAuthMethods || allowedAuthMethods.has(method);
 
-  const providers: Array<{ id: string; displayName: string; enabled: boolean }> = [];
-  if (methodAllowed('google')) providers.push({ id: 'google', displayName: 'Google', enabled: isGoogleLoginEnabled() });
-  if (methodAllowed('facebook')) providers.push({ id: 'facebook', displayName: 'Facebook', enabled: isFacebookLoginEnabled() });
-  if (methodAllowed('apple')) providers.push({ id: 'apple', displayName: 'Apple', enabled: isAppleLoginEnabled() });
-  if (methodAllowed('microsoft')) providers.push({ id: 'microsoft', displayName: 'Microsoft', enabled: isMicrosoftLoginEnabled() });
-
-  // Existing legacy social providers (github/instagram/linkedin/tiktok/x)
-  // configured via SocialIdentityProviderConfig — surfaced the same way BPA
-  // already consumes them (listPublicProviders in social.service.ts), just
-  // folded into one bootstrap payload for a new client.
-  const legacySocial = await prisma.socialIdentityProviderConfig.findMany({
+  const providerRows = await prisma.socialIdentityProviderConfig.findMany({
     where: { status: 'ACTIVE', showOnLogin: true },
     orderBy: [{ placement: 'asc' }, { sortOrder: 'asc' }],
   });
-  for (const row of legacySocial) {
+
+  const providers: Array<{ id: string; displayName: string; enabled: boolean }> = [];
+  for (const row of providerRows) {
     if (!methodAllowed(row.provider.toLowerCase())) continue;
-    providers.push({ id: row.provider.toLowerCase(), displayName: row.displayName, enabled: true });
+    const provider = publicBootstrapProviderFromConfig(row);
+    if (provider) providers.push(provider);
   }
 
   const enterpriseOrgs = await prisma.enterpriseIdentityProvider.findMany({

@@ -252,10 +252,10 @@ test('testProvider resolves Google using the Google provider row and signs GOOGL
     assert.match(result.testUrl, /scope=openid\+email\+profile/)
     const state = new URL(result.testUrl).searchParams.get('state')
     assert.ok(state)
-    const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; providerConfigId?: string }
+    const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; nonce?: string }
     assert.equal(payload.provider, 'GOOGLE')
     assert.equal(payload.purpose, 'ADMIN_PROVIDER_TEST')
-    assert.equal(payload.providerConfigId, existing.id)
+    assert.ok(payload.nonce)
   } finally {
     ;(prisma.socialIdentityProviderConfig.findUnique as any) = originalFindUnique
     ;(prisma.socialIdentityProviderConfig.update as any) = originalUpdate
@@ -287,10 +287,61 @@ test('testProvider resolves Instagram using the Instagram provider row and signs
     assert.match(result.testUrl, /scope=instagram_business_basic/)
     const state = new URL(result.testUrl).searchParams.get('state')
     assert.ok(state)
-    const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; providerConfigId?: string }
+    const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; nonce?: string }
     assert.equal(payload.provider, 'INSTAGRAM')
     assert.equal(payload.purpose, 'ADMIN_PROVIDER_TEST')
-    assert.equal(payload.providerConfigId, existing.id)
+    assert.ok(payload.nonce)
+  } finally {
+    ;(prisma.socialIdentityProviderConfig.findUnique as any) = originalFindUnique
+    ;(prisma.socialIdentityProviderConfig.update as any) = originalUpdate
+    ;(prisma.auditLog.create as any) = originalAuditCreate
+  }
+})
+
+test('testProvider resolves X using the X provider row and signs X state', async () => {
+  const existing = baseProvider({
+    id: 'x-provider-1',
+    provider: 'X',
+    displayName: 'X',
+    authorizationUrl: 'https://x.com/i/oauth2/authorize',
+    tokenUrl: 'https://api.x.com/2/oauth2/token',
+    userInfoUrl: 'https://api.x.com/2/users/me?user.fields=profile_image_url',
+    scopes: ['tweet.read', 'users.read'],
+    redirectUri: 'https://auth.worldpetsassociation.com/api/v1/auth/social/x/callback',
+    providerMetadata: {},
+    status: 'INACTIVE',
+  })
+  const originalFindUnique = prisma.socialIdentityProviderConfig.findUnique
+  const originalUpdate = prisma.socialIdentityProviderConfig.update
+  const originalAuditCreate = prisma.auditLog.create
+  ;(prisma.socialIdentityProviderConfig.findUnique as any) = async () => existing
+  ;(prisma.socialIdentityProviderConfig.update as any) = async () => {
+    throw new Error('testProvider should not persist test timestamps before the OAuth callback succeeds')
+  }
+  ;(prisma.auditLog.create as any) = async () => undefined
+  try {
+    const result = await testSocialProvider(existing.id, 'admin-1')
+    assert.equal(result.provider, 'X')
+    const url = new URL(result.testUrl)
+    assert.equal(url.origin, 'https://x.com')
+    assert.equal(url.pathname, '/i/oauth2/authorize')
+    assert.equal(url.searchParams.get('scope'), 'tweet.read users.read')
+    assert.equal(url.searchParams.get('redirect_uri'), 'https://auth.worldpetsassociation.com/api/v1/auth/social/x/callback')
+    assert.equal(url.searchParams.get('response_type'), 'code')
+    assert.equal(url.searchParams.getAll('response_type').length, 1)
+    assert.equal(url.searchParams.getAll('client_id').length, 1)
+    assert.equal(url.searchParams.getAll('redirect_uri').length, 1)
+    assert.equal(url.searchParams.getAll('scope').length, 1)
+    assert.equal(url.searchParams.getAll('state').length, 1)
+    assert.equal(url.searchParams.getAll('code_challenge').length, 1)
+    assert.equal(url.searchParams.getAll('code_challenge_method').length, 1)
+    const state = url.searchParams.get('state')
+    assert.ok(state)
+    assert.ok((state as string).length <= 500)
+    const payload = jwt.verify(state as string, config.JWT_ACCESS_SECRET) as { provider?: string; purpose?: string; nonce?: string }
+    assert.equal(payload.provider, 'X')
+    assert.equal(payload.purpose, 'ADMIN_PROVIDER_TEST')
+    assert.ok(payload.nonce)
   } finally {
     ;(prisma.socialIdentityProviderConfig.findUnique as any) = originalFindUnique
     ;(prisma.socialIdentityProviderConfig.update as any) = originalUpdate

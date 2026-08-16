@@ -5,28 +5,9 @@ import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
 import * as oauthService from './oauth.service.js';
 import { AppError } from '../../lib/errors.js';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
-import { config } from '../../config/index.js';
+import { buildOpenIdConfiguration } from '../../lib/oidc.js';
 
 const router = Router();
-
-function buildOpenIdConfiguration(baseUrl: string) {
-  return {
-    issuer: config.OAUTH_ISSUER,
-    authorization_endpoint: `${baseUrl}/oauth/authorize`,
-    token_endpoint: `${baseUrl}/oauth/token`,
-    userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
-    jwks_uri: `${baseUrl}/oauth/jwks`,
-    revocation_endpoint: `${baseUrl}/oauth/revoke`,
-    introspection_endpoint: `${baseUrl}/oauth/introspect`,
-    response_types_supported: ['code'],
-    subject_types_supported: ['public'],
-    id_token_signing_alg_values_supported: config.JWT_RSA_PRIVATE_KEY ? ['RS256'] : ['HS256'],
-    scopes_supported: ['openid', 'profile', 'email'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
-    code_challenge_methods_supported: ['S256'],
-    claims_supported: ['iss', 'sub', 'aud', 'exp', 'iat', 'auth_time', 'nonce', 'email', 'email_verified', 'name', 'preferred_username', 'picture', 'roles'],
-  };
-}
 
 // ─── GET /oauth/authorize ────────────────────────────────────────────────────
 // The user must already be authenticated (access token in header).
@@ -221,9 +202,12 @@ router.get('/jwks', async (_req, res, next) => {
 });
 
 // ─── GET /.well-known/openid-configuration ───────────────────────────────────
-router.get('/.well-known/openid-configuration', (_req, res) => {
-  const baseUrl = config.OAUTH_ISSUER.replace(/\/$/, '');
-  res.json(buildOpenIdConfiguration(baseUrl));
+router.get('/.well-known/openid-configuration', async (_req, res, next) => {
+  try {
+    res.json(await buildOpenIdConfiguration());
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ─── POST /oauth/introspect ──────────────────────────────────────────────────

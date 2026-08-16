@@ -62,6 +62,7 @@ test('Facebook configuration can be testable while still blocked for public acti
   assert.equal(readiness.configurationReady, true)
   assert.equal(readiness.canTest, true)
   assert.equal(readiness.tested, false)
+  assert.equal(readiness.publicLoginReady, false)
   assert.equal(readiness.lifecycleStage, 'ADMIN_TESTABLE')
   assert.equal(readiness.readyForProduction, false)
   assert.ok(readiness.blockers.some((blocker) => blocker.includes('Test-login status')))
@@ -84,6 +85,7 @@ test('Facebook readiness accepts NOT_REQUIRED metadata for optional external sta
   }))
 
   assert.equal(readiness.readyForProduction, true)
+  assert.equal(readiness.publicLoginReady, true)
   assert.equal(readiness.lifecycleStage, 'PRODUCTION_READY')
   assert.equal(readiness.canActivate, true)
   assert.equal(readiness.blockers.length, 0)
@@ -93,6 +95,7 @@ test('Instagram configuration is testable with the Instagram Login scope and int
   const readiness = computeProviderReadiness(instagramRow())
   assert.equal(readiness.configurationReady, true)
   assert.equal(readiness.canTest, true)
+  assert.equal(readiness.publicLoginReady, false)
   assert.equal(readiness.lifecycleStage, 'ADMIN_TESTABLE')
   assert.equal(readiness.testBlockers.length, 0)
   assert.ok(readiness.checks.some((check) => check.key === 'scopes' && check.status === 'OK'))

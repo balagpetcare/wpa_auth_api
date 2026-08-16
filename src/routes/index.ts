@@ -6,7 +6,7 @@ import communicationRoutes from '../modules/communication/communication.routes.j
 import emailRoutes from '../modules/email/email.routes.js';
 import oauthRoutes from '../modules/oauth/oauth.routes.js';
 import deletionRoutes from '../modules/deletion/deletion.routes.js';
-import { config } from '../config/index.js';
+import { buildOpenIdConfiguration } from '../lib/oidc.js';
 // NOTE (Phase 1 audit fix, see docs/wpa-central-auth-api-complete-audit.md):
 // src/modules/clients/clients.routes.ts, src/modules/roles/roles.routes.ts, and
 // src/modules/audit/audit.routes.ts are LEGACY/DUPLICATE modules. They were
@@ -38,28 +38,12 @@ const externalCommunicationRoutes = (
   await import(resolveExternalCommunicationRoutesModulePath())
 ).default;
 
-function buildOpenIdConfiguration(baseUrl: string) {
-  return {
-    issuer: config.OAUTH_ISSUER,
-    authorization_endpoint: `${baseUrl}/oauth/authorize`,
-    token_endpoint: `${baseUrl}/oauth/token`,
-    userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
-    jwks_uri: `${baseUrl}/oauth/jwks`,
-    revocation_endpoint: `${baseUrl}/oauth/revoke`,
-    introspection_endpoint: `${baseUrl}/oauth/introspect`,
-    response_types_supported: ['code'],
-    subject_types_supported: ['public'],
-    id_token_signing_alg_values_supported: config.JWT_RSA_PRIVATE_KEY ? ['RS256'] : ['HS256'],
-    scopes_supported: ['openid', 'profile', 'email'],
-    grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
-    code_challenge_methods_supported: ['S256'],
-    claims_supported: ['iss', 'sub', 'aud', 'exp', 'iat', 'auth_time', 'nonce', 'email', 'email_verified', 'name', 'preferred_username', 'picture', 'roles'],
-  };
-}
-
-router.get('/.well-known/openid-configuration', (_req, res) => {
-  const baseUrl = config.API_PREFIX.replace(/\/$/, '');
-  res.json(buildOpenIdConfiguration(baseUrl));
+router.get('/.well-known/openid-configuration', async (_req, res, next) => {
+  try {
+    res.json(await buildOpenIdConfiguration());
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.get('/health', (_req, res) => {

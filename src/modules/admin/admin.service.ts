@@ -1,5 +1,5 @@
 import { randomBytes, createHash } from 'crypto';
-import { UserStatus, AuthClientStatus, AuthClientType, Prisma, OAuthProvider, AdminNotificationCategory, AdminNotificationSeverity } from '@prisma/client';
+import { UserStatus, AuthClientStatus, AuthClientType, Prisma, OAuthProvider, AdminNotificationCategory, AdminNotificationSeverity, OidcIdTokenSigningAlg } from '@prisma/client';
 import { prisma } from '../../lib/db.js';
 import { AppError } from '../../lib/errors.js';
 import { writeAuditLog } from '../../lib/audit.js';
@@ -14,6 +14,14 @@ import { CursorPaginationInput, decodeCursor, encodeCursor, parseCursorLimit } f
 import { Request } from 'express';
 import { getPresenceSummary } from '../../lib/presence.js';
 import { computeProviderReadiness } from '../auth/social-readiness.js';
+import { defaultSigningAlgForClient, normalizeAllowedScopes, validateClientRegistryShape } from '../../lib/clientArchitecture.js';
+
+function providerNotReadyError(displayName: string, readiness: ReturnType<typeof computeProviderReadiness>) {
+  return new AppError(`${displayName} cannot be enabled yet.`, 'PROVIDER_NOT_READY', 400, {
+    blockers: readiness.blockers,
+    lifecycleStage: readiness.lifecycleStage,
+  });
+}
 
 // ─── Shared selects ──────────────────────────────────────────────────────────
 
@@ -61,6 +69,7 @@ const safeClientSelect = {
   slug: true,
   type: true,
   clientId: true,
+  oidcIdTokenSigningAlg: true,
   allowedOrigins: true,
   redirectUris: true,
   allowedScopes: true,
@@ -956,22 +965,44 @@ export async function createClient(data: {
   allowedOrigins?: string[];
   redirectUris?: string[];
   allowedScopes?: string[];
+  publicClient?: boolean;
+  oidcIdTokenSigningAlg?: OidcIdTokenSigningAlg | null;
 }) {
   const existing = await prisma.authClient.findUnique({ where: { slug: data.slug } });
   if (existing) throw new AppError('A client with that slug already exists.', 'ALREADY_EXISTS', 409);
 
   const clientId = randomBytes(16).toString('hex');
-  const rawSecret = randomBytes(32).toString('hex');
-  const clientSecretHash = createHash('sha256').update(rawSecret).digest('hex');
+  const publicClient = Boolean(data.publicClient);
+  if (publicClient && data.type === 'SERVICE') {
+    throw new AppError('SERVICE clients cannot be public clients.', 'VALIDATION_ERROR', 400);
+  }
+  const rawSecret = publicClient ? null : randomBytes(32).toString('hex');
+  const clientSecretHash = rawSecret ? createHash('sha256').update(rawSecret).digest('hex') : null;
+  const allowedOrigins = data.allowedOrigins ?? [];
+  const redirectUris = data.redirectUris ?? [];
+  const allowedScopes = normalizeAllowedScopes(data.type, data.allowedScopes);
+  const oidcIdTokenSigningAlg = data.type === 'SERVICE'
+    ? null
+    : (data.oidcIdTokenSigningAlg ?? defaultSigningAlgForClient(data.type));
+
+  validateClientRegistryShape({
+    type: data.type,
+    allowedOrigins,
+    redirectUris,
+    clientSecretHash,
+  });
 
   const client = await prisma.authClient.create({
     data: {
-      ...data,
+      name: data.name,
+      slug: data.slug,
+      type: data.type,
       clientId,
       clientSecretHash,
-      allowedOrigins: data.allowedOrigins ?? [],
-      redirectUris: data.redirectUris ?? [],
-      allowedScopes: data.allowedScopes ?? ['openid', 'profile'],
+      oidcIdTokenSigningAlg,
+      allowedOrigins,
+      redirectUris,
+      allowedScopes,
     },
     select: safeClientSelect,
   });
@@ -987,10 +1018,24 @@ export async function getClientById(id: string) {
 
 export async function updateClient(
   id: string,
-  data: { name?: string; allowedOrigins?: string[]; redirectUris?: string[]; allowedScopes?: string[] },
+  data: { name?: string; allowedOrigins?: string[]; redirectUris?: string[]; allowedScopes?: string[]; oidcIdTokenSigningAlg?: OidcIdTokenSigningAlg | null },
 ) {
   const client = await prisma.authClient.findUnique({ where: { id } });
   if (!client) throw new AppError('Client not found.', 'NOT_FOUND', 404);
+  const next = {
+    ...client,
+    ...data,
+    allowedOrigins: data.allowedOrigins ?? client.allowedOrigins,
+    redirectUris: data.redirectUris ?? client.redirectUris,
+    allowedScopes: data.allowedScopes ?? client.allowedScopes,
+    oidcIdTokenSigningAlg: data.oidcIdTokenSigningAlg ?? client.oidcIdTokenSigningAlg,
+  };
+  validateClientRegistryShape({
+    type: client.type,
+    allowedOrigins: next.allowedOrigins,
+    redirectUris: next.redirectUris,
+    clientSecretHash: client.clientSecretHash,
+  });
   return prisma.authClient.update({ where: { id }, data, select: safeClientSelect });
 }
 
@@ -1169,7 +1214,15 @@ export async function getSocialProviderById(id: string) {
 
 export async function createSocialProvider(data: any, actorId?: string, req?: Request) {
   const clientSecret = typeof data.clientSecret === 'string' ? data.clientSecret.trim() : '';
-  const clientSecretEncrypted = clientSecret ? JSON.stringify(encryptCredentialPayload({ clientSecret })) : undefined;
+  let clientSecretEncrypted: string | undefined;
+  if (clientSecret) {
+    try {
+      clientSecretEncrypted = JSON.stringify(encryptCredentialPayload({ clientSecret }));
+    } catch (error) {
+      console.error('Failed to encrypt social provider client secret during create:', error instanceof Error ? error.message : error);
+      throw new AppError('Unable to encrypt the provider secret. Please verify credential encryption is configured.', 'PROVIDER_MISCONFIGURED', 500);
+    }
+  }
   const candidate = {
     provider: data.provider,
     displayName: data.displayName,
@@ -1181,20 +1234,14 @@ export async function createSocialProvider(data: any, actorId?: string, req?: Re
     scopes: Array.isArray(data.scopes) ? data.scopes : [],
     redirectUri: data.redirectUri,
     providerMetadata: data.providerMetadata ?? null,
-    status: data.status,
     environment: data.environment,
     placement: data.placement,
     sortOrder: data.sortOrder ?? 0,
     showOnLogin: data.showOnLogin ?? true,
+    status: 'INACTIVE',
     createdByAdminId: actorId,
     updatedByAdminId: actorId,
   };
-  if (candidate.status === 'ACTIVE') {
-    const readiness = computeProviderReadiness(candidate as any);
-    if (!readiness.readyForProduction) {
-      throw new AppError(`Provider cannot be activated until blockers are resolved: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
-    }
-  }
   const created = await prisma.socialIdentityProviderConfig.create({ data: candidate as any });
   try {
     await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_CREATED', resource: 'social_provider', resourceId: created.id, req, metadata: { provider: created.provider } });
@@ -1213,29 +1260,33 @@ export async function updateSocialProvider(id: string, data: any, actorId?: stri
   const existing = await prisma.socialIdentityProviderConfig.findUnique({ where: { id } });
   if (!existing) throw new AppError('Provider not found.', 'NOT_FOUND', 404);
   const clientSecret = typeof data.clientSecret === 'string' ? data.clientSecret.trim() : '';
+  let clientSecretEncrypted: string | undefined = existing.clientSecretEncrypted ?? undefined;
+  if (clientSecret) {
+    try {
+      clientSecretEncrypted = JSON.stringify(encryptCredentialPayload({ clientSecret }));
+    } catch (error) {
+      console.error('Failed to encrypt social provider client secret during update:', error instanceof Error ? error.message : error);
+      throw new AppError('Unable to encrypt the provider secret. Please verify credential encryption is configured.', 'PROVIDER_MISCONFIGURED', 500);
+    }
+  }
   const candidate = {
+    provider: existing.provider,
     displayName: data.displayName ?? existing.displayName,
     clientId: data.clientId !== undefined ? data.clientId : existing.clientId,
-    clientSecretEncrypted: clientSecret ? JSON.stringify(encryptCredentialPayload({ clientSecret })) : existing.clientSecretEncrypted,
+    clientSecretEncrypted,
     authorizationUrl: data.authorizationUrl ?? existing.authorizationUrl,
     tokenUrl: data.tokenUrl ?? existing.tokenUrl,
     userInfoUrl: data.userInfoUrl !== undefined ? data.userInfoUrl : existing.userInfoUrl,
     scopes: Array.isArray(data.scopes) ? data.scopes : existing.scopes,
     redirectUri: data.redirectUri ?? existing.redirectUri,
     providerMetadata: data.providerMetadata !== undefined ? data.providerMetadata : existing.providerMetadata,
-    status: data.status ?? existing.status,
+    status: existing.status,
     environment: data.environment ?? existing.environment,
     placement: data.placement ?? existing.placement,
     sortOrder: data.sortOrder ?? existing.sortOrder,
     showOnLogin: data.showOnLogin ?? existing.showOnLogin,
     updatedByAdminId: actorId,
   };
-  if (candidate.status === 'ACTIVE') {
-    const readiness = computeProviderReadiness(candidate as any);
-    if (!readiness.readyForProduction) {
-      throw new AppError(`Provider cannot be activated until blockers are resolved: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
-    }
-  }
   const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: candidate as any });
   try {
     await writeAuditLog({ userId: actorId, action: 'SOCIAL_PROVIDER_UPDATED', resource: 'social_provider', resourceId: id, req, metadata: { provider: updated.provider } });
@@ -1256,8 +1307,8 @@ export async function updateSocialProviderStatus(id: string, status: any, actorI
   const candidate = { ...existing, status, updatedByAdminId: actorId };
   if (status === 'ACTIVE') {
     const readiness = computeProviderReadiness(candidate as any);
-    if (!readiness.readyForProduction) {
-      throw new AppError(`Provider cannot be activated until blockers are resolved: ${readiness.blockers.join(' | ')}`, 'PROVIDER_MISCONFIGURED', 400);
+    if (!readiness.publicLoginReady) {
+      throw providerNotReadyError(existing.displayName, readiness);
     }
   }
   const updated = await prisma.socialIdentityProviderConfig.update({ where: { id }, data: { status, updatedByAdminId: actorId } });
@@ -1757,29 +1808,41 @@ function buildVisibleNotificationsWhere(userId: string, filters?: {
   };
 
   if (filters?.status === 'archived') {
-    baseWhere.archivedAt = { not: null };
+    baseWhere.dismissedAt = { not: null };
   } else {
-    baseWhere.archivedAt = null;
+    baseWhere.dismissedAt = null;
   }
 
-  if (filters?.status === 'unread') baseWhere.status = 'UNREAD';
-  if (filters?.status === 'read') baseWhere.status = 'READ';
+  if (filters?.status === 'unread') {
+    baseWhere.readAt = null;
+  }
+  if (filters?.status === 'read') {
+    baseWhere.readAt = { not: null };
+  }
   if (filters?.category) baseWhere.category = filters.category;
   if (filters?.severity) baseWhere.severity = filters.severity;
 
   return baseWhere;
 }
 
+function getAdminNotificationStatus(notification: {
+  readAt: Date | null;
+  dismissedAt: Date | null;
+}) {
+  if (notification.dismissedAt) return 'ARCHIVED' as const;
+  if (notification.readAt) return 'READ' as const;
+  return 'UNREAD' as const;
+}
+
 const adminNotificationSelect = {
   id: true,
-  status: true,
   title: true,
   message: true,
   severity: true,
   category: true,
   actionUrl: true,
   readAt: true,
-  archivedAt: true,
+  dismissedAt: true,
   createdAt: true,
 } satisfies Prisma.AdminNotificationSelect;
 
@@ -1848,7 +1911,11 @@ export async function listMyNotifications(opts: {
   const nextCursor = hasNextPage ? encodeCursor({ createdAt: sliced[sliced.length - 1].createdAt, id: sliced[sliced.length - 1].id }) : null;
 
   return {
-    items: sliced,
+    items: sliced.map((notification) => ({
+      ...notification,
+      status: getAdminNotificationStatus(notification),
+      archivedAt: notification.dismissedAt,
+    })),
     unreadCount,
     totalCount,
     readCount,
@@ -1872,34 +1939,44 @@ export async function markNotificationRead(userId: string, notificationId: strin
   const notification = await prisma.adminNotification.findFirst({
     where: {
       id: notificationId,
-      archivedAt: null,
+      dismissedAt: null,
       OR: [{ userId }, { userId: null }],
     },
   });
   if (!notification) throw new AppError('Notification not found.', 'NOT_FOUND', 404);
 
-  return prisma.adminNotification.update({
+  const updated = await prisma.adminNotification.update({
     where: { id: notificationId },
-    data: { readAt: notification.readAt ?? new Date(), status: 'READ' },
+    data: { readAt: notification.readAt ?? new Date() },
     select: adminNotificationSelect,
   });
+  return {
+    ...updated,
+    status: getAdminNotificationStatus(updated),
+    archivedAt: updated.dismissedAt,
+  };
 }
 
 export async function markNotificationUnread(userId: string, notificationId: string) {
   const notification = await prisma.adminNotification.findFirst({
     where: {
       id: notificationId,
-      archivedAt: null,
+      dismissedAt: null,
       OR: [{ userId }, { userId: null }],
     },
   });
   if (!notification) throw new AppError('Notification not found.', 'NOT_FOUND', 404);
 
-  return prisma.adminNotification.update({
+  const updated = await prisma.adminNotification.update({
     where: { id: notificationId },
-    data: { readAt: null, status: 'UNREAD' },
+    data: { readAt: null },
     select: adminNotificationSelect,
   });
+  return {
+    ...updated,
+    status: getAdminNotificationStatus(updated),
+    archivedAt: updated.dismissedAt,
+  };
 }
 
 export async function markAllNotificationsRead(userId: string) {
@@ -1915,22 +1992,27 @@ export async function dismissNotification(userId: string, notificationId: string
     where: {
       id: notificationId,
       userId,
-      archivedAt: null,
+      dismissedAt: null,
     },
   });
   if (!notification) throw new AppError('Notification not found.', 'NOT_FOUND', 404);
 
-  return prisma.adminNotification.update({
+  const updated = await prisma.adminNotification.update({
     where: { id: notificationId },
-    data: { archivedAt: new Date(), status: 'ARCHIVED', readAt: notification.readAt ?? new Date() },
+    data: { dismissedAt: new Date(), readAt: notification.readAt ?? new Date() },
     select: adminNotificationSelect,
   });
+  return {
+    ...updated,
+    status: getAdminNotificationStatus(updated),
+    archivedAt: updated.dismissedAt,
+  };
 }
 
 export async function clearArchivedNotifications(userId: string) {
   const result = await prisma.adminNotification.deleteMany({
     where: {
-      archivedAt: { not: null },
+      dismissedAt: { not: null },
       OR: [{ userId }, { userId: null }],
     },
   });

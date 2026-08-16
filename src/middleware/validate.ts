@@ -8,11 +8,17 @@ export function validateBody(schema: ZodSchema) {
       next();
     } catch (error) {
       if (error instanceof ZodError) {
+        const issues = error.issues.map((issue) => ({
+          field: issue.path.join('.'),
+          message: issue.message,
+          code: issue.code,
+        }));
         res.status(400).json({
           success: false,
-          message: 'Validation failed',
+          message: issues.length > 0 ? `Validation failed for ${issues.map((issue) => issue.field).join(', ')}.` : 'Validation failed.',
           code: 'VALIDATION_ERROR',
-          errors: error.issues.map((i) => ({ field: i.path.join('.'), message: i.message })),
+          issues,
+          errors: issues,
         });
         return;
       }

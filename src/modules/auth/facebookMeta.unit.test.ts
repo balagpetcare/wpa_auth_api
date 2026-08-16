@@ -69,6 +69,33 @@ test('parseSocialCallbackQuery rejects missing code/state', () => {
   assert.equal(parseSocialCallbackQuery({ code: 'abc' }), null);
 });
 
+test('browser-client social callback cancellation redirects back to the requesting redirect_uri with the original app state', async () => {
+  const state = jwt.sign({
+    provider: 'GOOGLE',
+    purpose: 'SOCIAL_LOGIN',
+    nonce: 'nonce-1',
+    redirectContext: {
+      client_id: 'bangladesh_pet_association_client_id',
+      redirect_uri: 'https://api.bangladeshpetassociation.com/api/v1/auth/central-auth/callback',
+      state: 'bpa-client-state',
+    },
+  }, config.JWT_ACCESS_SECRET, { expiresIn: '10m' });
+
+  const { server, baseUrl } = await startSocialRouterServer();
+  try {
+    const res = await fetch(`${baseUrl}/auth/social/google/callback?error=access_denied&state=${encodeURIComponent(state)}`, {
+      redirect: 'manual',
+    });
+    assert.equal(res.status, 302);
+    assert.equal(
+      res.headers.get('location'),
+      'https://api.bangladeshpetassociation.com/api/v1/auth/central-auth/callback?error=access_denied&state=bpa-client-state',
+    );
+  } finally {
+    server.close();
+  }
+});
+
 test('handleCallback rejects tampered or invalid social OAuth state', async () => {
   await assert.rejects(
     () => handleCallback('facebook', 'provider-code', 'tampered-state', fakeReq()),

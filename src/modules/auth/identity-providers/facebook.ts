@@ -17,6 +17,7 @@ import { AppError, ErrorCodes } from '../../../lib/errors.js';
 import { config } from '../../../config/index.js';
 import { logger } from '../../../lib/logger.js';
 import type { NormalizedIdentityProfile } from './types.js';
+import { resolveFacebookAppCredentials, getFacebookGraphApiVersion } from '../facebookMetaConfig.js';
 
 export function isFacebookLoginEnabled(): boolean {
   return Boolean(config.FACEBOOK_APP_ID && config.FACEBOOK_APP_SECRET);
@@ -32,16 +33,16 @@ type DebugTokenResponse = {
 };
 
 export async function verifyFacebookAccessToken(userAccessToken: string): Promise<NormalizedIdentityProfile> {
-  if (!isFacebookLoginEnabled()) {
+  const credentials = await resolveFacebookAppCredentials();
+  if (!credentials) {
     throw new AppError('Facebook login is not enabled.', ErrorCodes.PROVIDER_DISABLED, 503);
   }
-  const appId = config.FACEBOOK_APP_ID!;
-  const appSecret = config.FACEBOOK_APP_SECRET!;
+  const { appId, appSecret } = credentials;
   const appAccessToken = `${appId}|${appSecret}`;
 
   let debug: DebugTokenResponse;
   try {
-    const debugUrl = new URL('https://graph.facebook.com/debug_token');
+    const debugUrl = new URL(`https://graph.facebook.com/${getFacebookGraphApiVersion()}/debug_token`);
     debugUrl.searchParams.set('input_token', userAccessToken);
     debugUrl.searchParams.set('access_token', appAccessToken);
     const res = await fetch(debugUrl.toString());
@@ -56,7 +57,7 @@ export async function verifyFacebookAccessToken(userAccessToken: string): Promis
     throw new AppError('The Facebook token is invalid or does not belong to this app.', ErrorCodes.INVALID_PROVIDER_TOKEN, 401);
   }
 
-  const meUrl = new URL('https://graph.facebook.com/me');
+  const meUrl = new URL(`https://graph.facebook.com/${getFacebookGraphApiVersion()}/me`);
   meUrl.searchParams.set('fields', 'id,name,email,picture');
   meUrl.searchParams.set('access_token', userAccessToken);
   const meRes = await fetch(meUrl.toString());

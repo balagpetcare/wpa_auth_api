@@ -586,6 +586,8 @@ router.post('/clients', validateBody(z.object({
   allowedOrigins: z.array(z.string()).optional(),
   redirectUris: z.array(z.string()).optional(),
   allowedScopes: z.array(z.string()).optional(),
+  publicClient: z.boolean().optional(),
+  oidcIdTokenSigningAlg: z.enum(['HS256', 'RS256'] as const).nullable().optional(),
 })), async (_req, res, next) => {
   try {
     const { client, clientSecret } = await adminService.createClient(_req.body);
@@ -611,6 +613,7 @@ router.patch('/clients/:id', validateBody(z.object({
   allowedOrigins: z.array(z.string()).optional(),
   redirectUris: z.array(z.string()).optional(),
   allowedScopes: z.array(z.string()).optional(),
+  oidcIdTokenSigningAlg: z.enum(['HS256', 'RS256'] as const).nullable().optional(),
 })), async (req, res, next) => {
   try {
     const client = await adminService.updateClient((req.params.id as string), req.body);

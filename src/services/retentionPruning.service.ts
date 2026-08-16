@@ -69,7 +69,7 @@ export async function runRetentionPruning(opts?: { dryRun?: boolean; batchSize?:
       model: prisma.adminNotification,
       where: {
         createdAt: { lt: cutoffDate(config.ADMIN_NOTIFICATION_RETENTION_DAYS) },
-        OR: [{ archivedAt: { not: null } }, { readAt: { not: null } }],
+        OR: [{ dismissedAt: { not: null } }, { readAt: { not: null } }],
       },
     },
     {

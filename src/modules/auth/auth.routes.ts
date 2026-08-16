@@ -655,8 +655,8 @@ router.post(
   authGuard,
   enterpriseRateLimit({
     route: "auth-presence-heartbeat",
-    windowMs: 30 * 1000,
-    max: 2,
+    windowMs: 5 * 60 * 1000,
+    max: 12,
     identifierFrom: (req) => (req as AuthenticatedRequest).user?.sub,
   }),
   validateBody(presenceHeartbeatSchema),

@@ -18,6 +18,7 @@ import { Request } from 'express';
 import { logAbuseSignal } from '../../lib/antiAbuse.js';
 import { exportJwks } from '../../lib/signingKeys.js';
 import { getServiceAdminPermissions, adminAudiencesForPermissions } from '../../lib/adminAccess.js';
+import type { IdTokenSigningAlg } from '../../lib/oidc.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -101,16 +102,13 @@ interface PendingConsent {
   userId: string;
 }
 
-export async function startAuthorization(opts: {
+export async function validateAuthorizationRequest(opts: {
   clientId: string;
   redirectUri: string;
   scopes: string[];
-  state?: string;
   codeChallenge?: string;
   codeChallengeMethod?: string;
-  nonce?: string;
-  userId: string;
-  req: Request;
+  req?: Request;
 }) {
   const client = await requireActiveClient(opts.clientId, opts.req);
   await validateRedirectUri(client, opts.redirectUri, opts.req);
@@ -124,6 +122,22 @@ export async function startAuthorization(opts: {
       throw new AppError('Public clients must use PKCE S256.', 'INVALID_REQUEST', 400);
     }
   }
+
+  return { client, scopes };
+}
+
+export async function startAuthorization(opts: {
+  clientId: string;
+  redirectUri: string;
+  scopes: string[];
+  state?: string;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+  nonce?: string;
+  userId: string;
+  req: Request;
+}) {
+  const { client, scopes } = await validateAuthorizationRequest(opts);
 
   if (client.type !== 'THIRD_PARTY_APP') {
     const result = await createAuthorizationCode({ ...opts, scopes });
@@ -303,7 +317,9 @@ export async function exchangeAuthorizationCode(opts: {
   }
 
   if (client.clientSecretHash) {
-    if (!opts.clientSecret) throw new AppError('client_secret required.', 'INVALID_CLIENT', 401);
+    if (!opts.clientSecret) {
+      throw new AppError('client_secret required.', 'INVALID_CLIENT', 401);
+    }
     const hash = createHash('sha256').update(opts.clientSecret).digest('hex');
     if (!timingSafeEqualHex(hash, client.clientSecretHash)) {
       await logAbuseSignal({ route: 'oauth-token', req: opts.req, clientId: client.id, identifier: `${client.id}:${opts.clientId}`, threat: 'OAUTH_CLIENT_SECRET_ABUSE', blockAfter: 5, blockTtlMs: 60 * 60 * 1000 });
@@ -391,7 +407,7 @@ export async function exchangeAuthorizationCode(opts: {
   });
 
   const idToken = record.scopes.includes('openid')
-    ? buildIdToken({ user, client, scopes: record.scopes, nonce: record.nonce, authTime: record.authTime })
+    ? await buildIdToken({ user, client, scopes: record.scopes, nonce: record.nonce, authTime: record.authTime })
     : undefined;
 
   return buildTokenResponse(accessToken, refreshToken, record.scopes, user, roles, idToken);
@@ -768,13 +784,13 @@ function buildTokenResponse(
 // Phase 2.5 (docs/phase-2-5-public-auth-rs256-oidc.md): builds the OIDC
 // id_token per OpenID Connect Core 1.0 §2 (ID Token). Only issued when the
 // authorization request's scope included `openid` (checked by the caller).
-function buildIdToken(opts: {
+async function buildIdToken(opts: {
   user: { id: string; email: string | null; username: string | null; displayName: string | null; emailVerifiedAt: Date | null };
-  client: { clientId: string };
+  client: { clientId: string; oidcIdTokenSigningAlg: IdTokenSigningAlg | null };
   scopes: string[];
   nonce: string | null;
   authTime: Date | null;
-}): string {
+}): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const claims: Record<string, unknown> = {
     iss: config.OAUTH_ISSUER,
@@ -799,5 +815,5 @@ function buildIdToken(opts: {
     claims.email_verified = !!opts.user.emailVerifiedAt;
   }
 
-  return signIdToken(claims, parseTtlToSeconds(config.ACCESS_TOKEN_TTL));
+  return signIdToken(claims, parseTtlToSeconds(config.ACCESS_TOKEN_TTL), opts.client.oidcIdTokenSigningAlg ?? 'HS256');
 }

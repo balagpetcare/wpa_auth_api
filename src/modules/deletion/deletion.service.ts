@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import bcrypt from 'bcrypt';
 import { OAuthProvider, Prisma, DeletionRequestSource, DeletionRequestStatus, DeletionRequestType, DeletionRequestEventType, UserStatus } from '@prisma/client';
 import { prisma } from '../../lib/db.js';
@@ -8,6 +8,8 @@ import { writeAuditLog } from '../../lib/audit.js';
 import { removeAvatarByUrl } from '../../lib/avatarStorage.js';
 import { getClientIp } from '../../lib/antiAbuse.js';
 import type { Request } from 'express';
+import { verifyMetaSignedRequest } from '../../lib/metaSignedRequest.js';
+import { resolveFacebookAppCredentials } from '../auth/facebookMetaConfig.js';
 
 type DeletionRequestRecord = Prisma.DeletionRequestGetPayload<{
   include: {
@@ -532,28 +534,57 @@ export async function requestMetaDeletionCallback(input: {
   signedRequest: string;
   req: Request;
 }) {
-  const decoded = decodeMetaSignedRequest(input.signedRequest);
-  const providerAccountId = typeof decoded?.user_id === 'string' ? decoded.user_id : null;
-  const email = typeof decoded?.email === 'string' ? decoded.email : null;
+  const credentials = await resolveFacebookAppCredentials();
+  const decoded = verifyMetaSignedRequest(input.signedRequest, credentials?.appSecret ?? config.FACEBOOK_APP_SECRET ?? '');
+  return requestMetaDeletionFromDecoded(decoded, input.req);
+}
+
+type MetaDeletionDeps = {
+  findUserIdByProviderAccountId: (providerAccountId: string) => Promise<string | null>;
+  findUserIdByEmail: (email: string) => Promise<string | null>;
+  createDeletionRequest: typeof createDeletionRequest;
+  processDeletionRequest: typeof processDeletionRequest;
+};
+
+function defaultMetaDeletionDeps(): MetaDeletionDeps {
+  return {
+    findUserIdByProviderAccountId: async (providerAccountId) => {
+      const account = await prisma.oAuthAccount.findFirst({
+        where: { provider: OAuthProvider.FACEBOOK, providerAccountId },
+        select: { userId: true },
+      });
+      return account?.userId ?? null;
+    },
+    findUserIdByEmail: async (email) => {
+      const user = await prisma.user.findFirst({
+        where: { email: normalizeEmail(email) },
+        select: { id: true },
+      });
+      return user?.id ?? null;
+    },
+    createDeletionRequest,
+    processDeletionRequest,
+  };
+}
+
+export async function requestMetaDeletionFromDecoded(
+  decoded: Record<string, unknown>,
+  req: Request,
+  deps: MetaDeletionDeps = defaultMetaDeletionDeps(),
+) {
+  const providerAccountId = typeof decoded.user_id === 'string' ? decoded.user_id : null;
+  const email = typeof decoded.email === 'string' ? decoded.email : null;
   const provider = OAuthProvider.FACEBOOK;
 
   let userId: string | null = null;
   if (providerAccountId) {
-    const account = await prisma.oAuthAccount.findFirst({
-      where: { provider, providerAccountId },
-      select: { userId: true },
-    });
-    userId = account?.userId ?? null;
+    userId = await deps.findUserIdByProviderAccountId(providerAccountId);
   }
   if (!userId && email) {
-    const user = await prisma.user.findFirst({
-      where: { email: normalizeEmail(email) },
-      select: { id: true },
-    });
-    userId = user?.id ?? null;
+    userId = await deps.findUserIdByEmail(email);
   }
 
-  const request = await createDeletionRequest({
+  const request = await deps.createDeletionRequest({
     requestType: DeletionRequestType.DATA,
     requestSource: DeletionRequestSource.META_CALLBACK,
     email,
@@ -562,47 +593,15 @@ export async function requestMetaDeletionCallback(input: {
     status: DeletionRequestStatus.SCHEDULED,
     gracePeriodDeadlineAt: new Date(),
     metaPayload: decoded as Prisma.InputJsonValue,
-    req: input.req,
+    req,
   });
 
-  const processed = await processDeletionRequest(request.confirmationCode, input.req, { skipGraceCheck: true });
+  const processed = await deps.processDeletionRequest(request.confirmationCode, req, { skipGraceCheck: true });
   return {
     confirmation_code: request.confirmationCode,
     url: publicStatusUrl(request.confirmationCode),
     status: processed.status,
   };
-}
-
-function base64UrlDecode(value: string) {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-  const pad = normalized.length % 4;
-  const padded = normalized + (pad === 0 ? '' : '='.repeat(4 - pad));
-  return Buffer.from(padded, 'base64');
-}
-
-function decodeMetaSignedRequest(signedRequest: string) {
-  const [encodedSignature, encodedPayload] = signedRequest.split('.', 2);
-  if (!encodedSignature || !encodedPayload) {
-    throw new AppError('Invalid Meta signed request.', 'VALIDATION_ERROR', 400);
-  }
-
-  const signature = base64UrlDecode(encodedSignature);
-  const payload = base64UrlDecode(encodedPayload);
-  const secret = config.FACEBOOK_APP_SECRET;
-  if (!secret) {
-    throw new AppError('Meta callback is not configured.', 'PROVIDER_DISABLED', 503);
-  }
-
-  const digest = createHmac('sha256', secret).update(payload).digest();
-  if (digest.length !== signature.length || !timingSafeEqual(digest, signature)) {
-    throw new AppError('Invalid Meta signed request signature.', 'FORBIDDEN', 403);
-  }
-
-  try {
-    return JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
-  } catch {
-    throw new AppError('Meta signed request payload could not be parsed.', 'VALIDATION_ERROR', 400);
-  }
 }
 
 export async function getDeletionStatusByConfirmationCode(confirmationCode: string) {

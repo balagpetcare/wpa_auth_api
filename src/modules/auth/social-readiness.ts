@@ -16,6 +16,7 @@ export type ProviderReadiness = {
   configurationReady: boolean;
   canTest: boolean;
   tested: boolean;
+  publicLoginReady: boolean;
   readyForProduction: boolean;
   visibleOnLogin: boolean;
   canActivate: boolean;
@@ -276,10 +277,11 @@ export function computeProviderReadiness(row: SocialProviderWithExtras): Provide
   const configurationReady = testBlockers.length === 0;
   const canTest = configurationReady;
   const tested = Boolean(row.lastSuccessfulTestAt);
+  const publicLoginReady = configurationReady && tested && spec.publicLoginSupported;
   const readyForProduction = blockers.length === 0 && tested;
-  const canActivate = readyForProduction && row.status !== 'ACTIVE';
-  const visibleOnLogin = readyForProduction && row.status === 'ACTIVE' && row.showOnLogin && (row.provider !== 'INSTAGRAM' || spec.publicLoginSupported);
-  const lifecycleStage: ProviderReadiness['lifecycleStage'] = row.status === 'ACTIVE' && readyForProduction
+  const canActivate = publicLoginReady && row.status !== 'ACTIVE';
+  const visibleOnLogin = publicLoginReady && row.status === 'ACTIVE' && row.showOnLogin;
+  const lifecycleStage: ProviderReadiness['lifecycleStage'] = row.status === 'ACTIVE' && publicLoginReady
     ? 'ACTIVE'
     : readyForProduction
       ? 'PRODUCTION_READY'
@@ -295,6 +297,7 @@ export function computeProviderReadiness(row: SocialProviderWithExtras): Provide
     configurationReady,
     canTest,
     tested,
+    publicLoginReady,
     readyForProduction,
     visibleOnLogin,
     canActivate,

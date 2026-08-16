@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, urlencoded } from 'express';
 import { OAuthProvider, DeletionRequestType } from '@prisma/client';
 import { z } from 'zod';
 import { enterpriseRateLimit } from '../../lib/antiAbuse.js';
@@ -7,6 +7,7 @@ import * as deletionService from './deletion.service.js';
 import { config } from '../../config/index.js';
 
 const router = Router();
+const metaFormBody = urlencoded({ extended: false });
 
 const publicDeletionRequestSchema = z.object({
   email: z.string().email(),
@@ -131,6 +132,7 @@ router.post(
 
 router.post(
   '/meta/callback',
+  metaFormBody,
   enterpriseRateLimit({
     route: 'meta-deletion-callback',
     windowMs: 60 * 60 * 1000,
@@ -150,10 +152,8 @@ router.post(
         req,
       });
       res.json({
-        success: true,
         confirmation_code: result.confirmation_code,
         url: result.url,
-        status: result.status,
       });
     } catch (err) {
       next(err);

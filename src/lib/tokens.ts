@@ -1,6 +1,8 @@
 import jwt from 'jsonwebtoken';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { config } from '../config/index.js';
+import { getCurrentSigningKeyMaterial } from './signingKeys.js';
+import type { IdTokenSigningAlg } from './oidc.js';
 
 export interface AccessTokenPayload {
   sub: string;
@@ -86,25 +88,26 @@ export function verifyRefreshToken(token: string): { sub: string } {
 // never published), so a real relying party cannot verify an HS256 id_token
 // against this server's JWKS in that fallback mode. This mirrors the same
 // documented HS256-fallback limitation already present in getJwks().
-export function signIdToken(claims: Record<string, unknown>, expiresInSeconds: number): string {
-  if (config.JWT_RSA_PRIVATE_KEY) {
-    const privateKey = config.JWT_RSA_PRIVATE_KEY.replace(/\\n/g, '\n');
-    return jwt.sign(claims, privateKey, {
+export async function signIdToken(
+  claims: Record<string, unknown>,
+  expiresInSeconds: number,
+  algorithm: IdTokenSigningAlg = 'HS256',
+): Promise<string> {
+  if (algorithm === 'RS256') {
+    const material = await getCurrentSigningKeyMaterial();
+    if (!material || !material.privateKey) {
+      throw new Error('OIDC RS256 signing is not configured.');
+    }
+    return jwt.sign(claims, material.privateKey, {
       algorithm: 'RS256',
       expiresIn: expiresInSeconds,
-      keyid: config.JWT_KEY_ID,
+      keyid: material.kid,
     });
   }
 
-  console.warn(
-    '[OIDC] JWT_RSA_PRIVATE_KEY not configured — signing id_token with HS256 as a local-development-only fallback. ' +
-      'This id_token CANNOT be verified by a third party against /oauth/jwks (HS256 is symmetric). ' +
-      'Set JWT_RSA_PRIVATE_KEY and JWT_RSA_PUBLIC_KEY for standards-compliant OIDC.',
-  );
   return jwt.sign(claims, config.JWT_ACCESS_SECRET, {
     algorithm: 'HS256',
     expiresIn: expiresInSeconds,
-    keyid: config.JWT_KEY_ID,
   });
 }
 
