@@ -46,6 +46,12 @@ export async function buildOpenIdConfiguration() {
     jwks_uri: `${baseUrl}/oauth/jwks`,
     revocation_endpoint: `${baseUrl}/oauth/revoke`,
     introspection_endpoint: `${baseUrl}/oauth/introspect`,
+    // RP-initiated logout (OpenID Connect Session Management / RP-Initiated
+    // Logout 1.0). This IdP is API-first: the browser SSO session is the
+    // token pair held by the hosted web app, so end-session validates the
+    // client + post_logout_redirect_uri and the hosted /auth/logout page
+    // performs the actual token revocation + local storage clear.
+    end_session_endpoint: `${baseUrl}/oauth/end-session`,
     response_types_supported: ['code'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: signingAlgs.length > 0 ? signingAlgs : ['HS256'],

@@ -19,6 +19,32 @@ test('access tokens preserve the optional sid claim', () => {
   assert.deepEqual(payload.roles, ['USER']);
 });
 
+test('access tokens carry the display name claim, so relying parties (e.g. Furtail JIT provisioning) can seed a real name', () => {
+  const token = signAccessToken({
+    sub: 'user-name-1',
+    email: 'owner@example.com',
+    username: 'owner_user',
+    name: 'Supta 88',
+    roles: ['USER'],
+  });
+
+  const payload = verifyAccessToken(token);
+  assert.equal(payload.name, 'Supta 88');
+});
+
+test('access tokens omit the name claim entirely when the user has none, rather than sending an empty string', () => {
+  const token = signAccessToken({
+    sub: 'user-name-2',
+    email: null,
+    username: null,
+    name: null,
+    roles: [],
+  });
+
+  const payload = verifyAccessToken(token);
+  assert.equal(payload.name, null);
+});
+
 test('access tokens signed with the client-supplied audience verify successfully when that audience is in the allowed list', () => {
   // getAllowedAudiences() always includes config.ACCESS_TOKEN_AUDIENCE
   // itself, so signing/verifying with that value round-trips regardless of

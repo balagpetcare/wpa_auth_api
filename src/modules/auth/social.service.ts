@@ -569,6 +569,7 @@ async function loginOrLink(
     sub: user.id,
     email: user.email,
     username: user.username,
+    name: user.displayName,
     roles,
     sid: session.id,
   }, audience);

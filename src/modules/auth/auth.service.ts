@@ -1,5 +1,5 @@
 import bcrypt from "bcrypt";
-import { randomBytes } from "crypto";
+import crypto, { randomBytes } from "crypto";
 import { UserStatus } from "@prisma/client";
 import { prisma } from "../../lib/db.js";
 import { config } from "../../config/index.js";
@@ -38,6 +38,7 @@ import { recordPresenceHeartbeat } from "../../lib/presence.js";
 import { incrementMetric } from "../../lib/metrics.js";
 import { removeAvatarByUrl } from "../../lib/avatarStorage.js";
 import { buildActionLink } from "./resetLinkRouting.js";
+import { getAccountAuthenticationState, hasAuthenticatableAccount } from "./accountPolicy.js";
 
 export const BCRYPT_ROUNDS = 12;
 
@@ -177,10 +178,37 @@ async function getUserRoles(userId: string): Promise<string[]> {
   return userRoles.map((ur) => ur.role.name);
 }
 
-export async function resolveClient(clientId?: string, req?: Request) {
+export async function resolveClient(
+  clientId?: string,
+  req?: Request,
+  opts?: { requireSecret?: boolean },
+) {
   if (!clientId) return null;
   const client = await prisma.authClient.findUnique({ where: { clientId } });
   if (!client || client.status !== "ACTIVE") return null;
+
+  // Client identity lookup is used by browser-hosted login/register/bootstrap
+  // flows as well as server-side OAuth helpers. Secret enforcement is only
+  // appropriate when the caller explicitly requires confidential-client auth.
+  if (opts?.requireSecret && client.clientSecretHash) {
+    const clientSecret = 
+      req?.headers["x-client-secret"] as string || 
+      req?.body?.client_secret || 
+      (req?.headers.authorization?.startsWith("Basic ") 
+        ? Buffer.from(req.headers.authorization.slice(6), "base64").toString("utf8").split(":")[1]
+        : undefined);
+
+    if (!clientSecret) {
+      throw new AppError("Client secret is required.", "UNAUTHORIZED_CLIENT", 401);
+    }
+
+    const candidateHash = crypto.createHash("sha256").update(clientSecret).digest("hex");
+    const a = Buffer.from(candidateHash, "utf8");
+    const b = Buffer.from(client.clientSecretHash, "utf8");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      throw new AppError("Invalid client credentials.", "INVALID_CLIENT", 401);
+    }
+  }
 
   if (req && req.headers.origin) {
     const origin = req.headers.origin;
@@ -420,14 +448,15 @@ export async function loginUser(
     throw new AppError("Invalid credentials.", "INVALID_CREDENTIALS", 401);
   }
 
-  if (user.status === UserStatus.SUSPENDED) {
+  const accountState = getAccountAuthenticationState(user.status);
+  if (accountState === "suspended") {
     throw new AppError(
       "Your account has been suspended.",
       "ACCOUNT_SUSPENDED",
       403,
     );
   }
-  if (user.status === UserStatus.DELETED) {
+  if (accountState === "deleted") {
     throw new AppError("Invalid credentials.", "INVALID_CREDENTIALS", 401);
   }
 
@@ -472,6 +501,7 @@ export async function loginUser(
       sub: user.id,
       email: user.email,
       username: user.username,
+      name: user.displayName,
       roles,
       sid: session.id,
       ...(servicePerms.length > 0 ? { perms: servicePerms } : {}),
@@ -737,11 +767,7 @@ export async function refreshTokens(
   }
 
   const user = await prisma.user.findUnique({ where: { id: payload.sub } });
-  if (
-    !user ||
-    user.status === UserStatus.DELETED ||
-    user.status === UserStatus.SUSPENDED
-  ) {
+  if (!hasAuthenticatableAccount(user)) {
     throw new AppError("User is not active.", "ACCOUNT_INACTIVE", 403);
   }
 
@@ -849,6 +875,7 @@ export async function refreshTokens(
       sub: user.id,
       email: user.email,
       username: user.username,
+      name: user.displayName,
       roles,
       sid: familyId ?? undefined,
       ...(servicePerms.length > 0 ? { perms: servicePerms } : {}),
@@ -2057,10 +2084,7 @@ export async function heartbeatPresence(
     select: { status: true },
   });
   if (!user) throw new AppError("User not found.", "NOT_FOUND", 404);
-  if (
-    user.status === UserStatus.SUSPENDED ||
-    user.status === UserStatus.DELETED
-  ) {
+  if (!hasAuthenticatableAccount(user)) {
     throw new AppError("Account is not active.", "ACCOUNT_INACTIVE", 403);
   }
   return recordPresenceHeartbeat({ userId, appId: appId ?? undefined });

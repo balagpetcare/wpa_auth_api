@@ -26,6 +26,7 @@ import {
   requestPhoneChange,
   confirmPhoneChange,
   getCurrentUser,
+  resolveClient,
 } from "./auth.service.js";
 
 function fakeReq(): Request {
@@ -492,12 +493,131 @@ test("requestPhoneChange rejects a target phone already used by another account"
     data: { phone: uniqueTestPhone(), status: "ACTIVE", phoneVerifiedAt: new Date() },
   });
   try {
-    await assert.rejects(
+    assert.rejects(
       () => requestPhoneChange(userB.id, takenPhone, fakeReq()),
       (err: any) => err.code === "PHONE_IN_USE" && err.status === 409,
     );
   } finally {
     await cleanupUser(userA.id);
     await cleanupUser(userB.id);
+  }
+});
+
+test("resolveClient validates client secret when clientSecretHash is present in the database", async () => {
+  const testClientId = `test-client-${Date.now()}`;
+  const rawSecret = "super-duper-secret-123";
+  const clientSecretHash = createHash("sha256").update(rawSecret).digest("hex");
+  
+  const client = await prisma.authClient.create({
+    data: {
+      name: "Test Secure Client",
+      slug: testClientId,
+      type: "FIRST_PARTY_APP",
+      clientId: testClientId,
+      clientSecretHash,
+      allowedOrigins: ["*"],
+      redirectUris: ["http://localhost:3000/callback"],
+      allowedScopes: ["openid"],
+    },
+  });
+
+  try {
+    // 1. Missing secret should reject with UNAUTHORIZED_CLIENT
+    const reqMissing = { headers: {}, body: {} } as unknown as Request;
+    await assert.rejects(
+      () => resolveClient(testClientId, reqMissing, { requireSecret: true }),
+      (err: any) => err.code === "UNAUTHORIZED_CLIENT" && err.status === 401,
+    );
+
+    // 2. Invalid secret should reject with INVALID_CLIENT
+    const reqInvalid = {
+      headers: { "x-client-secret": "wrong-secret" },
+      body: {},
+    } as unknown as Request;
+    await assert.rejects(
+      () => resolveClient(testClientId, reqInvalid, { requireSecret: true }),
+      (err: any) => err.code === "INVALID_CLIENT" && err.status === 401,
+    );
+
+    // 3. Correct secret in headers should succeed
+    const reqValidHeader = {
+      headers: { "x-client-secret": rawSecret },
+      body: {},
+    } as unknown as Request;
+    const resolvedHeader = await resolveClient(testClientId, reqValidHeader, { requireSecret: true });
+    assert.ok(resolvedHeader);
+    assert.equal(resolvedHeader.id, client.id);
+
+    // 4. Correct secret in body should succeed
+    const reqValidBody = {
+      headers: {},
+      body: { client_secret: rawSecret },
+    } as unknown as Request;
+    const resolvedBody = await resolveClient(testClientId, reqValidBody, { requireSecret: true });
+    assert.ok(resolvedBody);
+
+    // 5. Correct secret in basic Authorization header should succeed
+    const basicAuth = Buffer.from(`any-user:${rawSecret}`).toString("base64");
+    const reqValidBasic = {
+      headers: { authorization: `Basic ${basicAuth}` },
+      body: {},
+    } as unknown as Request;
+    const resolvedBasic = await resolveClient(testClientId, reqValidBasic, { requireSecret: true });
+    assert.ok(resolvedBasic);
+  } finally {
+    await prisma.authClient.delete({ where: { id: client.id } });
+  }
+});
+
+test("resolveClient can identify a confidential browser login client without requiring its secret", async () => {
+  const testClientId = `test-browser-login-${Date.now()}`;
+  const rawSecret = "browser-login-secret-123";
+  const clientSecretHash = createHash("sha256").update(rawSecret).digest("hex");
+
+  const client = await prisma.authClient.create({
+    data: {
+      name: "Test Browser Login Client",
+      slug: testClientId,
+      type: "FIRST_PARTY_APP",
+      clientId: testClientId,
+      clientSecretHash,
+      allowedOrigins: ["http://localhost:5011"],
+      redirectUris: ["http://localhost:7500/api/auth/callback"],
+      allowedScopes: ["openid"],
+    },
+  });
+
+  try {
+    const req = { headers: { origin: "http://localhost:5011" }, body: {} } as unknown as Request;
+    const resolved = await resolveClient(testClientId, req);
+    assert.ok(resolved);
+    assert.equal(resolved.id, client.id);
+  } finally {
+    await prisma.authClient.delete({ where: { id: client.id } });
+  }
+});
+
+test("resolveClient allows access without secret when clientSecretHash is null (public client)", async () => {
+  const testClientId = `test-public-${Date.now()}`;
+  const client = await prisma.authClient.create({
+    data: {
+      name: "Test Public Client",
+      slug: testClientId,
+      type: "FIRST_PARTY_APP",
+      clientId: testClientId,
+      clientSecretHash: null,
+      allowedOrigins: ["*"],
+      redirectUris: ["http://localhost:3000/callback"],
+      allowedScopes: ["openid"],
+    },
+  });
+
+  try {
+    const req = { headers: {}, body: {} } as unknown as Request;
+    const resolved = await resolveClient(testClientId, req);
+    assert.ok(resolved);
+    assert.equal(resolved.id, client.id);
+  } finally {
+    await prisma.authClient.delete({ where: { id: client.id } });
   }
 });

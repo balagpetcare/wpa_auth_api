@@ -19,6 +19,7 @@ import { signAccessToken, signRefreshToken, hashToken, generateOpaqueToken, pars
 import { writeAuditLog } from '../../lib/audit.js';
 import { logger } from '../../lib/logger.js';
 import { resolveClient, getOrCreateInternalClientId } from './auth.service.js';
+import { hasAuthenticatableAccount } from './accountPolicy.js';
 
 export type OtpChannel = 'email' | 'phone' | 'whatsapp';
 
@@ -172,7 +173,7 @@ export async function verifyLoginOtp(
   await redis.del(key);
 
   const user = await prisma.user.findUnique({ where: { id: state.userId } });
-  if (!user || user.status === UserStatus.DELETED || user.status === UserStatus.SUSPENDED) {
+  if (!hasAuthenticatableAccount(user)) {
     throw new AppError('Account is not active.', 'ACCOUNT_INACTIVE', 403);
   }
 
@@ -191,7 +192,7 @@ export async function verifyLoginOtp(
       userAgent: req.headers['user-agent'],
     },
   });
-  const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, roles, sid: session.id }, audience);
+  const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username, name: user.displayName, roles, sid: session.id }, audience);
   const refreshToken = signRefreshToken(user.id, audience);
   await prisma.refreshToken.create({
     data: {

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request, type Response, type NextFunction } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../../middleware/validate.js';
 import { authGuard, AuthenticatedRequest } from '../../middleware/auth.js';
@@ -209,6 +209,48 @@ router.get('/.well-known/openid-configuration', async (_req, res, next) => {
     next(err);
   }
 });
+
+// ─── GET|POST /oauth/end-session ─────────────────────────────────────────────
+// RP-initiated logout endpoint (advertised as end_session_endpoint in the
+// discovery document). Public (no authGuard): a logging-out browser may no
+// longer hold a valid access token. It only validates the client and the
+// optional post_logout_redirect_uri against the client's registered allowlist
+// and echoes back the safe target for the hosted /auth/logout page to use.
+// It performs NO redirect and issues NO token itself.
+const endSessionSchema = z.object({
+  client_id: z.string().min(1).optional(),
+  post_logout_redirect_uri: z.string().url().optional(),
+  state: z.string().optional(),
+  id_token_hint: z.string().optional(),
+});
+
+const endSessionHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const source = req.method === 'POST' ? req.body : req.query;
+    const parsed = endSessionSchema.safeParse(source);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, message: 'Invalid end-session request.', code: 'INVALID_REQUEST', errors: parsed.error.issues });
+      return;
+    }
+    const d = parsed.data;
+    const result = await oauthService.resolvePostLogoutRedirect({
+      clientId: d.client_id,
+      postLogoutRedirectUri: d.post_logout_redirect_uri,
+      req,
+    });
+    res.json({
+      success: true,
+      postLogoutRedirectUri: result.postLogoutRedirectUri,
+      state: d.state ?? null,
+      client: result.clientName ? { name: result.clientName } : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+router.get('/end-session', enterpriseRateLimit({ route: 'oauth-end-session', windowMs: 15 * 60 * 1000, max: 50, identifierFrom: (req) => `${req.query.client_id ?? ''}:${req.ip ?? ''}` }), endSessionHandler);
+router.post('/end-session', enterpriseRateLimit({ route: 'oauth-end-session', windowMs: 15 * 60 * 1000, max: 50, identifierFrom: (req) => `${req.body?.client_id ?? ''}:${req.ip ?? ''}` }), endSessionHandler);
 
 // ─── POST /oauth/introspect ──────────────────────────────────────────────────
 

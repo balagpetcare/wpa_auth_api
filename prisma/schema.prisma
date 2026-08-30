@@ -101,6 +101,12 @@ model AuthClient {
   oidcIdTokenSigningAlg  OidcIdTokenSigningAlg?       @map("oidc_id_token_signing_alg")
   allowedOrigins         String[]                     @map("allowed_origins")
   redirectUris           String[]                     @map("redirect_uris")
+  // Additive (WPA true global logout contract): exact-match allowlist of URLs
+  // this client may be redirected back to after an RP-initiated logout via
+  // GET /oauth/end-session. Empty (the default for every pre-existing client)
+  // means "no post-logout redirect permitted" — end-session then lands on the
+  // Central Auth signed-out page instead of bouncing anywhere.
+  postLogoutRedirectUris String[]                     @default([]) @map("post_logout_redirect_uris")
   allowedScopes          String[]                     @map("allowed_scopes")
   status                 AuthClientStatus             @default(ACTIVE)
   // Additive: per-client identity foundation (Furtail centralized-auth onboarding).

@@ -8,6 +8,13 @@ export interface AccessTokenPayload {
   sub: string;
   email: string | null;
   username: string | null;
+  // Best-effort display name, included so relying-party APIs (e.g. the
+  // Furtail API's JIT user-provisioning — see getOrProvisionUser /
+  // buildProvisionedProfileSeed) can seed a real name for a brand-new
+  // local profile instead of falling back to a generic placeholder. Never
+  // required/verified — purely a convenience claim, the source of truth
+  // for a user's identity remains this service's own User row.
+  name?: string | null;
   roles: string[];
   sid?: string;
   aud?: string | string[];

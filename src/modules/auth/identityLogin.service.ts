@@ -23,6 +23,7 @@ import {
 import { getClientIp } from '../../lib/antiAbuse.js';
 import { resolveClient, getOrCreateInternalClientId } from './auth.service.js';
 import type { NormalizedIdentityProfile } from './identity-providers/types.js';
+import { getAccountAuthenticationState } from './accountPolicy.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -65,7 +66,7 @@ async function issueSession(userId: string, clientDbId: string, audience: string
     },
   });
   const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
-  const accessToken = signAccessToken({ sub: userId, email: user.email, username: user.username, roles, sid: session.id }, audience);
+  const accessToken = signAccessToken({ sub: userId, email: user.email, username: user.username, name: user.displayName, roles, sid: session.id }, audience);
   const refreshToken = signRefreshToken(userId, audience);
   await prisma.refreshToken.create({
     data: {
@@ -313,8 +314,9 @@ export async function loginWithPhonePassword(opts: { phone: string; password: st
   if (!valid) {
     throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
   }
-  if (user.status === UserStatus.SUSPENDED) throw new AppError('Your account has been suspended.', 'ACCOUNT_SUSPENDED', 403);
-  if (user.status === UserStatus.DELETED) throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
+  const accountState = getAccountAuthenticationState(user.status);
+  if (accountState === 'suspended') throw new AppError('Your account has been suspended.', 'ACCOUNT_SUSPENDED', 403);
+  if (accountState === 'deleted') throw new AppError('Invalid credentials.', 'INVALID_CREDENTIALS', 401);
 
   const client = await resolveClient(opts.clientId, req);
   const clientDbId = client?.id ?? (await getOrCreateInternalClientId());

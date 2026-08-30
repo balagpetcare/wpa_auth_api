@@ -19,13 +19,20 @@ import { logAbuseSignal } from '../../lib/antiAbuse.js';
 import { exportJwks } from '../../lib/signingKeys.js';
 import { getServiceAdminPermissions, adminAudiencesForPermissions } from '../../lib/adminAccess.js';
 import type { IdTokenSigningAlg } from '../../lib/oidc.js';
+import { hasAuthenticatableAccount } from '../auth/accountPolicy.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function requireActiveClient(clientId: string, req?: Request) {
   const client = await prisma.authClient.findUnique({ where: { clientId } });
   if (!client || client.status !== 'ACTIVE') {
-    throw new AppError('Unknown or disabled client.', 'INVALID_CLIENT', 401);
+    // 400 (not 401): a missing/wrong client_id is a bad request, NOT a token
+    // problem. Returning 401 here caused the web BFF's apiClient to treat it
+    // as an expired access token — triggering refresh → retry → still 401 →
+    // clear session → redirect-to-login → infinite login loop. The user's
+    // correct credentials DID authenticate; the authorize step just failed
+    // because the client_id was unknown.
+    throw new AppError('Unknown or disabled client.', 'INVALID_CLIENT', 400);
   }
   if (req && req.headers.origin) {
     const origin = req.headers.origin;
@@ -58,6 +65,84 @@ async function validateRedirectUri(client: { id: string, redirectUris: string[] 
     }
     throw new AppError('redirect_uri is not registered for this client.', 'INVALID_REDIRECT_URI', 400);
   }
+}
+
+// ─── RP-initiated logout ─────────────────────────────────────────────────────
+// GET/POST /oauth/end-session. Validates the requesting client and, if a
+// post_logout_redirect_uri is supplied, that it is an EXACT match for one of
+// the client's registered postLogoutRedirectUris (no substring/prefix match,
+// no open redirect). Token/session revocation itself is done by the hosted
+// web app (this IdP keeps the browser SSO session as web-app storage, not a
+// server cookie), so this endpoint is purely the redirect-safety gate + audit
+// point for the shared WPA logout contract.
+export async function resolvePostLogoutRedirect(opts: {
+  clientId?: string;
+  postLogoutRedirectUri?: string;
+  req?: Request;
+}): Promise<{ postLogoutRedirectUri: string | null; clientName: string | null }> {
+  const { clientId, postLogoutRedirectUri, req } = opts;
+
+  if (!clientId) {
+    if (postLogoutRedirectUri) {
+      throw new AppError(
+        'client_id is required when post_logout_redirect_uri is provided.',
+        'INVALID_REQUEST',
+        400,
+      );
+    }
+    return { postLogoutRedirectUri: null, clientName: null };
+  }
+
+  const client = await prisma.authClient.findUnique({ where: { clientId } });
+  if (!client || client.status !== 'ACTIVE') {
+    throw new AppError('Unknown or disabled client.', 'INVALID_CLIENT', 400);
+  }
+
+  if (!postLogoutRedirectUri) {
+    return { postLogoutRedirectUri: null, clientName: client.name };
+  }
+
+  const registered = client.postLogoutRedirectUris ?? [];
+  if (!registered.includes(postLogoutRedirectUri)) {
+    console.warn(
+      `[SECURITY] Blocked invalid post_logout_redirect_uri "${postLogoutRedirectUri}" for client "${client.id}"`,
+    );
+    if (req) {
+      await writeSecurityEvent({
+        type: 'SUSPICIOUS_OAUTH',
+        severity: 'HIGH',
+        metadata: {
+          reason: 'invalid_post_logout_redirect_uri',
+          postLogoutRedirectUri,
+          clientId: client.id,
+        },
+        req,
+      });
+      await logAbuseSignal({
+        route: 'oauth-end-session',
+        req,
+        clientId: client.id,
+        identifier: `${client.id}:${postLogoutRedirectUri}`,
+        threat: 'SUSPICIOUS_ACTIVITY_BLOCKED',
+        blockAfter: 6,
+      });
+    }
+    throw new AppError(
+      'post_logout_redirect_uri is not registered for this client.',
+      'INVALID_REDIRECT_URI',
+      400,
+    );
+  }
+
+  if (req) {
+    await writeAuditLog({
+      action: 'LOGOUT',
+      req,
+      metadata: { flow: 'rp_initiated_logout', clientId: client.id },
+    });
+  }
+
+  return { postLogoutRedirectUri, clientName: client.name };
 }
 
 function validateScopes(client: { allowedScopes: string[] }, requested: string[]): string[] {
@@ -206,7 +291,7 @@ export async function resolveConsent(opts: {
 
   const client = await prisma.authClient.findUnique({ where: { id: pending.clientId } });
   if (!client || client.status !== 'ACTIVE') {
-    throw new AppError('Unknown or disabled client.', 'INVALID_CLIENT', 401);
+    throw new AppError('Unknown or disabled client.', 'INVALID_CLIENT', 400);
   }
 
   if (opts.decision === 'deny') {
@@ -364,7 +449,7 @@ export async function exchangeAuthorizationCode(opts: {
   await prisma.authorizationCode.update({ where: { codeHash }, data: { usedAt: new Date() } });
 
   const user = await prisma.user.findUnique({ where: { id: record.userId } });
-  if (!user || user.status !== 'ACTIVE') throw new AppError('User account is not active.', 'ACCOUNT_INACTIVE', 403);
+  if (!hasAuthenticatableAccount(user)) throw new AppError('User account is not active.', 'ACCOUNT_INACTIVE', 403);
 
   const roles = await getUserRoleNames(user.id);
   // Pre-existing gap fixed here (Global Super Admin Stage 2): this call
@@ -377,7 +462,7 @@ export async function exchangeAuthorizationCode(opts: {
   const baseAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
   const accessAudience = adminAudiences.length > 0 ? Array.from(new Set([baseAudience, ...adminAudiences])) : baseAudience;
   const accessToken = signAccessToken(
-    { sub: user.id, email: user.email, username: user.username, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
+    { sub: user.id, email: user.email, username: user.username, name: user.displayName, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
     accessAudience,
   );
   const refreshToken = signRefreshToken(user.id, client.audience ?? undefined);
@@ -496,7 +581,7 @@ export async function exchangeRefreshToken(opts: {
   if (stored.clientId !== client.id) throw new AppError('Token was not issued for this client.', 'INVALID_GRANT', 400);
 
   const user = await prisma.user.findUnique({ where: { id: payload.sub } });
-  if (!user || user.status !== 'ACTIVE') throw new AppError('User account is not active.', 'ACCOUNT_INACTIVE', 403);
+  if (!hasAuthenticatableAccount(user)) throw new AppError('User account is not active.', 'ACCOUNT_INACTIVE', 403);
 
   // Rotate
   const newRefresh = signRefreshToken(user.id);
@@ -541,7 +626,7 @@ export async function exchangeRefreshToken(opts: {
   const baseAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
   const accessAudience = adminAudiences.length > 0 ? Array.from(new Set([baseAudience, ...adminAudiences])) : baseAudience;
   const accessToken = signAccessToken(
-    { sub: user.id, email: user.email, username: user.username, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
+    { sub: user.id, email: user.email, username: user.username, name: user.displayName, roles, ...(servicePerms.length > 0 ? { perms: servicePerms } : {}) },
     accessAudience,
   );
 

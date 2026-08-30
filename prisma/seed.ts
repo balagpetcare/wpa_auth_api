@@ -81,11 +81,19 @@ const clientsList: Array<{
   // foundation). All optional — omitting them preserves the exact
   // generic behavior every other seeded client already had.
   clientId?: string;
+  clientSecret?: string;
   audience?: string;
   redirectUris?: string[];
+  // WPA true global logout contract: exact URLs this client may be sent back
+  // to after GET /oauth/end-session. Omitted → no post-logout redirect.
+  postLogoutRedirectUris?: string[];
   allowedAuthMethods?: string[];
   accessTokenTtlSeconds?: number;
   refreshTokenTtlSeconds?: number;
+  // Standard OIDC scopes every first-party/third-party client needs. If
+  // omitted, defaults to ['openid', 'profile', 'email']. SERVICE clients
+  // default to [] (they use client_credentials, not OIDC scopes).
+  allowedScopes?: string[];
 }> = [
   { name: 'World Pet Association', slug: 'world-pet-association', type: AuthClientType.FIRST_PARTY_APP },
   {
@@ -109,11 +117,74 @@ const clientsList: Array<{
     // as the place to restrict this later (e.g. disable Microsoft/org SSO
     // for Furtail specifically) once per-client provider scoping ships.
     allowedAuthMethods: [],
+    allowedScopes: ['openid', 'profile', 'email'],
   },
-  { name: 'Fortail Lab', slug: 'fortail-lab', type: AuthClientType.FIRST_PARTY_APP },
-  { name: 'Bangladesh Pet Association', slug: 'bangladesh-pet-association', type: AuthClientType.FIRST_PARTY_APP },
-  { name: 'WPA Payment Gateway', slug: 'wpa-payment-gateway', type: AuthClientType.SERVICE },
-  { name: 'Pet Smart Solution', slug: 'pet-smart-solution', type: AuthClientType.THIRD_PARTY_APP },
+  {
+    // Furtail Admin — standalone Next.js admin console (port 7500).
+    // Server-backed (BFF) confidential client: the client_secret stays
+    // server-side in the admin app's env, never shipped to the browser.
+    name: 'Furtail Admin',
+    slug: 'furtail-admin',
+    type: AuthClientType.FIRST_PARTY_APP,
+    clientId: 'furtail-admin',
+    audience: 'furtail-admin',
+    redirectUris: [
+      'http://localhost:7500/api/auth/callback',
+    ],
+    postLogoutRedirectUris: [
+      'http://localhost:7500/login?logged_out=1',
+    ],
+    allowedScopes: ['openid', 'profile', 'email'],
+  },
+  {
+    // Furtail Web — public-facing Next.js web app (port 7400).
+    name: 'Furtail Web',
+    slug: 'furtail-web',
+    type: AuthClientType.FIRST_PARTY_APP,
+    clientId: 'furtail-web',
+    audience: 'furtail',
+    redirectUris: [
+      'http://localhost:7400/api/auth/callback',
+    ],
+    postLogoutRedirectUris: [
+      'http://localhost:7400/login?logged_out=1',
+      'http://localhost:7400/',
+    ],
+    allowedScopes: ['openid', 'profile', 'email'],
+  },
+  { name: 'Fortail Lab', slug: 'fortail-lab', type: AuthClientType.FIRST_PARTY_APP, allowedScopes: ['openid', 'profile', 'email'] },
+  {
+    name: 'PetSmart Business Web',
+    slug: 'petsmart-business-web',
+    type: AuthClientType.FIRST_PARTY_APP,
+    clientId: 'petsmart-business-web',
+    clientSecret: 'test_secret',
+    audience: 'petsmart-business-web',
+    redirectUris: [
+      'http://localhost:8200/api/auth/callback',
+    ],
+    allowedScopes: ['openid', 'profile', 'email'],
+  },
+  {
+    name: 'PetSmart Ads Admin',
+    slug: 'petsmart-ads-admin',
+    type: AuthClientType.FIRST_PARTY_APP,
+    clientId: 'petsmart-ads-admin',
+    clientSecret: 'test_secret_ads_admin',
+    audience: 'petsmart-ads-admin',
+    redirectUris: [
+      'http://localhost:8300/api/auth/callback',
+    ],
+    allowedScopes: ['openid', 'profile', 'email'],
+  },
+  {
+    name: 'Bangladesh Pet Association',
+    slug: 'bangladesh-pet-association',
+    type: AuthClientType.FIRST_PARTY_APP,
+    allowedScopes: ['openid', 'profile', 'email'],
+  },
+  { name: 'WPA Payment Gateway', slug: 'wpa-payment-gateway', type: AuthClientType.SERVICE, allowedScopes: [] },
+  { name: 'Pet Smart Solution', slug: 'pet-smart-solution', type: AuthClientType.THIRD_PARTY_APP, allowedScopes: ['openid', 'profile', 'email'] },
 ];
 
 async function main() {
@@ -177,9 +248,12 @@ async function main() {
   // 3. Clients
   for (const c of clientsList) {
     const existing = await prisma.authClient.findUnique({ where: { slug: c.slug } });
+    const providedSecretHash = c.clientSecret
+      ? crypto.createHash('sha256').update(c.clientSecret).digest('hex')
+      : undefined;
     if (!existing) {
-      const generatedSecret = crypto.randomBytes(32).toString('base64url');
-      const hash = crypto.createHash('sha256').update(generatedSecret).digest('hex');
+      const generatedSecret = c.clientSecret ?? crypto.randomBytes(32).toString('base64url');
+      const hash = providedSecretHash ?? crypto.createHash('sha256').update(generatedSecret).digest('hex');
       const defaultRedirectUris = process.env.ALLOWED_PUBLIC_ORIGINS
         ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map((s) => s.trim() + '/api/auth/callback')
         : ['http://localhost:5011/api/auth/callback', 'http://localhost:5012/api/auth/callback'];
@@ -194,6 +268,8 @@ async function main() {
           status: AuthClientStatus.ACTIVE,
           allowedOrigins: process.env.ALLOWED_PUBLIC_ORIGINS ? process.env.ALLOWED_PUBLIC_ORIGINS.split(',').map(s=>s.trim()) : ['*'],
           redirectUris: c.redirectUris ?? defaultRedirectUris,
+          postLogoutRedirectUris: c.postLogoutRedirectUris ?? [],
+          allowedScopes: c.allowedScopes ?? (c.type === AuthClientType.SERVICE ? [] : ['openid', 'profile', 'email']),
           audience: c.audience ?? null,
           allowedAuthMethods: c.allowedAuthMethods ?? [],
           accessTokenTtlSeconds: c.accessTokenTtlSeconds ?? null,
@@ -209,7 +285,9 @@ async function main() {
     } else {
       let updatedHash: string | undefined = undefined;
 
-      if (!existing.clientSecretHash && c.type === AuthClientType.SERVICE) {
+      if (providedSecretHash) {
+        updatedHash = providedSecretHash;
+      } else if (!existing.clientSecretHash && c.type === AuthClientType.SERVICE) {
         // Dev fallback secret from environment or standard secure dev string
         const devSecret = process.env.DEV_PAYMENT_GATEWAY_SECRET || 'wpa_payment_gateway_dev_secret_2026';
         updatedHash = crypto.createHash('sha256').update(devSecret).digest('hex');
@@ -234,6 +312,8 @@ async function main() {
           ...(c.clientId ? { clientId: c.clientId } : {}),
           ...(c.audience ? { audience: c.audience } : {}),
           ...(c.redirectUris ? { redirectUris: c.redirectUris } : {}),
+          ...(c.postLogoutRedirectUris ? { postLogoutRedirectUris: c.postLogoutRedirectUris } : {}),
+          ...(c.allowedScopes !== undefined ? { allowedScopes: c.allowedScopes } : {}),
           ...(c.allowedAuthMethods ? { allowedAuthMethods: c.allowedAuthMethods } : {}),
           ...(c.accessTokenTtlSeconds ? { accessTokenTtlSeconds: c.accessTokenTtlSeconds } : {}),
           ...(c.refreshTokenTtlSeconds ? { refreshTokenTtlSeconds: c.refreshTokenTtlSeconds } : {}),
@@ -534,6 +614,42 @@ async function main() {
         console.log('Test user created successfully.');
       } else {
         console.log('Test user already exists.');
+      }
+    }
+
+    const businessOwnerEmail = 'business-owner@petsmartsolution.test';
+    const businessOwnerId = 'psbiz_demo_owner';
+    const existingBusinessOwner = await prisma.user.findUnique({ where: { email: businessOwnerEmail } });
+    if (userRole) {
+      if (!existingBusinessOwner) {
+        console.log(`Creating PetSmart business owner test user: ${businessOwnerEmail}`);
+        const passwordHash = await bcrypt.hash('ChangeMe123!', 10);
+        await prisma.user.create({
+          data: {
+            id: businessOwnerId,
+            email: businessOwnerEmail,
+            username: 'petsmart-business-owner',
+            displayName: 'PetSmart Business Owner',
+            passwordHash,
+            status: UserStatus.ACTIVE,
+            emailVerifiedAt: new Date(),
+            roles: {
+              create: {
+                roleId: userRole.id
+              }
+            }
+          }
+        });
+      } else {
+        await prisma.user.update({
+          where: { email: businessOwnerEmail },
+          data: {
+            username: 'petsmart-business-owner',
+            displayName: 'PetSmart Business Owner',
+            status: UserStatus.ACTIVE,
+            emailVerifiedAt: existingBusinessOwner.emailVerifiedAt ?? new Date(),
+          }
+        });
       }
     }
   }

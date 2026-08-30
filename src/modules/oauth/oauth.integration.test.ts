@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../../lib/db.js';
+import { config } from '../../config/index.js';
 import { encryptCredentialPayload } from '../../lib/credentialEncryption.js';
 import { buildOpenIdConfiguration } from '../../lib/oidc.js';
-import { exchangeAuthorizationCode, startAuthorization } from './oauth.service.js';
+import { exchangeAuthorizationCode, exchangeRefreshToken, startAuthorization } from './oauth.service.js';
 import { signIdToken } from '../../lib/tokens.js';
 
 function fakeReq() {
@@ -268,6 +269,71 @@ test('public native clients require PKCE and can exchange without a client secre
   }
 });
 
+test('pending-verification users can complete authorization code and refresh-token exchange consistently', async () => {
+  const user = await prisma.user.create({
+    data: {
+      email: `${unique('oidc-pending-user')}@example.com`,
+      status: 'PENDING_VERIFICATION',
+      emailVerifiedAt: null,
+    },
+  });
+  const { client, secret } = await makeClient({
+    clientId: unique('oidc-pending-client'),
+    slug: unique('oidc-pending-client'),
+    secret: true,
+    signingAlg: 'RS256',
+  });
+  const signingKey = await makeRsaSigningKey(`oidc-pending-key-${Date.now()}`);
+
+  const verifier = makePkceVerifier();
+  const challenge = makePkceChallenge(verifier);
+  const redirectUri = 'https://example.com/api/auth/callback';
+
+  try {
+    const auth = await startAuthorization({
+      clientId: client.clientId,
+      redirectUri,
+      scopes: ['openid', 'profile', 'email'],
+      state: 'state-pending',
+      codeChallenge: challenge,
+      codeChallengeMethod: 'S256',
+      nonce: 'nonce-pending',
+      userId: user.id,
+      req: fakeReq(),
+    });
+
+    if (!('code' in auth)) {
+      throw new Error('Expected authorization code response.');
+    }
+
+    const tokens = await exchangeAuthorizationCode({
+      code: auth.code,
+      clientId: client.clientId,
+      clientSecret: secret ?? undefined,
+      redirectUri,
+      codeVerifier: verifier,
+      req: fakeReq(),
+    });
+
+    assert.ok(tokens.access_token);
+    assert.ok(tokens.refresh_token);
+
+    const rotated = await exchangeRefreshToken({
+      refreshToken: tokens.refresh_token,
+      clientId: client.clientId,
+      clientSecret: secret ?? undefined,
+      req: fakeReq(),
+    });
+
+    assert.ok(rotated.access_token);
+    assert.ok(rotated.refresh_token);
+  } finally {
+    await cleanupClient(client.id);
+    await cleanupUser(user.id);
+    await cleanupSigningKey(signingKey.kid);
+  }
+});
+
 test('discovery metadata reflects absolute endpoints and supported algorithms', async () => {
   const { client } = await makeClient({
     clientId: unique('oidc-discovery-client'),
@@ -285,9 +351,10 @@ test('discovery metadata reflects absolute endpoints and supported algorithms', 
 
   try {
     const discovery = await buildOpenIdConfiguration();
-    assert.equal(discovery.issuer, 'https://auth.worldpetsassociation.com');
-    assert.match(discovery.authorization_endpoint, /^https:\/\/auth\.worldpetsassociation\.com\/api\/v1\/oauth\/authorize$/);
-    assert.match(discovery.token_endpoint, /^https:\/\/auth\.worldpetsassociation\.com\/api\/v1\/oauth\/token$/);
+    assert.equal(discovery.issuer, config.OAUTH_ISSUER.replace(/\/$/, ''));
+    const issuerBase = config.OAUTH_ISSUER.replace(/\/$/, '');
+    assert.match(discovery.authorization_endpoint, new RegExp(`^${issuerBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/api\\/v1\\/oauth\\/authorize$`));
+    assert.match(discovery.token_endpoint, new RegExp(`^${issuerBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/api\\/v1\\/oauth\\/token$`));
     assert.deepEqual(new Set(discovery.id_token_signing_alg_values_supported), new Set(['HS256', 'RS256']));
 
     const token = await signIdToken({ iss: discovery.issuer, sub: 'sub-1', aud: client.clientId, iat: Math.floor(Date.now() / 1000) }, 60, 'RS256');
