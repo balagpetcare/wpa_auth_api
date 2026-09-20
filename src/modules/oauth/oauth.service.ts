@@ -20,6 +20,7 @@ import { exportJwks } from '../../lib/signingKeys.js';
 import { getServiceAdminPermissions, adminAudiencesForPermissions } from '../../lib/adminAccess.js';
 import type { IdTokenSigningAlg } from '../../lib/oidc.js';
 import { hasAuthenticatableAccount } from '../auth/accountPolicy.js';
+import { buildJwtIntrospectionResponse, isServiceTokenOwnedByClient } from './introspection.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -749,7 +750,7 @@ export async function introspectToken(opts: {
   const tokenHash = hashToken(opts.token);
   const serviceToken = await prisma.serviceAccessToken.findUnique({ where: { tokenHash } });
   if (serviceToken) {
-    if (serviceToken.revokedAt || serviceToken.expiresAt < new Date()) return inactive;
+    if (serviceToken.revokedAt || serviceToken.expiresAt < new Date() || !isServiceTokenOwnedByClient(serviceToken.clientId, client.id)) return inactive;
     await writeAuditLog({ clientId: client.id, action: 'OAUTH_INTROSPECT', metadata: { token_type: 'service' }, req: opts.req });
     return {
       active: true,
@@ -763,20 +764,16 @@ export async function introspectToken(opts: {
 
   // Try JWT access token
   try {
-    const payload = jwt.verify(opts.token, config.JWT_ACCESS_SECRET) as any;
+    const expectedAudience = client.audience ?? config.ACCESS_TOKEN_AUDIENCE;
+    const payload = jwt.verify(opts.token, config.JWT_ACCESS_SECRET, {
+      issuer: config.OAUTH_ISSUER,
+      audience: expectedAudience,
+    }) as Record<string, unknown>;
+    if (typeof payload.sub !== 'string' || payload.sub.length === 0) return inactive;
+    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { status: true } });
+    const result = buildJwtIntrospectionResponse(payload, expectedAudience, config.OAUTH_ISSUER, hasAuthenticatableAccount(user));
     await writeAuditLog({ clientId: client.id, action: 'OAUTH_INTROSPECT', metadata: { token_type: 'jwt', sub: payload.sub }, req: opts.req });
-    return {
-      active: true,
-      token_type: 'Bearer',
-      sub: payload.sub,
-      email: payload.email,
-      username: payload.username,
-      roles: payload.roles,
-      scope: (payload.roles ?? []).join(' '),
-      exp: payload.exp,
-      iat: payload.iat,
-      iss: config.OAUTH_ISSUER,
-    };
+    return result;
   } catch {
     return inactive;
   }

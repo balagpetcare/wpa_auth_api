@@ -116,6 +116,20 @@ Refresh tokens are **rotated** on every use — store the new one and discard th
 
 ---
 
+## Introspection security contract
+
+`POST /oauth/introspect` authenticates the requesting OAuth client and validates
+JWT access tokens against that client's expected audience (`AuthClient.audience`
+or the configured default), the configured `OAUTH_ISSUER`, signature, and
+expiry. The account identified by `sub` must also remain authenticatable. A
+token for another audience, an unknown/inactive account, or any other
+validation failure returns only `{ "active": false }`.
+
+JWT introspection returns the verified `aud` claim and does not map Central Auth
+roles into the OAuth `scope` field. Roles remain non-authoritative metadata;
+Central Auth roles are not CPC permissions. Service-token introspection is also
+bound to the service client that owns the stored token.
+
 ## Flow 2: BPA Website Login (Authorization Code, Confidential Client)
 
 BPA runs a backend server that can safely store a `client_secret`.
