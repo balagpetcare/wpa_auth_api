@@ -14,6 +14,7 @@
     "smoke:communication-events": "tsx src/scripts/smokeExternalCommunicationEvents.ts",
     "bootstrap:global-super-admin": "tsx src/scripts/bootstrapGlobalSuperAdmin.ts",
     "bootstrap:bpa-web-client": "tsx src/scripts/bootstrapBpaWebClient.ts",
+    "bootstrap:cpc-web-client": "tsx src/scripts/bootstrapCommunityPetClinicClient.ts",
     "bootstrap:admin-oauth-clients:local": "tsx src/scripts/bootstrapAdminOAuthClientsLocal.ts",
     "build": "tsc",
     "start": "node dist/server.js",
